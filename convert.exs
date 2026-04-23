@@ -81,7 +81,7 @@ defmodule ElixirSFTConverter do
         entry = row["entry_point"] || "unknown"
         IO.write("\r[#{idx + 1}/#{total}] #{entry}...                    ")
 
-        {status, acc} =
+        {_status, acc} =
           case convert_one(row, thinking?, max_tokens) do
             {:ok, result} ->
               IO.write(file, Jason.encode!(result) <> "\n")
