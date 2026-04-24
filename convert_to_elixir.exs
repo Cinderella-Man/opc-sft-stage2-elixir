@@ -140,7 +140,7 @@ defmodule ElixirSFTConverter do
       """)
 
       log(1, "Removing default generated lib/*.ex and test/*_test.exs...")
-      for f <- Path.wildcard(Path.join(@workspace, "lib/*.ex")), do: File.rm(f)
+      for f <- Path.wildcard(Path.join(@workspace, "lib/elixir_sft.ex")), do: File.rm(f)
       for f <- Path.wildcard(Path.join(@workspace, "test/*_test.exs")), do: File.rm(f)
 
       ensure_deps()
@@ -416,15 +416,21 @@ defmodule ElixirSFTConverter do
   Apply ALL the reviewer's suggestions. Produce an improved version.
   The improved code MUST still pass all existing tests plus any new ones.
 
+  CRITICAL: If the code changes significantly (different algorithm, added guards,
+  new edge case handling), UPDATE THE INSTRUCTION to accurately describe what the
+  code actually does. The instruction must match the implementation — never claim
+  a technique the code doesn't use, and always mention techniques it does use.
+
   Rules:
   - Keep the same module name and function name
   - Add edge case handling (guards, pattern matching on empty input, etc.)
   - Add any new test cases the reviewer suggested
   - Code must compile and pass mix format
-  - div/2 and rem/2 are functions: div(a, b), NOT a div b
 
-  OUTPUT FORMAT — same as before:
+  OUTPUT FORMAT:
 
+  ---INSTRUCTION---
+  (updated instruction that accurately describes the implementation)
   ---MODULE---
   (improved defmodule)
   ---TEST---
@@ -504,8 +510,8 @@ defmodule ElixirSFTConverter do
         log(2, "Parsing refined output...")
 
         case parse_refine_output(content) do
-          {:ok, refined_module, refined_test} ->
-            log(2, "✓ Parsed: module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
+          {:ok, refined_instruction, refined_module, refined_test} ->
+            log(2, "✓ Parsed: instruction=#{if refined_instruction, do: String.length(refined_instruction), else: "nil"} module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
 
             log(2, "[Step 3/3] Validating refined code...")
             refined_result = validate(refined_module, refined_test)
@@ -517,7 +523,16 @@ defmodule ElixirSFTConverter do
               new_tests = count_tests(refined_result.test_code)
               log(2, "Tests: #{orig_tests} original → #{new_tests} after refinement")
 
+              # Use updated instruction if provided, otherwise keep original
+              final_instruction = if refined_instruction && refined_instruction != "" do
+                log(2, "Instruction updated by refinement")
+                refined_instruction
+              else
+                original_result.instruction
+              end
+
               {:ok, Map.merge(original_result, %{
+                instruction: final_instruction,
                 elixir_code: refined_result.module_code,
                 elixir_test: refined_result.test_code,
                 refined: true,
@@ -613,7 +628,8 @@ defmodule ElixirSFTConverter do
 
     Produce the improved version. Keep the same module and function names.
     All existing tests must still pass. Add new edge case tests.
-    Output: ---MODULE--- / ---TEST--- / ---END---
+    If the code changes significantly, update the instruction to match.
+    Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     """
   end
 
@@ -626,6 +642,9 @@ defmodule ElixirSFTConverter do
 
     """
     #{prefix}Your previous refinement had errors. Fix them.
+
+    ## Current Instruction
+    #{result.instruction}
 
     ## Original Working Module (do NOT break this)
     ```elixir
@@ -645,8 +664,9 @@ defmodule ElixirSFTConverter do
 
     Fix ALL errors. The code must compile, pass mix format, and pass all tests.
     Keep the same module and function names.
+    Update the instruction if the code approach changed.
 
-    Output: ---MODULE--- / ---TEST--- / ---END---
+    Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
     """
   end
@@ -658,18 +678,38 @@ defmodule ElixirSFTConverter do
       |> String.replace(~r/\n?```$/, "")
       |> String.trim()
 
-    with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
-         [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
-      test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
-      module_code = strip_fences(module_code)
+    # Try with instruction first
+    if String.contains?(content, "---INSTRUCTION---") do
+      with [_, rest] <- String.split(content, "---INSTRUCTION---", parts: 2),
+           [instruction, rest] <- String.split(rest, "---MODULE---", parts: 2),
+           [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
+        test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
+        module_code = strip_fences(module_code)
+        instruction = String.trim(instruction)
 
-      if module_code != "" and test_code != "" do
-        {:ok, module_code, test_code}
+        if module_code != "" and test_code != "" do
+          {:ok, instruction, module_code, test_code}
+        else
+          :error
+        end
       else
-        :error
+        _ -> :error
       end
     else
-      _ -> :error
+      # Fallback: no instruction section
+      with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
+           [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
+        test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
+        module_code = strip_fences(module_code)
+
+        if module_code != "" and test_code != "" do
+          {:ok, nil, module_code, test_code}
+        else
+          :error
+        end
+      else
+        _ -> :error
+      end
     end
   end
 

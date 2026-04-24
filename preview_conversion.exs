@@ -423,15 +423,20 @@ defmodule Pipeline do
   Apply ALL the reviewer's suggestions. Produce an improved version.
   The improved code MUST still pass all existing tests plus any new ones.
 
+  CRITICAL: If the code changes significantly (different algorithm, added guards,
+  new edge case handling), UPDATE THE INSTRUCTION to accurately describe what the
+  code actually does. The instruction must match the implementation.
+
   Rules:
   - Keep the same module name and function name
   - Add edge case handling (guards, pattern matching on empty input, etc.)
   - Add any new test cases the reviewer suggested
   - Code must compile and pass mix format
-  - div/2 and rem/2 are functions: div(a, b), NOT a div b
 
   OUTPUT FORMAT:
 
+  ---INSTRUCTION---
+  (updated instruction that accurately describes the implementation)
   ---MODULE---
   (improved defmodule)
   ---TEST---
@@ -507,8 +512,8 @@ defmodule Pipeline do
         log(2, "Parsing refined output...")
 
         case parse_refine_output(content) do
-          {:ok, refined_module, refined_test} ->
-            log(2, "✓ Parsed: module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
+          {:ok, refined_instruction, refined_module, refined_test} ->
+            log(2, "✓ Parsed: instruction=#{if refined_instruction, do: String.length(refined_instruction), else: "nil"} module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
 
             log(2, "[Step 3/3] Validating refined code...")
             refined_result = validate(refined_module, refined_test)
@@ -520,7 +525,15 @@ defmodule Pipeline do
               new_tests = count_tests(refined_result.test_code)
               log(2, "Tests: #{orig_tests} original → #{new_tests} after refinement")
 
+              final_instruction = if refined_instruction && refined_instruction != "" do
+                log(2, "Instruction updated by refinement")
+                refined_instruction
+              else
+                original_result.instruction
+              end
+
               {:ok, Map.merge(original_result, %{
+                instruction: final_instruction,
                 module_code: refined_result.module_code,
                 test_code: refined_result.test_code,
                 refined: true,
@@ -596,6 +609,9 @@ defmodule Pipeline do
     """
     #{prefix}Apply the review feedback below to improve this Elixir code.
 
+    ## Current Instruction
+    #{result.instruction}
+
     ## Current Module (working, passes all tests)
     ```elixir
     #{result.module_code}
@@ -611,7 +627,8 @@ defmodule Pipeline do
 
     Produce the improved version. Keep the same module and function names.
     All existing tests must still pass. Add new edge case tests.
-    Output: ---MODULE--- / ---TEST--- / ---END---
+    If the code changes significantly, update the instruction to match.
+    Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     """
   end
 
@@ -624,6 +641,9 @@ defmodule Pipeline do
 
     """
     #{prefix}Your previous refinement had errors. Fix them.
+
+    ## Current Instruction
+    #{result.instruction}
 
     ## Original Working Module (do NOT break this)
     ```elixir
@@ -643,8 +663,9 @@ defmodule Pipeline do
 
     Fix ALL errors. The code must compile, pass mix format, and pass all tests.
     Keep the same module and function names.
+    Update the instruction if the code approach changed.
 
-    Output: ---MODULE--- / ---TEST--- / ---END---
+    Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
     """
   end
@@ -656,18 +677,36 @@ defmodule Pipeline do
       |> String.replace(~r/\n?```$/, "")
       |> String.trim()
 
-    with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
-         [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
-      test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
-      module_code = strip_fences(module_code)
+    if String.contains?(content, "---INSTRUCTION---") do
+      with [_, rest] <- String.split(content, "---INSTRUCTION---", parts: 2),
+           [instruction, rest] <- String.split(rest, "---MODULE---", parts: 2),
+           [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
+        test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
+        module_code = strip_fences(module_code)
+        instruction = String.trim(instruction)
 
-      if module_code != "" and test_code != "" do
-        {:ok, module_code, test_code}
+        if module_code != "" and test_code != "" do
+          {:ok, instruction, module_code, test_code}
+        else
+          :error
+        end
       else
-        :error
+        _ -> :error
       end
     else
-      _ -> :error
+      with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
+           [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
+        test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
+        module_code = strip_fences(module_code)
+
+        if module_code != "" and test_code != "" do
+          {:ok, nil, module_code, test_code}
+        else
+          :error
+        end
+      else
+        _ -> :error
+      end
     end
   end
 
