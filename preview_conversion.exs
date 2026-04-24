@@ -282,7 +282,16 @@ defmodule Pipeline do
     log(1, "Building initial prompt from Python instruction...")
     initial_prompt = build_initial_prompt(example, thinking?)
     log(1, "Prompt built (#{String.length(initial_prompt)} chars)")
-    do_attempt(example, initial_prompt, thinking?, max_tokens, 1, nil)
+
+    case do_attempt(example, initial_prompt, thinking?, max_tokens, 1, nil) do
+      {:ok, result} ->
+        log(1, "")
+        log(1, "═══ Refinement Phase ═══")
+        refine_solution(example, result, thinking?, max_tokens)
+
+      {:failed, _} = fail ->
+        fail
+    end
   end
 
   defp do_attempt(_example, _prompt, _thinking?, _max_tokens, attempt, _) when attempt > @max_retries do
@@ -354,6 +363,261 @@ defmodule Pipeline do
           log(1, "✗ No retries left")
           {:failed, nil}
         end
+    end
+  end
+
+  # ── Self-Refine: Review → Improve → Validate ──────────────────────
+
+  @review_prompt """
+  You are an expert Elixir code reviewer. Review the Elixir code below and provide
+  actionable feedback. Focus on:
+
+  1. EDGE CASES: What inputs would break this? Empty list, nil, single element,
+     negative numbers, unicode strings, very large inputs, duplicate values, etc.
+  2. IDIOMATIC ELIXIR: Is it truly idiomatic? Could it use better pattern matching
+     in function heads? Guards? The pipe operator more naturally? with blocks?
+  3. CORRECTNESS: Does it actually handle all cases from the instruction?
+  4. PERFORMANCE: Any obvious inefficiency for Elixir's data structures?
+  5. ADDITIONAL TESTS: What test cases are missing?
+
+  Be specific and actionable. For each issue, say what to change and why.
+  If the code is already excellent, say "NO_ISSUES_FOUND" and nothing else.
+  """
+
+  @refine_prompt """
+  You are an expert Elixir programmer. You will receive:
+  - An instruction for an Elixir exercise
+  - The current working Elixir module
+  - The current tests
+  - A code review with specific feedback
+
+  Apply ALL the reviewer's suggestions. Produce an improved version.
+  The improved code MUST still pass all existing tests plus any new ones.
+
+  Rules:
+  - Keep the same module name and function name
+  - Add edge case handling (guards, pattern matching on empty input, etc.)
+  - Add any new test cases the reviewer suggested
+  - Code must compile and pass mix format
+  - div/2 and rem/2 are functions: div(a, b), NOT a div b
+
+  OUTPUT FORMAT:
+
+  ---MODULE---
+  (improved defmodule)
+  ---TEST---
+  (improved tests with additional edge cases)
+  ---END---
+
+  Nothing else. No markdown. No explanations.
+  """
+
+  defp refine_solution(example, result, thinking?, max_tokens) do
+    log(2, "[Step 1/3] Asking LLM to review the working code for issues and edge cases...")
+
+    review_user = build_review_prompt(example, result, thinking?)
+    log(2, "Review prompt: #{String.length(review_user)} chars")
+
+    t0 = System.monotonic_time(:millisecond)
+
+    case call_llm_with_system(review_user, @review_prompt, max_tokens) do
+      {:ok, review_feedback} ->
+        elapsed = System.monotonic_time(:millisecond) - t0
+        log(2, "Review received in #{Float.round(elapsed / 1000, 1)}s (#{String.length(review_feedback)} chars)")
+
+        if String.contains?(review_feedback, "NO_ISSUES_FOUND") do
+          log(2, "✓ Reviewer found no issues — code is already good")
+          {:ok, Map.put(result, :refined, false)}
+        else
+          feedback_lines = review_feedback |> String.split("\n") |> Enum.reject(&(&1 == ""))
+          log(2, "Reviewer found #{length(feedback_lines)} lines of feedback:")
+          feedback_lines |> Enum.take(5) |> Enum.each(&log(3, String.slice(&1, 0, 120)))
+          if length(feedback_lines) > 5, do: log(3, "... (#{length(feedback_lines) - 5} more lines)")
+
+          apply_review(example, result, review_feedback, thinking?, max_tokens)
+        end
+
+      {:empty, reason} ->
+        log(2, "✗ Review call returned empty: #{reason}. Keeping original.")
+        {:ok, Map.put(result, :refined, false)}
+
+      {:error, reason} ->
+        log(2, "✗ Review call failed: #{reason}. Keeping original.")
+        {:ok, Map.put(result, :refined, false)}
+    end
+  end
+
+  defp apply_review(example, original_result, review_feedback, thinking?, max_tokens) do
+    log(2, "[Step 2/3] Asking LLM to apply review feedback and improve the code...")
+
+    refine_user = build_refine_prompt(example, original_result, review_feedback, thinking?)
+    log(2, "Refine prompt: #{String.length(refine_user)} chars")
+
+    t0 = System.monotonic_time(:millisecond)
+
+    case call_llm_with_system(refine_user, @refine_prompt, max_tokens) do
+      {:ok, content} ->
+        elapsed = System.monotonic_time(:millisecond) - t0
+        log(2, "Refinement received in #{Float.round(elapsed / 1000, 1)}s (#{String.length(content)} chars)")
+        log(2, "Parsing refined output...")
+
+        case parse_refine_output(content) do
+          {:ok, refined_module, refined_test} ->
+            log(2, "✓ Parsed: module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
+
+            log(2, "[Step 3/3] Validating refined code...")
+            refined_result = validate(refined_module, refined_test)
+
+            if refined_result.errors == [] do
+              log(2, "✓ Refined version passed all checks!")
+
+              orig_tests = count_tests(original_result.test_code)
+              new_tests = count_tests(refined_result.test_code)
+              log(2, "Tests: #{orig_tests} original → #{new_tests} after refinement")
+
+              {:ok, %{original_result |
+                module_code: refined_result.module_code,
+                test_code: refined_result.test_code,
+                refined: true,
+                tests_before: orig_tests,
+                tests_after: new_tests
+              }}
+            else
+              error_types = refined_result.errors |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")
+              log(2, "✗ Refined version failed validation (#{error_types}). Keeping original.")
+              refined_result.errors |> Enum.each(fn {stage, msg} ->
+                log(3, "[#{stage}] #{String.slice(msg, 0, 150)}")
+              end)
+              {:ok, Map.put(original_result, :refined, false)}
+            end
+
+          :error ->
+            log(2, "✗ Could not parse refined output. Keeping original.")
+            {:ok, Map.put(original_result, :refined, false)}
+        end
+
+      {:empty, reason} ->
+        log(2, "✗ Refine call returned empty: #{reason}. Keeping original.")
+        {:ok, Map.put(original_result, :refined, false)}
+
+      {:error, reason} ->
+        log(2, "✗ Refine call failed: #{reason}. Keeping original.")
+        {:ok, Map.put(original_result, :refined, false)}
+    end
+  end
+
+  defp build_review_prompt(example, result, thinking?) do
+    prefix = unless thinking?, do: "/no_think\n", else: ""
+
+    """
+    #{prefix}Review this Elixir code. Identify edge cases, idiom issues, and missing tests.
+
+    ## Instruction
+    #{result.instruction}
+
+    ## Module Code
+    ```elixir
+    #{result.module_code}
+    ```
+
+    ## Current Tests
+    ```elixir
+    #{result.test_code}
+    ```
+
+    ## Original Python (for reference)
+    ```python
+    #{example.code}
+    ```
+
+    Provide specific, actionable feedback. If the code is excellent as-is, respond with only: NO_ISSUES_FOUND
+    """
+  end
+
+  defp build_refine_prompt(_example, result, review_feedback, thinking?) do
+    prefix = unless thinking?, do: "/no_think\n", else: ""
+
+    """
+    #{prefix}Apply the review feedback below to improve this Elixir code.
+
+    ## Current Module (working, passes all tests)
+    ```elixir
+    #{result.module_code}
+    ```
+
+    ## Current Tests (all passing)
+    ```elixir
+    #{result.test_code}
+    ```
+
+    ## Review Feedback (apply ALL of these)
+    #{review_feedback}
+
+    Produce the improved version. Keep the same module and function names.
+    All existing tests must still pass. Add new edge case tests.
+    Output: ---MODULE--- / ---TEST--- / ---END---
+    """
+  end
+
+  defp parse_refine_output(content) do
+    content =
+      content
+      |> String.replace(~r/^```\w*\n?/, "")
+      |> String.replace(~r/\n?```$/, "")
+      |> String.trim()
+
+    with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
+         [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
+      test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
+      module_code = strip_fences(module_code)
+
+      if module_code != "" and test_code != "" do
+        {:ok, module_code, test_code}
+      else
+        :error
+      end
+    else
+      _ -> :error
+    end
+  end
+
+  defp count_tests(test_code) do
+    test_code
+    |> String.split("\n")
+    |> Enum.count(&String.contains?(&1, "test \""))
+  end
+
+  defp call_llm_with_system(user_prompt, system_prompt, max_tokens) do
+    body = %{
+      messages: [
+        %{role: "system", content: system_prompt},
+        %{role: "user", content: user_prompt}
+      ],
+      temperature: 0.3,
+      max_tokens: max_tokens,
+      stream: false
+    }
+
+    case Req.post(@llama_url, json: body, receive_timeout: 600_000) do
+      {:ok, %{status: 200, body: resp}} ->
+        choice = resp["choices"] |> List.first()
+        msg = choice["message"]
+        content = (msg["content"] || "") |> String.trim()
+        reasoning = (msg["reasoning_content"] || "") |> String.trim()
+        finish = choice["finish_reason"]
+        usage = resp["usage"]
+
+        if usage, do: log(3, "Tokens: prompt=#{usage["prompt_tokens"]} completion=#{usage["completion_tokens"]} finish=#{finish}")
+        if String.length(reasoning) > 0, do: log(3, "Thinking: #{String.length(reasoning)} chars (not used)")
+
+        cond do
+          String.length(content) > 0 -> {:ok, content}
+          finish == "length" -> {:empty, "thinking exhausted tokens"}
+          true -> {:empty, "empty content, finish=#{finish}"}
+        end
+
+      {:ok, %{status: s}} -> {:error, "HTTP #{s}"}
+      {:error, err} -> {:error, inspect(err)}
     end
   end
 
@@ -595,8 +859,10 @@ defmodule Pipeline do
 
       case result do
         {:ok, data} ->
+          refined_tag = if data[:refined], do: " | refined ✨", else: " | kept original"
+          tests_tag = if data[:tests_after], do: " | tests: #{data[:tests_before]}→#{data[:tests_after]}", else: ""
           IO.puts("")
-          log(0, "╔══ FINAL RESULT (attempt #{data.attempts}) ══╗")
+          log(0, "╔══ FINAL RESULT (attempt #{data.attempts}#{refined_tag}#{tests_tag}) ══╗")
           log(0, "")
           log(0, "Rewritten Elixir instruction:")
           log(1, data.instruction)
