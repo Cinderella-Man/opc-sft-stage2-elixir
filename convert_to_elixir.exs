@@ -35,19 +35,48 @@ defmodule ElixirSFTConverter do
 
   INSTRUCTION rewriting rules:
   - Remove ALL Python references. Do not mention Python anywhere.
-  - Replace types: dict→map, list→list, tuple→tuple, set→MapSet
-  - Adapt complexity claims for Elixir (linked lists, immutable data, no in-place mutation)
+  - Replace types: dict→map, list→list, tuple→tuple, set→MapSet, string→string
+  - Adapt complexity claims for Elixir's data model (linked lists are O(n)
+    access, data is immutable, no in-place mutation)
   - Keep the core algorithmic problem identical
 
-  CODE rules:
-  - Idiomatic Elixir: pattern matching, pipes, guards, Enum/Stream, recursion
-  - Module with @doc and @spec
-  - Code MUST compile. Elixir syntax reminders:
-    • div/2 and rem/2 are functions: div(a, b), NOT a div b
-    • String.graphemes/1 or String.codepoints/1 for character iteration
-    • Enum.at/2 for list access, hd/1 and tl/1 for head/tail
-    • No mutable variables — use accumulators, Enum.reduce, recursion
-  - Do NOT include tests in the module section
+  PYTHON → ELIXIR translation patterns (apply these, don't transliterate):
+  - for loop with accumulator → Enum.reduce/3 or recursive function with accumulator
+  - for loop building a list → Enum.map/2, Enum.filter/2, or for comprehension
+  - while loop → recursion with pattern-matched base case
+  - list[i] index access in a loop → NEVER use Enum.at in a loop (O(n²));
+    use recursion, Enum.reduce, or Enum.with_index instead
+  - list.append(x) → prepend [x | acc], then Enum.reverse at the end
+  - list + list → avoid ++ in a loop (O(n) each time); prepend + reverse
+  - dict[key] / dict.get(key) → pattern match on %{key => value} or Map.get/2
+  - if/elif/else chains → cond/do, multi-clause functions, or pattern matching
+  - try/except → {:ok, val}/{:error, reason} tuples + case or with
+  - class with methods → module with functions, struct if state is needed
+  - len(list) == 0 → pattern match on [] in function head
+  - sorting with key function → Enum.sort_by/2
+  - string iteration (for c in s) → String.graphemes/1 |> Enum.map/filter/reduce
+  - string slicing s[1:] → binary pattern matching or String.slice/2
+  - integer division // → div(a, b); modulo % → rem(a, b) — both are functions
+  - multiple return values → return a tuple
+  - None → nil
+  - True/False → true/false (lowercase)
+  - default args → Elixir supports \\\\ for defaults in function heads
+
+  Idiomatic Elixir patterns to USE:
+  - Pattern matching in function heads for dispatch (instead of case/cond inside)
+  - Multi-clause functions for different input shapes
+  - Pipe operator |> for data transformation chains
+  - Guards (when is_list/is_integer/is_binary, when x > 0, etc.)
+  - @doc with examples and @spec for type documentation
+  - with for chaining multiple {:ok, _} results
+
+  Anti-patterns to AVOID:
+  - Enum.at/2 inside Enum.reduce or recursion (O(n) per access on linked lists)
+  - Building lists with list ++ [element] (O(n) per append)
+  - length(list) == 0 or length(list) > 0 (traverses entire list; match on []/[_|_])
+  - Deeply nested case/if/cond — flatten with multi-clause functions or with
+  - Single-clause def with a case/cond on the argument — use multi-clause instead
+  - Assigning intermediate variables that are only used once — use pipes
 
   TEST rules:
   - Separate module with `use ExUnit.Case`
@@ -444,10 +473,26 @@ defmodule ElixirSFTConverter do
     end
   end
 
-  defp apply_review(example, original_result, review_feedback, thinking?, max_tokens) do
-    log(2, "[Step 2/3] Asking LLM to apply review feedback and improve the code...")
+  @max_refine_retries 3
 
-    refine_user = build_refine_prompt(example, original_result, review_feedback, thinking?)
+  defp apply_review(example, original_result, review_feedback, thinking?, max_tokens) do
+    do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, 1)
+  end
+
+  defp do_refine_attempt(_, original_result, _, _, _, _, attempt) when attempt > @max_refine_retries do
+    log(2, "✗ Refinement failed after #{@max_refine_retries} attempts. Keeping original.")
+    {:ok, Map.merge(original_result, %{refined: false, refinement_failed: "exceeded #{@max_refine_retries} retries"})}
+  end
+
+  defp do_refine_attempt(example, original_result, review_feedback, prev_errors, thinking?, max_tokens, attempt) do
+    log(2, "[Step 2/3] Refine attempt #{attempt}/#{@max_refine_retries}...")
+
+    refine_user = if prev_errors do
+      build_refine_fix_prompt(original_result, prev_errors, thinking?)
+    else
+      build_refine_prompt(example, original_result, review_feedback, thinking?)
+    end
+
     log(2, "Refine prompt: #{String.length(refine_user)} chars")
 
     t0 = System.monotonic_time(:millisecond)
@@ -462,43 +507,53 @@ defmodule ElixirSFTConverter do
           {:ok, refined_module, refined_test} ->
             log(2, "✓ Parsed: module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
 
-            # Step 3: Validate the refined version
             log(2, "[Step 3/3] Validating refined code...")
             refined_result = validate(refined_module, refined_test)
 
             if refined_result.errors == [] do
-              log(2, "✓ Refined version passed all checks!")
+              log(2, "✓ Refined version passed all checks on attempt #{attempt}!")
 
-              # Count how many tests the refined version has vs original
               orig_tests = count_tests(original_result.elixir_test)
               new_tests = count_tests(refined_result.test_code)
               log(2, "Tests: #{orig_tests} original → #{new_tests} after refinement")
 
-              {:ok, %{original_result |
+              {:ok, Map.merge(original_result, %{
                 elixir_code: refined_result.module_code,
                 elixir_test: refined_result.test_code,
                 refined: true,
                 review_feedback: review_feedback,
                 tests_before: orig_tests,
-                tests_after: new_tests
-              }}
+                tests_after: new_tests,
+                refine_attempts: attempt
+              })}
             else
               error_types = refined_result.errors |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")
-              log(2, "✗ Refined version failed validation (#{error_types}). Keeping original.")
+              log(2, "✗ Refined version failed validation (#{error_types}).")
               refined_result.errors |> Enum.each(fn {stage, msg} ->
                 log(3, "[#{stage}] #{String.slice(msg, 0, 150)}")
               end)
-              {:ok, Map.merge(original_result, %{refined: false, refinement_failed: error_types})}
+              log(2, "Building retry prompt with error feedback...")
+              do_refine_attempt(example, original_result, review_feedback, {content, refined_result.errors}, thinking?, max_tokens, attempt + 1)
             end
 
           :error ->
-            log(2, "✗ Could not parse refined output. Keeping original.")
-            {:ok, Map.put(original_result, :refined, false)}
+            log(2, "✗ Could not parse refined output on attempt #{attempt}.")
+            if attempt < @max_refine_retries do
+              do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, attempt + 1)
+            else
+              log(2, "Keeping original.")
+              {:ok, Map.put(original_result, :refined, false)}
+            end
         end
 
       {:empty, reason} ->
-        log(2, "✗ Refine call returned empty: #{reason}. Keeping original.")
-        {:ok, Map.put(original_result, :refined, false)}
+        log(2, "✗ Refine call returned empty: #{reason}.")
+        if attempt < @max_refine_retries do
+          do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, attempt + 1)
+        else
+          log(2, "Keeping original.")
+          {:ok, Map.put(original_result, :refined, false)}
+        end
 
       {:error, reason} ->
         log(2, "✗ Refine call failed: #{reason}. Keeping original.")
@@ -559,6 +614,40 @@ defmodule ElixirSFTConverter do
     Produce the improved version. Keep the same module and function names.
     All existing tests must still pass. Add new edge case tests.
     Output: ---MODULE--- / ---TEST--- / ---END---
+    """
+  end
+
+  defp build_refine_fix_prompt(result, {previous_output, errors}, thinking?) do
+    prefix = unless thinking?, do: "/no_think\n", else: ""
+
+    error_text = Enum.map_join(errors, "\n\n", fn {stage, msg} ->
+      "### #{stage} error:\n#{msg}"
+    end)
+
+    """
+    #{prefix}Your previous refinement had errors. Fix them.
+
+    ## Original Working Module (do NOT break this)
+    ```elixir
+    #{result.elixir_code}
+    ```
+
+    ## Original Working Tests (these MUST still pass)
+    ```elixir
+    #{result.elixir_test}
+    ```
+
+    ## Your Previous Refinement (HAS ERRORS)
+    #{previous_output}
+
+    ## Errors Found
+    #{error_text}
+
+    Fix ALL errors. The code must compile, pass mix format, and pass all tests.
+    Keep the same module and function names.
+
+    Output: ---MODULE--- / ---TEST--- / ---END---
+    Nothing else.
     """
   end
 
@@ -907,7 +996,7 @@ defmodule ElixirSFTConverter do
     output_path = "elixir_sft_#{subset}.jsonl"
     errors_path = "elixir_sft_#{subset}_errors.jsonl"
     log_path = "convert_log_#{subset}.txt"
-    max_tokens = if thinking?, do: 16_384, else: 4_096
+    max_tokens = if thinking?, do: 16_384, else: 12_288
 
     log(0, "\nStep 2: Set up Mix workspace for validation")
     setup_workspace()
