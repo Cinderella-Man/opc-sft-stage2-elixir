@@ -96,10 +96,19 @@ defmodule Pipeline do
   Anti-patterns to AVOID:
   - Enum.at/2 inside Enum.reduce or recursion (O(n) per access on linked lists)
   - Building lists with list ++ [element] (O(n) per append)
+  - ++ inside recursive functions (same O(n²) cost as in loops)
   - length(list) == 0 or length(list) > 0 (traverses entire list; match on []/[_|_])
+  - length(list) in guard clauses (O(n) on every call attempt)
   - Deeply nested case/if/cond — flatten with multi-clause functions or with
   - Single-clause def with a case/cond on the argument — use multi-clause instead
   - Assigning intermediate variables that are only used once — use pipes
+  - String.graphemes |> Enum.reverse |> Enum.join — use String.reverse/1
+  - Enum.sort(list) |> Enum.reverse — use Enum.sort(list, :desc)
+  - Enum.sort(list) |> Enum.at(index) — use Enum.min/max or pattern matching
+  - Enum.join("") — the empty string is the default, just use Enum.join()
+  - when var == literal in guards — pattern match the literal in the function head
+  - Decomposing a string into graphemes/charlist only to compare with Enum.reverse
+    — compare strings directly with String.reverse/1
 
   TEST rules:
   - Separate module with `use ExUnit.Case`
@@ -119,6 +128,22 @@ defmodule Pipeline do
   Nothing else. No markdown fences. No explanations. No preamble.
   """
 
+  @credence_script """
+  code = File.read!("lib/solution.ex")
+  result = Credence.analyze(code)
+
+  if result.valid do
+    IO.puts("OK: No credence issues found")
+  else
+    IO.puts("ISSUES: \#{length(result.issues)} credence issue(s) found")
+    for issue <- result.issues do
+      line = if issue.meta[:line], do: "line \#{issue.meta[:line]}", else: "unknown line"
+      IO.puts("  [\#{issue.severity}] \#{issue.rule}: \#{issue.message} (\#{line})")
+    end
+    System.halt(1)
+  end
+  """
+
   # ── Logging ──────────────────────────────────────────────────────────
 
   defp log(indent, msg), do: IO.puts(String.duplicate("  ", indent) <> msg)
@@ -128,6 +153,8 @@ defmodule Pipeline do
   def setup_workspace do
     if File.exists?(Path.join(@workspace, "mix.exs")) do
       log(0, "Workspace #{@workspace}/ already exists, checking deps...")
+      ensure_credence_in_mix_exs()
+      ensure_credence_script()
       ensure_deps()
     else
       log(0, "Creating Mix project with `mix new #{@workspace}`...")
@@ -135,13 +162,13 @@ defmodule Pipeline do
       if code != 0, do: raise("mix new failed: #{output}")
       log(1, "Mix project scaffolded (mix.exs, lib/, test/, .formatter.exs)")
 
-      log(1, "Injecting {:credo, \"~> 1.7\"} into mix.exs deps...")
+      log(1, "Injecting {:credo} and {:credence} into mix.exs deps...")
       mix_exs = Path.join(@workspace, "mix.exs")
       mix_content = File.read!(mix_exs)
       fixed = Regex.replace(
         ~r/defp deps do\n\s+\[.*?\]/s,
         mix_content,
-        "defp deps do\n      [\n        {:credo, \"~> 1.7\", only: [:dev, :test], runtime: false}\n      ]"
+        "defp deps do\n      [\n        {:credo, \"~> 1.7\", only: [:dev, :test], runtime: false},\n        {:credence, github: \"Cinderella-Man/credence\", only: [:dev, :test], runtime: false}\n      ]"
       )
       File.write!(mix_exs, fixed)
 
@@ -162,6 +189,8 @@ defmodule Pipeline do
       }
       """)
 
+      ensure_credence_script()
+
       log(1, "Removing default generated lib/*.ex and test/*_test.exs...")
       for f <- Path.wildcard(Path.join(@workspace, "lib/*.ex")), do: File.rm(f)
       for f <- Path.wildcard(Path.join(@workspace, "test/*_test.exs")), do: File.rm(f)
@@ -171,15 +200,42 @@ defmodule Pipeline do
     end
   end
 
+  defp ensure_credence_in_mix_exs do
+    mix_exs = Path.join(@workspace, "mix.exs")
+    mix_content = File.read!(mix_exs)
+
+    unless String.contains?(mix_content, "credence") do
+      log(1, "Adding {:credence} to existing mix.exs deps...")
+      fixed = String.replace(
+        mix_content,
+        "{:credo, \"~> 1.7\", only: [:dev, :test], runtime: false}",
+        "{:credo, \"~> 1.7\", only: [:dev, :test], runtime: false},\n        {:credence, github: \"Cinderella-Man/credence\", only: [:dev, :test], runtime: false}"
+      )
+      File.write!(mix_exs, fixed)
+    end
+  end
+
+  defp ensure_credence_script do
+    script_path = Path.join(@workspace, "run_credence.exs")
+
+    unless File.exists?(script_path) do
+      log(1, "Writing run_credence.exs (semantic lint check script)...")
+      File.write!(script_path, @credence_script)
+    end
+  end
+
   defp ensure_deps do
-    unless File.exists?(Path.join(@workspace, "deps/credo")) do
-      log(1, "Running `mix deps.get` to fetch credo...")
+    credo_ok = File.exists?(Path.join(@workspace, "deps/credo"))
+    credence_ok = File.exists?(Path.join(@workspace, "deps/credence"))
+
+    unless credo_ok and credence_ok do
+      log(1, "Running `mix deps.get` to fetch deps...")
       System.cmd("mix", ["deps.get"], cd: @workspace, stderr_to_stdout: true)
-      log(1, "Running `mix deps.compile` to compile credo...")
+      log(1, "Running `mix deps.compile` to compile deps...")
       System.cmd("mix", ["deps.compile"], cd: @workspace, stderr_to_stdout: true)
       log(1, "✓ Deps ready")
     else
-      log(1, "✓ Credo already installed")
+      log(1, "✓ Credo and Credence already installed")
     end
   end
 
@@ -200,8 +256,8 @@ defmodule Pipeline do
 
     errors = []
 
-    # Compile
-    log(2, "[1/4] Running `mix compile --warnings-as-errors --force`...")
+    # Step 1: Compile
+    log(2, "[1/5] Running `mix compile --warnings-as-errors --force`...")
     {output, code} = System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
       cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
     compile_ok = code == 0
@@ -214,9 +270,9 @@ defmodule Pipeline do
       errors ++ [{:compile, clean_mix_output(output)}]
     end
 
-    # Format
+    # Step 2: Format
     errors = if compile_ok do
-      log(2, "[2/4] Running `mix format --check-formatted`...")
+      log(2, "[2/5] Running `mix format --check-formatted`...")
       {_output, code} = System.cmd("mix", ["format", "--check-formatted",
         "lib/solution.ex", "test/solution_test.exs"],
         cd: @workspace, stderr_to_stdout: true)
@@ -231,13 +287,13 @@ defmodule Pipeline do
         errors ++ [{:format, "Code was not formatted. mix format has been applied."}]
       end
     else
-      log(2, "[2/4] Skipping format check (compilation failed)")
+      log(2, "[2/5] Skipping format check (compilation failed)")
       errors
     end
 
-    # Credo
+    # Step 3: Credo
     errors = if compile_ok do
-      log(2, "[3/4] Running `mix credo --strict` on lib/solution.ex...")
+      log(2, "[3/5] Running `mix credo --strict` on lib/solution.ex...")
       {output, _code} = System.cmd("mix", ["credo", "list", "--strict",
         "--format", "oneline", "lib/solution.ex"],
         cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
@@ -256,13 +312,37 @@ defmodule Pipeline do
         errors ++ [{:credo, Enum.join(credo_issues, "\n")}]
       end
     else
-      log(2, "[3/4] Skipping credo (compilation failed)")
+      log(2, "[3/5] Skipping credo (compilation failed)")
       errors
     end
 
-    # Tests
+    # Step 4: Credence (semantic lint)
+    errors = if compile_ok do
+      log(2, "[4/5] Running Credence semantic analysis on lib/solution.ex...")
+      {output, code} = System.cmd("mix", ["run", "--no-start", "run_credence.exs"],
+        cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+      if code == 0 do
+        log(3, "✓ No credence issues")
+        errors
+      else
+        credence_issues = output
+        |> String.split("\n")
+        |> Enum.filter(&String.contains?(&1, "]"))
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+
+        log(3, "✗ #{length(credence_issues)} credence issue(s):")
+        Enum.each(credence_issues, &log(4, &1))
+        errors ++ [{:credence, String.trim(output)}]
+      end
+    else
+      log(2, "[4/5] Skipping credence (compilation failed)")
+      errors
+    end
+
+    # Step 5: Tests
     {test_result, errors} = if compile_ok do
-      log(2, "[4/4] Running `mix test test/solution_test.exs`...")
+      log(2, "[5/5] Running `mix test test/solution_test.exs`...")
       {output, code} = System.cmd("mix", ["test", "test/solution_test.exs", "--no-deps-check"],
         cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
       if code == 0 do
@@ -274,7 +354,7 @@ defmodule Pipeline do
         {:fail, errors ++ [{:test, clean_mix_output(output)}]}
       end
     else
-      log(2, "[4/4] Skipping tests (compilation failed)")
+      log(2, "[5/5] Skipping tests (compilation failed)")
       {:skip, errors}
     end
 
@@ -283,7 +363,7 @@ defmodule Pipeline do
 
     total_issues = length(errors)
     if total_issues == 0 do
-      log(2, "✓ All 4 checks passed")
+      log(2, "✓ All 5 checks passed")
     else
       log(2, "✗ #{total_issues} check(s) failed: #{errors |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")}")
     end
@@ -862,7 +942,7 @@ defmodule Pipeline do
     ## Errors
     #{error_text}
 
-    Fix ALL errors. Code must compile, pass mix format, pass credo, and pass tests.
+    Fix ALL errors. Code must compile, pass mix format, pass credo, pass credence (semantic lint), and pass tests.
     Output using: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
     """
@@ -956,7 +1036,7 @@ defmodule Pipeline do
   def run(thinking?) do
     IO.puts(String.duplicate("═", 70))
     IO.puts("  PREVIEW — Full Validation Pipeline")
-    IO.puts("  compile → format → credo → test → retry on failure")
+    IO.puts("  compile → format → credo → credence → test → retry on failure")
     IO.puts(String.duplicate("═", 70))
 
     log(0, "\nStep 1: Check llama.cpp server")
