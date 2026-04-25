@@ -1,6 +1,6 @@
 Given the following JSON:
 
-```json id="x91k2p"
+```json
 <PASTE JSON HERE>
 ```
 
