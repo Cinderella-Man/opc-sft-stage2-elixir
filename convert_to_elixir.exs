@@ -25,7 +25,7 @@ defmodule ElixirSFTConverter do
   @llama_url "http://127.0.0.1:8080/v1/chat/completions"
   @workspace "elixir_sft_workspace"
   @dataset_base "https://huggingface.co/datasets/OpenCoder-LLM/opc-sft-stage2/resolve/refs%2Fconvert%2Fparquet"
-  @max_retries 3
+  @max_retries 5
 
   @system_prompt """
   You convert Python coding exercises into Elixir coding exercises.
@@ -559,7 +559,7 @@ defmodule ElixirSFTConverter do
     end
   end
 
-  @max_refine_retries 3
+  @max_refine_retries 5
 
   defp apply_review(example, original_result, review_feedback, thinking?, max_tokens) do
     do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, 1)
