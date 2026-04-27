@@ -36,9 +36,18 @@ defmodule ElixirSFTConverter do
   INSTRUCTION rewriting rules:
   - Remove ALL Python references. Do not mention Python anywhere.
   - Replace types: dict→map, list→list, tuple→tuple, set→MapSet, string→string
-  - Adapt complexity claims for Elixir's data model (linked lists are O(n)
-    access, data is immutable, no in-place mutation)
   - Keep the core algorithmic problem identical
+  - Describe the PROBLEM, not the SOLUTION. The instruction should say WHAT
+    to compute and what edge cases to handle, never HOW to implement it.
+  - NEVER mention specific Elixir functions, modules, or data structures in
+    the instruction (no Enum.reduce, MapSet, String.graphemes, Enum.scan, etc.)
+  - NEVER dictate recursion style (tail-recursive, accumulator, etc.)
+  - NEVER prescribe internal helper functions, default arguments, or code structure
+  - DO mention expected time/space complexity if the original instruction does
+  - DO mention edge case behavior (empty input, negative numbers, unicode, etc.)
+  - DO mention the expected function name and its input/output contract
+  - Think of the instruction as what you'd give to a human developer in a
+    coding interview — describe the problem and constraints, not the answer
 
   PYTHON → ELIXIR translation patterns (apply these, don't transliterate):
   - for loop with accumulator → Enum.reduce/3 or recursive function with accumulator
@@ -86,6 +95,15 @@ defmodule ElixirSFTConverter do
   - when var == literal in guards — pattern match the literal in the function head
   - Decomposing a string into graphemes/charlist only to compare with Enum.reverse
     — compare strings directly with String.reverse/1
+  - def/defp functions prefixed with is_ (e.g. is_valid, is_palindrome) — use ? suffix
+    instead (valid?, palindrome?). is_ prefix is reserved for guard-safe functions.
+  - Enum.count/1 without a predicate — use length/1 for lists
+  - List.foldl/3 or List.foldr/3 — use Enum.reduce/3 instead
+  - Enum.map(f) |> Enum.max/min/sum — fuse into a single Enum.reduce pass
+  - Map.keys(m) |> Enum.map(fn k -> ... m[k] ... end) — iterate the map directly
+  - Catch-all clauses that only raise (def foo(_), do: raise(...)) — let
+    FunctionClauseError handle it; it includes the actual failing arguments
+  - if a > b, do: a, else: b — use max(a, b); same for min
 
   TEST rules:
   - Separate module with `use ExUnit.Case`
@@ -484,6 +502,11 @@ defmodule ElixirSFTConverter do
 
   Be specific and actionable. For each issue, say what to change and why.
   If the code is already excellent, say "NO_ISSUES_FOUND" and nothing else.
+
+  IMPORTANT: Do NOT suggest adding catch-all clauses that raise errors — Elixir's
+  FunctionClauseError is the idiomatic way to handle unmatched inputs. Do NOT
+  suggest adding is_list/is_integer guards unless the function genuinely needs
+  to accept mixed types. Focus on real improvements, not defensive boilerplate.
   """
 
   @refine_prompt """
@@ -496,10 +519,16 @@ defmodule ElixirSFTConverter do
   Apply ALL the reviewer's suggestions. Produce an improved version.
   The improved code MUST still pass all existing tests plus any new ones.
 
-  CRITICAL: If the code changes significantly (different algorithm, added guards,
-  new edge case handling), UPDATE THE INSTRUCTION to accurately describe what the
-  code actually does. The instruction must match the implementation — never claim
-  a technique the code doesn't use, and always mention techniques it does use.
+  IMPORTANT: The instruction describes the PROBLEM, not the solution. If you add
+  new edge case handling (e.g., empty input, invalid types), update the instruction
+  to mention the expected BEHAVIOR for those cases — but do NOT describe HOW the
+  code handles them internally. Never mention specific functions, data structures,
+  recursion styles, or implementation techniques in the instruction.
+
+  Good instruction update: "Returns nil for empty lists or lists with fewer than
+  two unique elements."
+  Bad instruction update: "Uses Enum.uniq/1 and pattern matching on [_, _ | _]
+  to handle deduplication and enforce minimum list length."
 
   Rules:
   - Keep the same module name and function name
@@ -708,7 +737,9 @@ defmodule ElixirSFTConverter do
 
     Produce the improved version. Keep the same module and function names.
     All existing tests must still pass. Add new edge case tests.
-    If the code changes significantly, update the instruction to match.
+    If you add new edge case handling, update the instruction to describe the
+    expected BEHAVIOR — but never describe implementation details, specific
+    functions, or data structures in the instruction.
     Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     """
   end
@@ -744,7 +775,8 @@ defmodule ElixirSFTConverter do
 
     Fix ALL errors. The code must compile, pass mix format, and pass all tests.
     Keep the same module and function names.
-    Update the instruction if the code approach changed.
+    If you update the instruction, describe BEHAVIOR only — never mention
+    implementation details like specific functions or data structures.
 
     Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
