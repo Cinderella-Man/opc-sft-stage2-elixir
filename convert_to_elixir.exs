@@ -832,6 +832,8 @@ defmodule ElixirSFTConverter do
   end
 
   defp call_llm_with_system(user_prompt, system_prompt, max_tokens) do
+    log(1, "Calling LLM with the following user prompt: #{user_prompt} and system prompt: #{system_prompt}")
+
     body = %{
       messages: [
         %{role: "system", content: system_prompt},
@@ -860,7 +862,9 @@ defmodule ElixirSFTConverter do
         end
 
         cond do
-          String.length(content) > 0 -> {:ok, content}
+          String.length(content) > 0 ->
+            log(1, "Response from LLM: #{content}")
+            {:ok, content}
           finish == "length" -> {:empty, "thinking exhausted tokens"}
           true -> {:empty, "empty content, finish=#{finish}"}
         end
@@ -871,6 +875,8 @@ defmodule ElixirSFTConverter do
   end
 
   defp call_llm(user_prompt, max_tokens) do
+    log(1, "Calling LLM with the following prompt: #{user_prompt}")
+
     body = %{
       messages: [
         %{role: "system", content: @system_prompt},
@@ -899,7 +905,9 @@ defmodule ElixirSFTConverter do
         end
 
         cond do
-          String.length(content) > 0 -> {:ok, content}
+          String.length(content) > 0 ->
+            log(1, "Response from LLM: #{content}")
+            {:ok, content}
           finish == "length" -> {:empty, "thinking exhausted all #{usage["completion_tokens"]} tokens (reasoning=#{String.length(reasoning)} chars)"}
           true -> {:empty, "empty content, finish=#{finish}"}
         end
