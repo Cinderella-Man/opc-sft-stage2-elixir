@@ -344,8 +344,6 @@ defmodule Revalidator do
     if delete? and failed > 0 do
       IO.puts("\n  --delete flag set: removing #{failed} failing entries from #{jsonl_path}")
 
-      failed_index_set = MapSet.new(failed_indices)
-
       kept =
         results
         |> Enum.reject(fn {_, status, _} -> status == :fail end)
