@@ -59,9 +59,18 @@ defmodule Pipeline do
   INSTRUCTION rewriting rules:
   - Remove ALL Python references. Do not mention Python anywhere.
   - Replace types: dict→map, list→list, tuple→tuple, set→MapSet, string→string
-  - Adapt complexity claims for Elixir's data model (linked lists are O(n)
-    access, data is immutable, no in-place mutation)
   - Keep the core algorithmic problem identical
+  - Describe the PROBLEM, not the SOLUTION. The instruction should say WHAT
+    to compute and what edge cases to handle, never HOW to implement it.
+  - NEVER mention specific Elixir functions, modules, or data structures in
+    the instruction (no Enum.reduce, MapSet, String.graphemes, Enum.scan, etc.)
+  - NEVER dictate recursion style (tail-recursive, accumulator, etc.)
+  - NEVER prescribe internal helper functions, default arguments, or code structure
+  - DO mention expected time/space complexity if the original instruction does
+  - DO mention edge case behavior (empty input, negative numbers, unicode, etc.)
+  - DO mention the expected function name and its input/output contract
+  - Think of the instruction as what you'd give to a human developer in a
+    coding interview — describe the problem and constraints, not the answer
 
   PYTHON → ELIXIR translation patterns (apply these, don't transliterate):
   - for loop with accumulator → Enum.reduce/3 or recursive function with accumulator
@@ -92,8 +101,21 @@ defmodule Pipeline do
   - Guards (when is_list/is_integer/is_binary, when x > 0, etc.)
   - @doc with examples and @spec for type documentation
   - with for chaining multiple {:ok, _} results
+  - Descriptive parameter names — NEVER use single-letter names like s, n, k, m.
+    Use input_string, count, index, size, etc. This applies to ALL parameters in
+    ALL clauses, including private helper functions and guards.
+  - In multi-clause functions, prefix unused parameters with _ in EACH clause
+    independently. Each clause is compiled separately — a variable used in one
+    clause's guard or body does NOT make it "used" in another clause.
+    Example:
+      defp expand(_tuple, left, _right, _size) when left < 0, do: 0
+      defp expand(tuple, left, right, _size) when elem(tuple, left) != elem(tuple, right), do: 0
+      defp expand(tuple, left, right, size), do: 1 + expand(tuple, left - 1, right + 1, size)
+    Notice: _tuple, _right, _size in first clause; _size in second; none in third.
 
   Anti-patterns to AVOID:
+  - Single-letter parameter names (s, n, k, m, i, l, r, etc.) — Elixir linters
+    flag these. Use descriptive names: input_string, count, index, left, right, etc.
   - Enum.at/2 inside Enum.reduce or recursion (O(n) per access on linked lists)
   - Building lists with list ++ [element] (O(n) per append)
   - ++ inside recursive functions (same O(n²) cost as in loops)
@@ -109,6 +131,16 @@ defmodule Pipeline do
   - when var == literal in guards — pattern match the literal in the function head
   - Decomposing a string into graphemes/charlist only to compare with Enum.reverse
     — compare strings directly with String.reverse/1
+  - def/defp functions prefixed with is_ (e.g. is_valid, is_palindrome) — use ? suffix
+    instead (valid?, palindrome?). is_ prefix is reserved for guard-safe functions.
+  - Enum.count/1 without a predicate — use length/1 for lists
+  - List.foldl/3 or List.foldr/3 — use Enum.reduce/3 instead
+  - Enum.map(f) |> Enum.max/min/sum — fuse into a single Enum.reduce pass
+  - Map.keys(m) |> Enum.map(fn k -> ... m[k] ... end) — iterate the map directly
+  - Catch-all clauses that only raise (def foo(_), do: raise(...)) — let
+    FunctionClauseError handle it; it includes the actual failing arguments
+  - if a > b, do: a, else: b — use max(a, b); same for min
+  - Enum.map(f) |> Enum.join — use Enum.map_join/3 for single-pass
 
   TEST rules:
   - Separate module with `use ExUnit.Case`
@@ -256,7 +288,6 @@ defmodule Pipeline do
 
     errors = []
 
-    # Step 1: Compile
     log(2, "[1/5] Running `mix compile --warnings-as-errors --force`...")
     {output, code} = System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
       cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
@@ -270,7 +301,6 @@ defmodule Pipeline do
       errors ++ [{:compile, clean_mix_output(output)}]
     end
 
-    # Step 2: Format
     errors = if compile_ok do
       log(2, "[2/5] Running `mix format --check-formatted`...")
       {_output, code} = System.cmd("mix", ["format", "--check-formatted",
@@ -291,7 +321,6 @@ defmodule Pipeline do
       errors
     end
 
-    # Step 3: Credo
     errors = if compile_ok do
       log(2, "[3/5] Running `mix credo --strict` on lib/solution.ex...")
       {output, _code} = System.cmd("mix", ["credo", "list", "--strict",
@@ -316,7 +345,6 @@ defmodule Pipeline do
       errors
     end
 
-    # Step 4: Credence (semantic lint)
     errors = if compile_ok do
       log(2, "[4/5] Running Credence semantic analysis on lib/solution.ex...")
       {output, code} = System.cmd("mix", ["run", "--no-start", "run_credence.exs"],
@@ -340,7 +368,6 @@ defmodule Pipeline do
       errors
     end
 
-    # Step 5: Tests
     {test_result, errors} = if compile_ok do
       log(2, "[5/5] Running `mix test test/solution_test.exs`...")
       {output, code} = System.cmd("mix", ["test", "test/solution_test.exs", "--no-deps-check"],
@@ -491,6 +518,11 @@ defmodule Pipeline do
 
   Be specific and actionable. For each issue, say what to change and why.
   If the code is already excellent, say "NO_ISSUES_FOUND" and nothing else.
+
+  IMPORTANT: Do NOT suggest adding catch-all clauses that raise errors — Elixir's
+  FunctionClauseError is the idiomatic way to handle unmatched inputs. Do NOT
+  suggest adding is_list/is_integer guards unless the function genuinely needs
+  to accept mixed types. Focus on real improvements, not defensive boilerplate.
   """
 
   @refine_prompt """
@@ -503,9 +535,16 @@ defmodule Pipeline do
   Apply ALL the reviewer's suggestions. Produce an improved version.
   The improved code MUST still pass all existing tests plus any new ones.
 
-  CRITICAL: If the code changes significantly (different algorithm, added guards,
-  new edge case handling), UPDATE THE INSTRUCTION to accurately describe what the
-  code actually does. The instruction must match the implementation.
+  IMPORTANT: The instruction describes the PROBLEM, not the solution. If you add
+  new edge case handling (e.g., empty input, invalid types), update the instruction
+  to mention the expected BEHAVIOR for those cases — but do NOT describe HOW the
+  code handles them internally. Never mention specific functions, data structures,
+  recursion styles, or implementation techniques in the instruction.
+
+  Good instruction update: "Returns nil for empty lists or lists with fewer than
+  two unique elements."
+  Bad instruction update: "Uses Enum.uniq/1 and pattern matching on [_, _ | _]
+  to handle deduplication and enforce minimum list length."
 
   Rules:
   - Keep the same module name and function name
@@ -707,7 +746,9 @@ defmodule Pipeline do
 
     Produce the improved version. Keep the same module and function names.
     All existing tests must still pass. Add new edge case tests.
-    If the code changes significantly, update the instruction to match.
+    If you add new edge case handling, update the instruction to describe the
+    expected BEHAVIOR — but never describe implementation details, specific
+    functions, or data structures in the instruction.
     Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     """
   end
@@ -742,8 +783,15 @@ defmodule Pipeline do
     #{error_text}
 
     Fix ALL errors. The code must compile, pass mix format, and pass all tests.
+
+    Common Elixir pitfalls when fixing errors:
+    - "unused variable" warnings: prefix with _ in THAT clause only (each clause is independent)
+    - "undefined variable": you probably renamed a param to _name but still reference it in the body
+    - "descriptive_names" credence error: replace single-letter params with descriptive names in ALL clauses
+
     Keep the same module and function names.
-    Update the instruction if the code approach changed.
+    If you update the instruction, describe BEHAVIOR only — never mention
+    implementation details like specific functions or data structures.
 
     Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
@@ -943,6 +991,12 @@ defmodule Pipeline do
     #{error_text}
 
     Fix ALL errors. Code must compile, pass mix format, pass credo, pass credence (semantic lint), and pass tests.
+
+    Common Elixir pitfalls when fixing errors:
+    - "unused variable" warnings: prefix with _ in THAT clause only (each clause is independent)
+    - "undefined variable": you probably renamed a param to _name in one clause but still use it in the body — keep the name without _ in clauses where it IS used
+    - "descriptive_names" credence error: replace single-letter params (s, n, k) with descriptive names in ALL clauses of the function
+
     Output using: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
     """

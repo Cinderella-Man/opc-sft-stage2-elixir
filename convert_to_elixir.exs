@@ -6,8 +6,12 @@
 #   1. LLM rewrites instruction + code for Elixir
 #   2. Module written to lib/, tests to test/
 #   3. Pipeline: mix compile → mix format → mix credo → credence → mix test
-#   4. If anything fails, errors sent back to LLM (up to 3 retries)
+#   4. If anything fails, errors sent back to LLM (up to 5 retries)
 #   5. Final result saved to JSONL
+#
+# Smart resume: scans both output and error files to find which indices
+# are already processed. Skips those and picks up the next missing one.
+# Delete an entry from the output file to have it re-processed.
 #
 # Usage:
 #   elixir convert_to_elixir.exs [subset] [start_index] [--workers N]
@@ -78,8 +82,21 @@ defmodule ElixirSFTConverter do
   - Guards (when is_list/is_integer/is_binary, when x > 0, etc.)
   - @doc with examples and @spec for type documentation
   - with for chaining multiple {:ok, _} results
+  - Descriptive parameter names — NEVER use single-letter names like s, n, k, m.
+    Use input_string, count, index, size, etc. This applies to ALL parameters in
+    ALL clauses, including private helper functions and guards.
+  - In multi-clause functions, prefix unused parameters with _ in EACH clause
+    independently. Each clause is compiled separately — a variable used in one
+    clause's guard or body does NOT make it "used" in another clause.
+    Example:
+      defp expand(_tuple, left, _right, _size) when left < 0, do: 0
+      defp expand(tuple, left, right, _size) when elem(tuple, left) != elem(tuple, right), do: 0
+      defp expand(tuple, left, right, size), do: 1 + expand(tuple, left - 1, right + 1, size)
+    Notice: _tuple, _right, _size in first clause; _size in second; none in third.
 
   Anti-patterns to AVOID:
+  - Single-letter parameter names (s, n, k, m, i, l, r, etc.) — Elixir linters
+    flag these. Use descriptive names: input_string, count, index, left, right, etc.
   - Enum.at/2 inside Enum.reduce or recursion (O(n) per access on linked lists)
   - Building lists with list ++ [element] (O(n) per append)
   - ++ inside recursive functions (same O(n²) cost as in loops)
@@ -104,6 +121,7 @@ defmodule ElixirSFTConverter do
   - Catch-all clauses that only raise (def foo(_), do: raise(...)) — let
     FunctionClauseError handle it; it includes the actual failing arguments
   - if a > b, do: a, else: b — use max(a, b); same for min
+  - Enum.map(f) |> Enum.join — use Enum.map_join/3 for single-pass
 
   TEST rules:
   - Separate module with `use ExUnit.Case`
@@ -212,7 +230,6 @@ defmodule ElixirSFTConverter do
       ensure_credence_script(workspace)
 
       log(1, "Removing default generated lib/*.ex and test/*_test.exs...")
-      # The default file name depends on the workspace dir name; just glob everything
       for f <- Path.wildcard(Path.join(workspace, "lib/*.ex")), do: File.rm(f)
       for f <- Path.wildcard(Path.join(workspace, "test/*_test.exs")), do: File.rm(f)
 
@@ -277,7 +294,6 @@ defmodule ElixirSFTConverter do
 
     errors = []
 
-    # Step 1: Compile
     log(2, "[1/5] Running `mix compile --warnings-as-errors --force`...")
     {output, code} = System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
       cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
@@ -291,7 +307,6 @@ defmodule ElixirSFTConverter do
       errors ++ [{:compile, clean(output)}]
     end
 
-    # Step 2: Format
     formatted_clean = if compiled do
       log(2, "[2/5] Running `mix format --check-formatted`...")
       {_, code} = System.cmd("mix", ["format", "--check-formatted", "lib/solution.ex", "test/solution_test.exs"],
@@ -311,7 +326,6 @@ defmodule ElixirSFTConverter do
       nil
     end
 
-    # Step 3: Credo
     credo_issues = if compiled do
       log(2, "[3/5] Running `mix credo --strict` on lib/solution.ex...")
       {output, _} = System.cmd("mix", ["credo", "list", "--strict", "--format", "oneline", "lib/solution.ex"],
@@ -335,7 +349,6 @@ defmodule ElixirSFTConverter do
     end
     errors = if credo_issues != [], do: errors ++ [{:credo, Enum.join(credo_issues, "\n")}], else: errors
 
-    # Step 4: Credence (semantic lint)
     errors = if compiled do
       log(2, "[4/5] Running Credence semantic analysis on lib/solution.ex...")
       {output, code} = System.cmd("mix", ["run", "--no-start", "run_credence.exs"],
@@ -359,7 +372,6 @@ defmodule ElixirSFTConverter do
       errors
     end
 
-    # Step 5: Tests
     {test_result, errors} = if compiled do
       log(2, "[5/5] Running `mix test test/solution_test.exs`...")
       {output, code} = System.cmd("mix", ["test", "test/solution_test.exs", "--no-deps-check"],
@@ -377,7 +389,6 @@ defmodule ElixirSFTConverter do
       {:skip, errors}
     end
 
-    # Re-read (may have been auto-formatted)
     final_mod = File.read!(mod_path)
     final_test = File.read!(test_path)
 
@@ -576,7 +587,6 @@ defmodule ElixirSFTConverter do
   """
 
   defp refine_solution(example, result, max_tokens, workspace) do
-    # Step 1: Ask LLM to review the working code
     log(2, "[Step 1/3] Asking LLM to review the working code for issues and edge cases...")
 
     review_user = build_review_prompt(example, result)
@@ -589,18 +599,15 @@ defmodule ElixirSFTConverter do
         elapsed = System.monotonic_time(:millisecond) - t0
         log(2, "Review received in #{Float.round(elapsed / 1000, 1)}s (#{String.length(review_feedback)} chars)")
 
-        # Check if reviewer found no issues
         if String.contains?(review_feedback, "NO_ISSUES_FOUND") do
           log(2, "✓ Reviewer found no issues — code is already good")
           {:ok, Map.put(result, :refined, false)}
         else
-          # Show summary of feedback
           feedback_lines = review_feedback |> String.split("\n") |> Enum.reject(&(&1 == ""))
           log(2, "Reviewer found #{length(feedback_lines)} lines of feedback:")
           feedback_lines |> Enum.take(5) |> Enum.each(&log(3, String.slice(&1, 0, 120)))
           if length(feedback_lines) > 5, do: log(3, "... (#{length(feedback_lines) - 5} more lines)")
 
-          # Step 2: Ask LLM to apply the review feedback
           apply_review(example, result, review_feedback, max_tokens, workspace)
         end
 
@@ -658,7 +665,6 @@ defmodule ElixirSFTConverter do
               new_tests = count_tests(refined_result.test_code)
               log(2, "Tests: #{orig_tests} original → #{new_tests} after refinement")
 
-              # Use updated instruction if provided, otherwise keep original
               final_instruction = if refined_instruction && refined_instruction != "" do
                 log(2, "Instruction updated by refinement")
                 refined_instruction
@@ -794,6 +800,12 @@ defmodule ElixirSFTConverter do
     #{error_text}
 
     Fix ALL errors. The code must compile, pass mix format, and pass all tests.
+
+    Common Elixir pitfalls when fixing errors:
+    - "unused variable" warnings: prefix with _ in THAT clause only (each clause is independent)
+    - "undefined variable": you probably renamed a param to _name but still reference it in the body
+    - "descriptive_names" credence error: replace single-letter params with descriptive names in ALL clauses
+
     Keep the same module and function names.
     If you update the instruction, describe BEHAVIOR only — never mention
     implementation details like specific functions or data structures.
@@ -810,7 +822,6 @@ defmodule ElixirSFTConverter do
       |> String.replace(~r/\n?```$/, "")
       |> String.trim()
 
-    # Try with instruction first
     if String.contains?(content, "---INSTRUCTION---") do
       with [_, rest] <- String.split(content, "---INSTRUCTION---", parts: 2),
            [instruction, rest] <- String.split(rest, "---MODULE---", parts: 2),
@@ -828,7 +839,6 @@ defmodule ElixirSFTConverter do
         _ -> :error
       end
     else
-      # Fallback: no instruction section
       with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
            [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
         test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
@@ -1008,6 +1018,12 @@ defmodule ElixirSFTConverter do
     #{error_text}
 
     Fix ALL errors. Code must compile, pass mix format, pass credo, pass credence (semantic lint), and pass tests.
+
+    Common Elixir pitfalls when fixing errors:
+    - "unused variable" warnings: prefix with _ in THAT clause only (each clause is independent)
+    - "undefined variable": you probably renamed a param to _name in one clause but still use it in the body — keep the name without _ in clauses where it IS used
+    - "descriptive_names" credence error: replace single-letter params (s, n, k) with descriptive names in ALL clauses of the function
+
     Output using: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     Nothing else.
     """
@@ -1124,23 +1140,20 @@ defmodule ElixirSFTConverter do
     filename
   end
 
-  # ── Auto-Resume ──────────────────────────────────────────────────
+  # ── Smart Resume ─────────────────────────────────────────────────
 
-  def detect_resume_index(output_path) do
-    errors_path = String.replace(output_path, ".jsonl", "_errors.jsonl")
+  def load_completed_indices(output_path, errors_path) do
+    output_indices = collect_indices_from_file(output_path)
+    error_indices = collect_indices_from_file(errors_path)
 
-    max_output = last_index_in_file(output_path)
-    max_errors = last_index_in_file(errors_path)
+    completed = MapSet.union(output_indices, error_indices)
 
-    case {max_output, max_errors} do
-      {nil, nil} -> :start_fresh
-      {a, nil} -> {:resume, a}
-      {nil, b} -> {:resume, b}
-      {a, b} -> {:resume, max(a, b)}
-    end
+    log(0, "Loaded #{MapSet.size(output_indices)} completed + #{MapSet.size(error_indices)} errored = #{MapSet.size(completed)} total processed indices")
+
+    completed
   end
 
-  defp last_index_in_file(path) do
+  defp collect_indices_from_file(path) do
     if File.exists?(path) do
       path
       |> File.stream!()
@@ -1153,9 +1166,9 @@ defmodule ElixirSFTConverter do
         end
       end)
       |> Stream.reject(&is_nil/1)
-      |> Enum.max(fn -> nil end)
+      |> MapSet.new()
     else
-      nil
+      MapSet.new()
     end
   end
 
@@ -1178,97 +1191,112 @@ defmodule ElixirSFTConverter do
     df = Explorer.DataFrame.from_parquet!(parquet_path)
     total = Explorer.DataFrame.n_rows(df)
     log(1, "Loaded #{total} rows total")
-    log(1, "Will process rows #{start_index}..#{total - 1} (#{total - start_index} rows)")
-    log(1, "LLM: #{@llama_url}, max_tokens=#{max_tokens}, workers=#{concurrency}")
-    log(1, "Output  → #{output_path}")
-    log(1, "Errors  → #{errors_path}")
-    log(1, "Log     → #{log_path}")
 
-    log(0, "\nStep 4: Begin conversion loop (#{concurrency} workers)")
-    file = File.open!(output_path, [:append, :utf8])
-    errors_file = File.open!(errors_path, [:append, :utf8])
-    log_file = File.open!(log_path, [:append, :utf8])
+    log(0, "\nStep 4: Scan existing output for already-processed indices")
+    completed = load_completed_indices(output_path, errors_path)
 
-    stats = %{ok: 0, failed: 0, total_attempts: 0, refined: 0}
+    pending =
+      start_index..(total - 1)
+      |> Enum.reject(&MapSet.member?(completed, &1))
 
-    stats =
-      df
-      |> Explorer.DataFrame.slice(start_index, total - start_index)
-      |> Explorer.DataFrame.to_rows()
-      |> Enum.with_index(start_index)
-      |> Task.async_stream(
-        fn {row, idx} ->
-          workspace_id = checkout_workspace()
-          workspace = workspace_dir(workspace_id)
-          entry = row["entry_point"] || "?"
-          t0 = System.monotonic_time(:millisecond)
+    log(1, "#{length(pending)} indices pending (from #{start_index}..#{total - 1}, skipping #{MapSet.size(completed)} already done)")
 
-          IO.puts("\n" <> String.duplicate("─", 60))
-          log(0, "[#{idx + 1}/#{total}] Converting: #{entry} (worker #{workspace_id})")
-          IO.puts(String.duplicate("─", 60))
+    if pending == [] do
+      log(0, "\n✓ All indices already processed. Nothing to do.")
+    else
+      log(1, "First pending: #{hd(pending)}, last pending: #{List.last(pending)}")
+      log(1, "LLM: #{@llama_url}, max_tokens=#{max_tokens}, workers=#{concurrency}")
+      log(1, "Output  → #{output_path}")
+      log(1, "Errors  → #{errors_path}")
+      log(1, "Log     → #{log_path}")
 
-          result = convert_row(row, max_tokens, workspace)
-          elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
+      log(0, "\nStep 5: Begin conversion loop (#{concurrency} workers)")
+      file = File.open!(output_path, [:append, :utf8])
+      errors_file = File.open!(errors_path, [:append, :utf8])
+      log_file = File.open!(log_path, [:append, :utf8])
 
-          checkin_workspace(workspace_id)
-          {row, idx, entry, result, elapsed}
-        end,
-        max_concurrency: concurrency,
-        timeout: :infinity,
-        ordered: false
-      )
-      |> Enum.reduce(stats, fn {:ok, {row, idx, entry, result, elapsed}}, stats ->
-        case result do
-          {:ok, result} ->
-            refined_tag = if result[:refined], do: " | refined ✨", else: " | kept original"
-            tests_tag = if result[:tests_after], do: " | tests: #{result[:tests_before]}→#{result[:tests_after]}", else: ""
-            log(0, "✓ SUCCESS: #{entry} | #{result.attempts} attempt(s) | #{elapsed}s | #{String.length(result.elixir_code)} chars#{refined_tag}#{tests_tag}")
-            log(1, "Appending result to #{output_path}")
-            IO.write(file, Jason.encode!(Map.put(result, :index, idx)) <> "\n")
-            IO.write(log_file, "[#{idx}] ✓ #{entry} attempts=#{result.attempts} refined=#{result[:refined]} time=#{elapsed}s\n")
-            refined_count = if result[:refined], do: 1, else: 0
-            %{stats | ok: stats.ok + 1, total_attempts: stats.total_attempts + result.attempts, refined: stats.refined + refined_count}
+      all_rows = Explorer.DataFrame.to_rows(df)
 
-          {:failed, reason} ->
-            log(0, "✗ FAILED: #{entry} | #{reason} | #{elapsed}s")
-            log(1, "Saving to errors file for later retry")
-            error_record = %{
-              index: idx,
-              entry_point: entry,
-              instruction: row["instruction"],
-              code: row["code"],
-              testcase: row["testcase"],
-              failure_reason: reason,
-              elapsed_s: elapsed
-            }
-            IO.write(errors_file, Jason.encode!(error_record) <> "\n")
-            IO.write(log_file, "[#{idx}] ✗ #{entry}: #{reason} time=#{elapsed}s\n")
-            %{stats | failed: stats.failed + 1, total_attempts: stats.total_attempts + @max_retries}
-        end
-      end)
+      stats = %{ok: 0, failed: 0, total_attempts: 0, refined: 0}
 
-    File.close(file)
-    File.close(errors_file)
-    File.close(log_file)
+      stats =
+        pending
+        |> Enum.map(fn idx -> {Enum.at(all_rows, idx), idx} end)
+        |> Task.async_stream(
+          fn {row, idx} ->
+            workspace_id = checkout_workspace()
+            workspace = workspace_dir(workspace_id)
+            entry = row["entry_point"] || "?"
+            t0 = System.monotonic_time(:millisecond)
 
-    processed = stats.ok + stats.failed
-    avg_attempts = if processed > 0, do: Float.round(stats.total_attempts / processed, 1), else: 0
+            IO.puts("\n" <> String.duplicate("─", 60))
+            log(0, "[#{idx}/#{total - 1}] Converting: #{entry} (worker #{workspace_id}, #{stats.ok + stats.failed + 1} pending)")
+            IO.puts(String.duplicate("─", 60))
 
-    IO.puts("""
+            result = convert_row(row, max_tokens, workspace)
+            elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
 
-    ══════════════════════════════════
-      FINISHED
-    ══════════════════════════════════
-      ✓ Converted:      #{stats.ok}
-      ✨ Refined:         #{stats.refined}/#{stats.ok}
-      ✗ Failed:          #{stats.failed}
-      Workers:           #{concurrency}
-      Avg attempts/row:  #{avg_attempts}
+            checkin_workspace(workspace_id)
+            {row, idx, entry, result, elapsed}
+          end,
+          max_concurrency: concurrency,
+          timeout: :infinity,
+          ordered: false
+        )
+        |> Enum.reduce(stats, fn {:ok, {row, idx, entry, result, elapsed}}, stats ->
+          case result do
+            {:ok, result} ->
+              refined_tag = if result[:refined], do: " | refined ✨", else: " | kept original"
+              tests_tag = if result[:tests_after], do: " | tests: #{result[:tests_before]}→#{result[:tests_after]}", else: ""
+              log(0, "✓ SUCCESS: #{entry} | #{result.attempts} attempt(s) | #{elapsed}s | #{String.length(result.elixir_code)} chars#{refined_tag}#{tests_tag}")
+              log(1, "Appending result to #{output_path}")
+              IO.write(file, Jason.encode!(Map.put(result, :index, idx)) <> "\n")
+              IO.write(log_file, "[#{idx}] ✓ #{entry} attempts=#{result.attempts} refined=#{result[:refined]} time=#{elapsed}s\n")
+              refined_count = if result[:refined], do: 1, else: 0
+              %{stats | ok: stats.ok + 1, total_attempts: stats.total_attempts + result.attempts, refined: stats.refined + refined_count}
 
-      Output:  #{output_path}
-      Errors:  #{errors_path}
-      Log:     #{log_path}
-    """)
+            {:failed, reason} ->
+              log(0, "✗ FAILED: #{entry} | #{reason} | #{elapsed}s")
+              log(1, "Saving to errors file for later retry")
+              error_record = %{
+                index: idx,
+                entry_point: entry,
+                instruction: row["instruction"],
+                code: row["code"],
+                testcase: row["testcase"],
+                failure_reason: reason,
+                elapsed_s: elapsed
+              }
+              IO.write(errors_file, Jason.encode!(error_record) <> "\n")
+              IO.write(log_file, "[#{idx}] ✗ #{entry}: #{reason} time=#{elapsed}s\n")
+              %{stats | failed: stats.failed + 1, total_attempts: stats.total_attempts + @max_retries}
+          end
+        end)
+
+      File.close(file)
+      File.close(errors_file)
+      File.close(log_file)
+
+      processed = stats.ok + stats.failed
+      avg_attempts = if processed > 0, do: Float.round(stats.total_attempts / processed, 1), else: 0
+
+      IO.puts("""
+
+      ══════════════════════════════════
+        FINISHED
+      ══════════════════════════════════
+        ✓ Converted:      #{stats.ok}
+        ✨ Refined:         #{stats.refined}/#{stats.ok}
+        ✗ Failed:          #{stats.failed}
+        ⏭ Skipped:         #{MapSet.size(completed)} (already done)
+        Workers:           #{concurrency}
+        Avg attempts/row:  #{avg_attempts}
+
+        Output:  #{output_path}
+        Errors:  #{errors_path}
+        Log:     #{log_path}
+      """)
+    end
   end
 end
 
@@ -1284,45 +1312,27 @@ args = argv
       {1, args}
     i ->
       n = args |> Enum.at(i + 1) |> String.to_integer()
-      remaining = args |> List.delete_at(i) |> List.delete_at(i)  # remove flag and value
+      remaining = args |> List.delete_at(i) |> List.delete_at(i)
       {n, remaining}
   end
 
-{subset, explicit_start} =
+{subset, start_index} =
   case args do
     [s, n] -> {s, String.to_integer(n)}
-    [s] -> {s, :auto}
-    [] -> {"educational_instruct", :auto}
-  end
-
-start =
-  case explicit_start do
-    :auto ->
-      output_path = "elixir_sft_#{subset}.jsonl"
-      case ElixirSFTConverter.detect_resume_index(output_path) do
-        {:resume, idx} ->
-          IO.puts("Found existing #{output_path}, last index=#{idx}. Resuming from #{idx + 1}.")
-          idx + 1
-        :start_fresh ->
-          IO.puts("No existing output file found. Starting from 0.")
-          0
-      end
-    n when is_integer(n) ->
-      IO.puts("Explicit start index: #{n}")
-      n
+    [s] -> {s, 0}
+    [] -> {"educational_instruct", 0}
   end
 
 IO.puts("""
 ╔═══════════════════════════════════════════════════════╗
-║  Elixir SFT Converter (v4 — validated + credence)     ║
+║  Elixir SFT Converter (v5 — smart resume + credence)  ║
 ║  compile → format → credo → credence → test → retry   ║
 ╚═══════════════════════════════════════════════════════╝
   Subset:   #{subset}
-  Start:    #{start}
+  Start:    #{start_index}
   Workers:  #{concurrency}
   Retries:  up to 5 per row
-  Output:   elixir_sft_#{subset}.jsonl
-  Errors:   elixir_sft_#{subset}_errors.jsonl
+  Mode:     skip already-processed indices (delete from output to re-run)
 """)
 
-ElixirSFTConverter.run(subset, start, concurrency)
+ElixirSFTConverter.run(subset, start_index, concurrency)
