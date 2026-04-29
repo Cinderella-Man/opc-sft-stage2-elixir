@@ -10,10 +10,10 @@
 #   5. Final result saved to JSONL
 #
 # Usage:
-#   elixir convert_to_elixir.exs [subset] [start_index] [--think]
+#   elixir convert_to_elixir.exs [subset] [start_index] [--workers N]
 #
-# First run creates a Mix project in ./elixir_sft_workspace/
-# Requires: Elixir 1.15+, llama.cpp on http://127.0.0.1:8080
+# First run creates Mix projects in ./elixir_sft_workspace_0/ .. _N/
+# Requires: Elixir 1.15+, llama.cpp on http://127.0.0.1:8020
 
 Mix.install([
   {:req, "~> 0.5"},
@@ -22,8 +22,8 @@ Mix.install([
 ])
 
 defmodule ElixirSFTConverter do
-  @llama_url "http://127.0.0.1:8080/v1/chat/completions"
-  @workspace "elixir_sft_workspace"
+  @llama_url "http://127.0.0.1:8020/v1/chat/completions"
+  @workspace_base "elixir_sft_workspace"
   @dataset_base "https://huggingface.co/datasets/OpenCoder-LLM/opc-sft-stage2/resolve/refs%2Fconvert%2Fparquet"
   @max_retries 5
 
@@ -143,22 +143,47 @@ defmodule ElixirSFTConverter do
 
   defp log(indent, msg), do: IO.puts(String.duplicate("  ", indent) <> msg)
 
+  # ── Workspace Pool ─────────────────────────────────────────────────
+
+  defp workspace_dir(id), do: "#{@workspace_base}_#{id}"
+
+  def start_pool(concurrency) do
+    Agent.start_link(fn -> Enum.to_list(0..(concurrency - 1)) end, name: :workspace_pool)
+  end
+
+  defp checkout_workspace do
+    Agent.get_and_update(:workspace_pool, fn
+      [id | rest] -> {id, rest}
+      [] -> {:wait, []}
+    end)
+  end
+
+  defp checkin_workspace(id) do
+    Agent.update(:workspace_pool, fn ids -> [id | ids] end)
+  end
+
   # ── Workspace Setup ────────────────────────────────────────────────
 
-  def setup_workspace do
-    if File.exists?(Path.join(@workspace, "mix.exs")) do
-      log(0, "Workspace #{@workspace}/ already exists, checking deps...")
-      ensure_credence_in_mix_exs()
-      ensure_credence_script()
-      ensure_deps()
+  def setup_workspaces(concurrency) do
+    Enum.each(0..(concurrency - 1), fn id ->
+      setup_workspace(workspace_dir(id))
+    end)
+  end
+
+  def setup_workspace(workspace) do
+    if File.exists?(Path.join(workspace, "mix.exs")) do
+      log(0, "Workspace #{workspace}/ already exists, checking deps...")
+      ensure_credence_in_mix_exs(workspace)
+      ensure_credence_script(workspace)
+      ensure_deps(workspace)
     else
-      log(0, "Creating Mix project with `mix new #{@workspace}`...")
-      {output, code} = System.cmd("mix", ["new", @workspace], stderr_to_stdout: true)
+      log(0, "Creating Mix project with `mix new #{workspace}`...")
+      {output, code} = System.cmd("mix", ["new", workspace], stderr_to_stdout: true)
       if code != 0, do: raise("mix new failed: #{output}")
       log(1, "Mix project scaffolded (mix.exs, lib/, test/, .formatter.exs)")
 
       log(1, "Injecting {:credo} and {:credence} into mix.exs deps...")
-      mix_exs = Path.join(@workspace, "mix.exs")
+      mix_exs = Path.join(workspace, "mix.exs")
       mix_content = File.read!(mix_exs)
       fixed = Regex.replace(
         ~r/defp deps do\n\s+\[.*?\]/s,
@@ -168,7 +193,7 @@ defmodule ElixirSFTConverter do
       File.write!(mix_exs, fixed)
 
       log(1, "Writing .credo.exs (disabling ModuleDoc and TagTODO checks)...")
-      File.write!(Path.join(@workspace, ".credo.exs"), """
+      File.write!(Path.join(workspace, ".credo.exs"), """
       %{
         configs: [
           %{
@@ -184,19 +209,20 @@ defmodule ElixirSFTConverter do
       }
       """)
 
-      ensure_credence_script()
+      ensure_credence_script(workspace)
 
       log(1, "Removing default generated lib/*.ex and test/*_test.exs...")
-      for f <- Path.wildcard(Path.join(@workspace, "lib/elixir_sft.ex")), do: File.rm(f)
-      for f <- Path.wildcard(Path.join(@workspace, "test/*_test.exs")), do: File.rm(f)
+      # The default file name depends on the workspace dir name; just glob everything
+      for f <- Path.wildcard(Path.join(workspace, "lib/*.ex")), do: File.rm(f)
+      for f <- Path.wildcard(Path.join(workspace, "test/*_test.exs")), do: File.rm(f)
 
-      ensure_deps()
-      log(0, "✓ Workspace ready")
+      ensure_deps(workspace)
+      log(0, "✓ Workspace #{workspace} ready")
     end
   end
 
-  defp ensure_credence_in_mix_exs do
-    mix_exs = Path.join(@workspace, "mix.exs")
+  defp ensure_credence_in_mix_exs(workspace) do
+    mix_exs = Path.join(workspace, "mix.exs")
     mix_content = File.read!(mix_exs)
 
     unless String.contains?(mix_content, "credence") do
@@ -210,8 +236,8 @@ defmodule ElixirSFTConverter do
     end
   end
 
-  defp ensure_credence_script do
-    script_path = Path.join(@workspace, "run_credence.exs")
+  defp ensure_credence_script(workspace) do
+    script_path = Path.join(workspace, "run_credence.exs")
 
     unless File.exists?(script_path) do
       log(1, "Writing run_credence.exs (semantic lint check script)...")
@@ -219,15 +245,15 @@ defmodule ElixirSFTConverter do
     end
   end
 
-  defp ensure_deps do
-    credo_ok = File.exists?(Path.join(@workspace, "deps/credo"))
-    credence_ok = File.exists?(Path.join(@workspace, "deps/credence"))
+  defp ensure_deps(workspace) do
+    credo_ok = File.exists?(Path.join(workspace, "deps/credo"))
+    credence_ok = File.exists?(Path.join(workspace, "deps/credence"))
 
     unless credo_ok and credence_ok do
       log(1, "Running `mix deps.get` to fetch deps...")
-      System.cmd("mix", ["deps.get"], cd: @workspace, stderr_to_stdout: true)
+      System.cmd("mix", ["deps.get"], cd: workspace, stderr_to_stdout: true)
       log(1, "Running `mix deps.compile` to compile deps...")
-      System.cmd("mix", ["deps.compile"], cd: @workspace, stderr_to_stdout: true)
+      System.cmd("mix", ["deps.compile"], cd: workspace, stderr_to_stdout: true)
       log(1, "✓ Deps ready")
     else
       log(1, "✓ Credo and Credence already installed")
@@ -236,13 +262,13 @@ defmodule ElixirSFTConverter do
 
   # ── Validation Pipeline ────────────────────────────────────────────
 
-  def validate(module_code, test_code) do
-    mod_path = Path.join(@workspace, "lib/solution.ex")
-    test_path = Path.join(@workspace, "test/solution_test.exs")
+  def validate(module_code, test_code, workspace) do
+    mod_path = Path.join(workspace, "lib/solution.ex")
+    test_path = Path.join(workspace, "test/solution_test.exs")
 
     log(2, "Cleaning old lib/*.ex and test/*_test.exs...")
-    for f <- Path.wildcard(Path.join(@workspace, "lib/*.ex")), do: File.rm(f)
-    for f <- Path.wildcard(Path.join(@workspace, "test/*_test.exs")), do: File.rm(f)
+    for f <- Path.wildcard(Path.join(workspace, "lib/*.ex")), do: File.rm(f)
+    for f <- Path.wildcard(Path.join(workspace, "test/*_test.exs")), do: File.rm(f)
 
     log(2, "Writing #{String.length(module_code)} chars → lib/solution.ex")
     File.write!(mod_path, module_code)
@@ -254,7 +280,7 @@ defmodule ElixirSFTConverter do
     # Step 1: Compile
     log(2, "[1/5] Running `mix compile --warnings-as-errors --force`...")
     {output, code} = System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
-      cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+      cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
     compiled = code == 0
     errors = if compiled do
       log(3, "✓ Compilation passed")
@@ -269,11 +295,11 @@ defmodule ElixirSFTConverter do
     formatted_clean = if compiled do
       log(2, "[2/5] Running `mix format --check-formatted`...")
       {_, code} = System.cmd("mix", ["format", "--check-formatted", "lib/solution.ex", "test/solution_test.exs"],
-        cd: @workspace, stderr_to_stdout: true)
+        cd: workspace, stderr_to_stdout: true)
       if code != 0 do
         log(3, "~ Code was not formatted, running `mix format` to auto-fix...")
         System.cmd("mix", ["format", "lib/solution.ex", "test/solution_test.exs"],
-          cd: @workspace, stderr_to_stdout: true)
+          cd: workspace, stderr_to_stdout: true)
         log(3, "✓ Auto-formatted (will use formatted version)")
         false
       else
@@ -289,7 +315,7 @@ defmodule ElixirSFTConverter do
     credo_issues = if compiled do
       log(2, "[3/5] Running `mix credo --strict` on lib/solution.ex...")
       {output, _} = System.cmd("mix", ["credo", "list", "--strict", "--format", "oneline", "lib/solution.ex"],
-        cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+        cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
       issues = output
       |> String.split("\n")
       |> Enum.filter(&String.contains?(&1, "lib/solution.ex"))
@@ -313,7 +339,7 @@ defmodule ElixirSFTConverter do
     errors = if compiled do
       log(2, "[4/5] Running Credence semantic analysis on lib/solution.ex...")
       {output, code} = System.cmd("mix", ["run", "--no-start", "run_credence.exs"],
-        cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+        cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
       if code == 0 do
         log(3, "✓ No credence issues")
         errors
@@ -337,7 +363,7 @@ defmodule ElixirSFTConverter do
     {test_result, errors} = if compiled do
       log(2, "[5/5] Running `mix test test/solution_test.exs`...")
       {output, code} = System.cmd("mix", ["test", "test/solution_test.exs", "--no-deps-check"],
-        cd: @workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+        cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
       if code == 0 do
         log(3, "✓ All tests passed")
         {:pass, errors}
@@ -382,7 +408,7 @@ defmodule ElixirSFTConverter do
 
   # ── LLM + Retry Loop ──────────────────────────────────────────────
 
-  def convert_row(row, thinking?, max_tokens) do
+  def convert_row(row, max_tokens, workspace) do
     entry = row["entry_point"] || "?"
     log(1, "Building initial prompt from Python: #{String.slice(row["instruction"], 0, 80)}...")
 
@@ -393,26 +419,26 @@ defmodule ElixirSFTConverter do
       tests: row["testcase"] || []
     }
 
-    prompt = build_initial_prompt(example, thinking?)
+    prompt = build_initial_prompt(example)
     log(1, "Prompt built (#{String.length(prompt)} chars). Starting conversion attempts...")
 
-    case do_attempt(example, prompt, thinking?, max_tokens, 1) do
+    case do_attempt(example, prompt, max_tokens, 1, workspace) do
       {:ok, result} ->
         log(1, "")
         log(1, "═══ Refinement Phase ═══")
-        refine_solution(example, result, thinking?, max_tokens)
+        refine_solution(example, result, max_tokens, workspace)
 
       {:failed, reason} ->
         {:failed, reason}
     end
   end
 
-  defp do_attempt(_example, _prompt, _thinking?, _max_tokens, attempt) when attempt > @max_retries do
+  defp do_attempt(_example, _prompt, _max_tokens, attempt, _workspace) when attempt > @max_retries do
     log(1, "✗ Giving up after #{@max_retries} attempts")
     {:failed, "exceeded #{@max_retries} retries"}
   end
 
-  defp do_attempt(example, prompt, thinking?, max_tokens, attempt) do
+  defp do_attempt(example, prompt, max_tokens, attempt, workspace) do
     log(1, "── Attempt #{attempt}/#{@max_retries} ──")
     log(1, "Sending prompt to LLM (#{String.length(prompt)} chars, max_tokens=#{max_tokens})...")
 
@@ -429,7 +455,7 @@ defmodule ElixirSFTConverter do
             log(1, "✓ Parsed: instruction=#{String.length(instruction)} module=#{String.length(module_code)} test=#{String.length(test_code)} chars")
             log(1, "Running validation pipeline...")
 
-            result = validate(module_code, test_code)
+            result = validate(module_code, test_code, workspace)
 
             if result.errors == [] do
               log(1, "✓ Conversion succeeded on attempt #{attempt}")
@@ -447,26 +473,26 @@ defmodule ElixirSFTConverter do
             else
               error_types = result.errors |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")
               log(1, "✗ Validation failed (#{error_types}). Building retry prompt with error feedback...")
-              retry = build_retry_prompt(example, content, result.errors, thinking?)
+              retry = build_retry_prompt(example, content, result.errors)
               log(1, "Retry prompt built (#{String.length(retry)} chars)")
-              do_attempt(example, retry, thinking?, max_tokens, attempt + 1)
+              do_attempt(example, retry, max_tokens, attempt + 1, workspace)
             end
 
           :error ->
             log(1, "✗ Could not find delimiters in LLM output. First 150 chars:")
             log(2, String.slice(content, 0, 150))
             log(1, "Building parse-retry prompt (includes previous output so LLM can see what went wrong)...")
-            retry = build_parse_retry_prompt(example, content, thinking?)
-            do_attempt(example, retry, thinking?, max_tokens, attempt + 1)
+            retry = build_parse_retry_prompt(example, content)
+            do_attempt(example, retry, max_tokens, attempt + 1, workspace)
         end
 
       {:empty, reason} ->
         elapsed = System.monotonic_time(:millisecond) - t0
         log(1, "✗ LLM returned empty response after #{Float.round(elapsed / 1000, 1)}s: #{reason}")
         if attempt < @max_retries do
-          log(1, "Retrying with a shorter prompt and /no_think reinforcement...")
+          log(1, "Retrying with a shorter prompt...")
           retry = build_empty_retry_prompt(example)
-          do_attempt(example, retry, thinking?, max_tokens, attempt + 1)
+          do_attempt(example, retry, max_tokens, attempt + 1, workspace)
         else
           log(1, "✗ No retries left")
           {:failed, reason}
@@ -477,7 +503,7 @@ defmodule ElixirSFTConverter do
         log(1, "✗ LLM request error after #{Float.round(elapsed / 1000, 1)}s: #{reason}")
         if attempt < @max_retries do
           log(1, "Retrying in case it was a transient error...")
-          do_attempt(example, prompt, thinking?, max_tokens, attempt + 1)
+          do_attempt(example, prompt, max_tokens, attempt + 1, workspace)
         else
           log(1, "✗ No retries left")
           {:failed, reason}
@@ -549,11 +575,11 @@ defmodule ElixirSFTConverter do
   Nothing else. No markdown. No explanations.
   """
 
-  defp refine_solution(example, result, thinking?, max_tokens) do
+  defp refine_solution(example, result, max_tokens, workspace) do
     # Step 1: Ask LLM to review the working code
     log(2, "[Step 1/3] Asking LLM to review the working code for issues and edge cases...")
 
-    review_user = build_review_prompt(example, result, thinking?)
+    review_user = build_review_prompt(example, result)
     log(2, "Review prompt: #{String.length(review_user)} chars")
 
     t0 = System.monotonic_time(:millisecond)
@@ -575,7 +601,7 @@ defmodule ElixirSFTConverter do
           if length(feedback_lines) > 5, do: log(3, "... (#{length(feedback_lines) - 5} more lines)")
 
           # Step 2: Ask LLM to apply the review feedback
-          apply_review(example, result, review_feedback, thinking?, max_tokens)
+          apply_review(example, result, review_feedback, max_tokens, workspace)
         end
 
       {:empty, reason} ->
@@ -590,22 +616,22 @@ defmodule ElixirSFTConverter do
 
   @max_refine_retries 5
 
-  defp apply_review(example, original_result, review_feedback, thinking?, max_tokens) do
-    do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, 1)
+  defp apply_review(example, original_result, review_feedback, max_tokens, workspace) do
+    do_refine_attempt(example, original_result, review_feedback, nil, max_tokens, 1, workspace)
   end
 
-  defp do_refine_attempt(_, original_result, _, _, _, _, attempt) when attempt > @max_refine_retries do
+  defp do_refine_attempt(_, original_result, _, _, _, attempt, _workspace) when attempt > @max_refine_retries do
     log(2, "✗ Refinement failed after #{@max_refine_retries} attempts. Keeping original.")
     {:ok, Map.merge(original_result, %{refined: false, refinement_failed: "exceeded #{@max_refine_retries} retries"})}
   end
 
-  defp do_refine_attempt(example, original_result, review_feedback, prev_errors, thinking?, max_tokens, attempt) do
+  defp do_refine_attempt(example, original_result, review_feedback, prev_errors, max_tokens, attempt, workspace) do
     log(2, "[Step 2/3] Refine attempt #{attempt}/#{@max_refine_retries}...")
 
     refine_user = if prev_errors do
-      build_refine_fix_prompt(original_result, prev_errors, thinking?)
+      build_refine_fix_prompt(original_result, prev_errors)
     else
-      build_refine_prompt(example, original_result, review_feedback, thinking?)
+      build_refine_prompt(example, original_result, review_feedback)
     end
 
     log(2, "Refine prompt: #{String.length(refine_user)} chars")
@@ -623,7 +649,7 @@ defmodule ElixirSFTConverter do
             log(2, "✓ Parsed: instruction=#{if refined_instruction, do: String.length(refined_instruction), else: "nil"} module=#{String.length(refined_module)} test=#{String.length(refined_test)} chars")
 
             log(2, "[Step 3/3] Validating refined code...")
-            refined_result = validate(refined_module, refined_test)
+            refined_result = validate(refined_module, refined_test, workspace)
 
             if refined_result.errors == [] do
               log(2, "✓ Refined version passed all checks on attempt #{attempt}!")
@@ -657,13 +683,13 @@ defmodule ElixirSFTConverter do
                 log(3, "[#{stage}] #{String.slice(msg, 0, 150)}")
               end)
               log(2, "Building retry prompt with error feedback...")
-              do_refine_attempt(example, original_result, review_feedback, {content, refined_result.errors}, thinking?, max_tokens, attempt + 1)
+              do_refine_attempt(example, original_result, review_feedback, {content, refined_result.errors}, max_tokens, attempt + 1, workspace)
             end
 
           :error ->
             log(2, "✗ Could not parse refined output on attempt #{attempt}.")
             if attempt < @max_refine_retries do
-              do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, attempt + 1)
+              do_refine_attempt(example, original_result, review_feedback, nil, max_tokens, attempt + 1, workspace)
             else
               log(2, "Keeping original.")
               {:ok, Map.put(original_result, :refined, false)}
@@ -673,7 +699,7 @@ defmodule ElixirSFTConverter do
       {:empty, reason} ->
         log(2, "✗ Refine call returned empty: #{reason}.")
         if attempt < @max_refine_retries do
-          do_refine_attempt(example, original_result, review_feedback, nil, thinking?, max_tokens, attempt + 1)
+          do_refine_attempt(example, original_result, review_feedback, nil, max_tokens, attempt + 1, workspace)
         else
           log(2, "Keeping original.")
           {:ok, Map.put(original_result, :refined, false)}
@@ -685,11 +711,9 @@ defmodule ElixirSFTConverter do
     end
   end
 
-  defp build_review_prompt(example, result, thinking?) do
-    prefix = unless thinking?, do: "/no_think\n", else: ""
-
+  defp build_review_prompt(example, result) do
     """
-    #{prefix}Review this Elixir code. Identify edge cases, idiom issues, and missing tests.
+    Review this Elixir code. Identify edge cases, idiom issues, and missing tests.
 
     ## Instruction
     #{result.instruction}
@@ -713,11 +737,9 @@ defmodule ElixirSFTConverter do
     """
   end
 
-  defp build_refine_prompt(_example, result, review_feedback, thinking?) do
-    prefix = unless thinking?, do: "/no_think\n", else: ""
-
+  defp build_refine_prompt(_example, result, review_feedback) do
     """
-    #{prefix}Apply the review feedback below to improve this Elixir code.
+    Apply the review feedback below to improve this Elixir code.
 
     ## Instruction
     #{result.instruction}
@@ -744,15 +766,13 @@ defmodule ElixirSFTConverter do
     """
   end
 
-  defp build_refine_fix_prompt(result, {previous_output, errors}, thinking?) do
-    prefix = unless thinking?, do: "/no_think\n", else: ""
-
+  defp build_refine_fix_prompt(result, {previous_output, errors}) do
     error_text = Enum.map_join(errors, "\n\n", fn {stage, msg} ->
       "### #{stage} error:\n#{msg}"
     end)
 
     """
-    #{prefix}Your previous refinement had errors. Fix them.
+    Your previous refinement had errors. Fix them.
 
     ## Current Instruction
     #{result.instruction}
@@ -839,9 +859,8 @@ defmodule ElixirSFTConverter do
         %{role: "system", content: system_prompt},
         %{role: "user", content: user_prompt}
       ],
-      temperature: 0.3,
-      max_tokens: max_tokens,
-      stream: false
+      model: "qwen3.6-27b-autoround",
+      max_tokens: max_tokens
     }
 
     case Req.post(@llama_url, json: body, receive_timeout: 600_000) do
@@ -882,9 +901,8 @@ defmodule ElixirSFTConverter do
         %{role: "system", content: @system_prompt},
         %{role: "user", content: user_prompt}
       ],
-      temperature: 0.3,
-      max_tokens: max_tokens,
-      stream: false
+      model: "qwen3.6-27b-autoround",
+      max_tokens: max_tokens
     }
 
     case Req.post(@llama_url, json: body, receive_timeout: 600_000) do
@@ -919,12 +937,11 @@ defmodule ElixirSFTConverter do
 
   # ── Prompt Builders ────────────────────────────────────────────────
 
-  defp build_initial_prompt(example, thinking?) do
-    prefix = unless thinking?, do: "/no_think\n", else: ""
+  defp build_initial_prompt(example) do
     tests = if is_list(example.tests), do: Enum.join(example.tests, "\n"), else: to_string(example.tests)
 
     """
-    #{prefix}Convert this Python exercise to Elixir. Rewrite both the instruction and the code.
+    Convert this Python exercise to Elixir. Rewrite both the instruction and the code.
 
     ## Python Instruction
     #{example.instruction}
@@ -943,11 +960,9 @@ defmodule ElixirSFTConverter do
   end
 
   defp build_empty_retry_prompt(example) do
-    # Always force /no_think on retry — the whole reason we got empty was thinking eating all tokens
     tests = if is_list(example.tests), do: Enum.join(example.tests, "\n"), else: to_string(example.tests)
 
     """
-    /no_think
     Convert this Python to Elixir. Be concise. Go straight to the output.
 
     Python: #{example.instruction}
@@ -971,15 +986,13 @@ defmodule ElixirSFTConverter do
     """
   end
 
-  defp build_retry_prompt(example, previous_output, errors, thinking?) do
-    prefix = unless thinking?, do: "/no_think\n", else: ""
-
+  defp build_retry_prompt(example, previous_output, errors) do
     error_text = Enum.map_join(errors, "\n\n", fn {stage, msg} ->
       "### #{stage} error:\n#{msg}"
     end)
 
     """
-    #{prefix}Your previous conversion had errors. Fix them.
+    Your previous conversion had errors. Fix them.
 
     ## Original Python
     #{example.instruction}
@@ -1000,12 +1013,11 @@ defmodule ElixirSFTConverter do
     """
   end
 
-  defp build_parse_retry_prompt(example, previous_output, thinking?) do
-    prefix = unless thinking?, do: "/no_think\n", else: ""
+  defp build_parse_retry_prompt(example, previous_output) do
     tests = if is_list(example.tests), do: Enum.join(example.tests, "\n"), else: to_string(example.tests)
 
     """
-    #{prefix}Your output could not be parsed. Use the EXACT delimiters below.
+    Your output could not be parsed. Use the EXACT delimiters below.
 
     ## Python
     #{example.instruction}
@@ -1149,32 +1161,33 @@ defmodule ElixirSFTConverter do
 
   # ── Main ───────────────────────────────────────────────────────────
 
-  def run(subset, start_index, thinking?) do
+  def run(subset, start_index, concurrency) do
     log(0, "Step 1: Ensure dataset is downloaded")
     parquet_path = ensure_downloaded(subset)
 
     output_path = "elixir_sft_#{subset}.jsonl"
     errors_path = "elixir_sft_#{subset}_errors.jsonl"
     log_path = "convert_log_#{subset}.txt"
-    max_tokens = if thinking?, do: 16_384, else: 12_288
+    max_tokens = 16_384
 
-    log(0, "\nStep 2: Set up Mix workspace for validation")
-    setup_workspace()
+    log(0, "\nStep 2: Set up #{concurrency} Mix workspace(s) for validation")
+    setup_workspaces(concurrency)
+    start_pool(concurrency)
 
     log(0, "\nStep 3: Load dataset from #{parquet_path}")
     df = Explorer.DataFrame.from_parquet!(parquet_path)
     total = Explorer.DataFrame.n_rows(df)
     log(1, "Loaded #{total} rows total")
     log(1, "Will process rows #{start_index}..#{total - 1} (#{total - start_index} rows)")
-    log(1, "LLM: #{@llama_url}, max_tokens=#{max_tokens}, thinking=#{thinking?}")
+    log(1, "LLM: #{@llama_url}, max_tokens=#{max_tokens}, workers=#{concurrency}")
     log(1, "Output  → #{output_path}")
     log(1, "Errors  → #{errors_path}")
     log(1, "Log     → #{log_path}")
 
-    log(0, "\nStep 4: Begin conversion loop")
+    log(0, "\nStep 4: Begin conversion loop (#{concurrency} workers)")
     file = File.open!(output_path, [:append, :utf8])
     errors_file = File.open!(errors_path, [:append, :utf8])
-    log = File.open!(log_path, [:append, :utf8])
+    log_file = File.open!(log_path, [:append, :utf8])
 
     stats = %{ok: 0, failed: 0, total_attempts: 0, refined: 0}
 
@@ -1183,28 +1196,40 @@ defmodule ElixirSFTConverter do
       |> Explorer.DataFrame.slice(start_index, total - start_index)
       |> Explorer.DataFrame.to_rows()
       |> Enum.with_index(start_index)
-      |> Enum.reduce(stats, fn {row, idx}, stats ->
-        entry = row["entry_point"] || "?"
-        t0 = System.monotonic_time(:millisecond)
+      |> Task.async_stream(
+        fn {row, idx} ->
+          workspace_id = checkout_workspace()
+          workspace = workspace_dir(workspace_id)
+          entry = row["entry_point"] || "?"
+          t0 = System.monotonic_time(:millisecond)
 
-        IO.puts("\n" <> String.duplicate("─", 60))
-        log(0, "[#{idx + 1}/#{total}] Converting: #{entry}")
-        IO.puts(String.duplicate("─", 60))
+          IO.puts("\n" <> String.duplicate("─", 60))
+          log(0, "[#{idx + 1}/#{total}] Converting: #{entry} (worker #{workspace_id})")
+          IO.puts(String.duplicate("─", 60))
 
-        case convert_row(row, thinking?, max_tokens) do
+          result = convert_row(row, max_tokens, workspace)
+          elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
+
+          checkin_workspace(workspace_id)
+          {row, idx, entry, result, elapsed}
+        end,
+        max_concurrency: concurrency,
+        timeout: :infinity,
+        ordered: false
+      )
+      |> Enum.reduce(stats, fn {:ok, {row, idx, entry, result, elapsed}}, stats ->
+        case result do
           {:ok, result} ->
-            elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
             refined_tag = if result[:refined], do: " | refined ✨", else: " | kept original"
             tests_tag = if result[:tests_after], do: " | tests: #{result[:tests_before]}→#{result[:tests_after]}", else: ""
             log(0, "✓ SUCCESS: #{entry} | #{result.attempts} attempt(s) | #{elapsed}s | #{String.length(result.elixir_code)} chars#{refined_tag}#{tests_tag}")
             log(1, "Appending result to #{output_path}")
             IO.write(file, Jason.encode!(Map.put(result, :index, idx)) <> "\n")
-            IO.write(log, "[#{idx}] ✓ #{entry} attempts=#{result.attempts} refined=#{result[:refined]} time=#{elapsed}s\n")
+            IO.write(log_file, "[#{idx}] ✓ #{entry} attempts=#{result.attempts} refined=#{result[:refined]} time=#{elapsed}s\n")
             refined_count = if result[:refined], do: 1, else: 0
             %{stats | ok: stats.ok + 1, total_attempts: stats.total_attempts + result.attempts, refined: stats.refined + refined_count}
 
           {:failed, reason} ->
-            elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
             log(0, "✗ FAILED: #{entry} | #{reason} | #{elapsed}s")
             log(1, "Saving to errors file for later retry")
             error_record = %{
@@ -1217,14 +1242,14 @@ defmodule ElixirSFTConverter do
               elapsed_s: elapsed
             }
             IO.write(errors_file, Jason.encode!(error_record) <> "\n")
-            IO.write(log, "[#{idx}] ✗ #{entry}: #{reason} time=#{elapsed}s\n")
+            IO.write(log_file, "[#{idx}] ✗ #{entry}: #{reason} time=#{elapsed}s\n")
             %{stats | failed: stats.failed + 1, total_attempts: stats.total_attempts + @max_retries}
         end
       end)
 
     File.close(file)
     File.close(errors_file)
-    File.close(log)
+    File.close(log_file)
 
     processed = stats.ok + stats.failed
     avg_attempts = if processed > 0, do: Float.round(stats.total_attempts / processed, 1), else: 0
@@ -1237,6 +1262,7 @@ defmodule ElixirSFTConverter do
       ✓ Converted:      #{stats.ok}
       ✨ Refined:         #{stats.refined}/#{stats.ok}
       ✗ Failed:          #{stats.failed}
+      Workers:           #{concurrency}
       Avg attempts/row:  #{avg_attempts}
 
       Output:  #{output_path}
@@ -1249,8 +1275,18 @@ end
 # ── CLI ──────────────────────────────────────────────────────────────
 
 argv = System.argv()
-thinking? = "--think" in argv
-args = Enum.reject(argv, &(&1 == "--think"))
+args = argv
+
+# Parse --workers N
+{concurrency, args} =
+  case Enum.find_index(args, &(&1 == "--workers")) do
+    nil ->
+      {1, args}
+    i ->
+      n = args |> Enum.at(i + 1) |> String.to_integer()
+      remaining = args |> List.delete_at(i) |> List.delete_at(i)  # remove flag and value
+      {n, remaining}
+  end
 
 {subset, explicit_start} =
   case args do
@@ -1283,10 +1319,10 @@ IO.puts("""
 ╚═══════════════════════════════════════════════════════╝
   Subset:   #{subset}
   Start:    #{start}
-  Thinking: #{thinking?}
-  Retries:  up to 3 per row
+  Workers:  #{concurrency}
+  Retries:  up to 5 per row
   Output:   elixir_sft_#{subset}.jsonl
   Errors:   elixir_sft_#{subset}_errors.jsonl
 """)
 
-ElixirSFTConverter.run(subset, start, thinking?)
+ElixirSFTConverter.run(subset, start, concurrency)

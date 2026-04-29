@@ -250,6 +250,12 @@ This was developed and tested with **Qwen3-27B** (Q5_K_M quantization) running o
 └── convert_log_educational_instruct.txt           # Log (created during run)
 ```
 
+## Dev notes
+
+```
+jq -r 'select(.index >= 100 and .index <= 124) | .elixir_code' elixir_sft_educational_instruct.jsonl > dump.txt
+```
+
 ## License
 
 The source dataset [OpenCoder-LLM/opc-sft-stage2](https://huggingface.co/datasets/OpenCoder-LLM/opc-sft-stage2) is released under the Apache 2.0 license. The conversion scripts in this repository are provided as-is for research and educational use.
