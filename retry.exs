@@ -428,7 +428,7 @@ defmodule Retrier do
     do_fix_attempt(entry, error_text, 1)
   end
 
-  defp do_fix_attempt(entry, _error_text, attempt) when attempt > @max_retries do
+  defp do_fix_attempt(_entry, _error_text, attempt) when attempt > @max_retries do
     log(2, "✗ Fix failed after #{@max_retries} attempts")
     {:failed, "exceeded #{@max_retries} retries"}
   end
@@ -657,125 +657,130 @@ defmodule Retrier do
       System.halt(1)
     end
 
+    tmp_path = jsonl_path <> ".tmp"
     errors_path = String.replace(jsonl_path, ".jsonl", "_errors.jsonl")
 
     log(0, "Step 1: Set up workspace")
     setup_workspace()
     update_credence()
 
-    log(0, "\nStep 2: Load entries from #{jsonl_path}")
-    entries =
+    # Convert filter_indices to a MapSet for O(1) lookup
+    index_set = if is_list(filter_indices), do: MapSet.new(filter_indices), else: nil
+
+    log(0, "\nStep 2: Processing entries line-by-line...")
+
+    # Open all file handles
+    output_file = File.open!(tmp_path, [:write, :utf8])
+    errors_file = File.open!(errors_path, [:append, :utf8])
+
+    stats = %{passed_as_is: 0, instruction_rewritten: 0, code_fixed: 0, failed: 0, skipped: 0}
+
+    # Stream the input file to keep memory usage low and allow immediate writes
+    final_stats =
       jsonl_path
       |> File.stream!()
       |> Stream.map(&String.trim/1)
       |> Stream.reject(&(&1 == ""))
-      |> Stream.map(fn line ->
+      |> Enum.reduce(stats, fn line, acc ->
         case Jason.decode(line) do
-          {:ok, entry} -> entry
-          _ -> nil
-        end
-      end)
-      |> Stream.reject(&is_nil/1)
-      |> Enum.to_list()
+          {:ok, entry} ->
+            idx = entry["index"]
 
-    {to_process, to_keep} = case filter_indices do
-      nil ->
-        {entries, []}
-      indices ->
-        index_set = MapSet.new(indices)
-        Enum.split_with(entries, fn e -> MapSet.member?(index_set, e["index"]) end)
-    end
+            # Determine if this row needs processing
+            should_process = is_nil(index_set) or MapSet.member?(index_set, idx)
 
-    log(1, "#{length(entries)} total, #{length(to_process)} to process, #{length(to_keep)} unchanged")
+            if should_process do
+              process_entry(entry, errors_file, output_file, acc)
+            else
+              # Write original entry directly back to output
+              IO.write(output_file, line <> "\n")
+              %{acc | skipped: acc.skipped + 1}
+            end
 
-    log(0, "\nStep 3: Process entries")
-    errors_file = File.open!(errors_path, [:append, :utf8])
-
-    stats = %{passed_as_is: 0, instruction_rewritten: 0, code_fixed: 0, failed: 0}
-
-    {updated_entries, stats} =
-      to_process
-      |> Enum.with_index(1)
-      |> Enum.map_reduce(stats, fn {entry, num}, stats ->
-        idx = entry["index"]
-        ep = entry["entry_point"] || entry["original_entry_point"] || "?"
-        t0 = System.monotonic_time(:millisecond)
-
-        IO.puts("\n" <> String.duplicate("─", 60))
-        log(0, "[#{num}/#{length(to_process)}] idx=#{idx} #{ep}")
-        IO.puts(String.duplicate("─", 60))
-
-        module_code = entry["elixir_code"]
-        test_code = entry["elixir_test"]
-
-        unless module_code && test_code do
-          log(1, "SKIP — missing code or tests")
-          {entry, %{stats | passed_as_is: stats.passed_as_is + 1}}
-        else
-          log(1, "Validating existing code...")
-          failures = validate(module_code, test_code)
-
-          result = if failures == [] do
-            # Path A: code passes, just rewrite instruction
-            log(1, "✓ Code passes all checks — rewriting instruction only")
-            rewrite_instruction(entry)
-          else
-            # Path B: code fails, fix everything
-            failed_detail = format_failure_summary(failures)
-            log(1, "✗ Code fails #{failed_detail} — fixing code + instruction")
-            fix_code_and_instruction(entry, failures)
-          end
-
-          elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
-
-          case result do
-            {:ok, updated_entry} ->
-              was_code_fix = failures != []
-              tag = if was_code_fix, do: "code+instruction fixed", else: "instruction rewritten"
-              log(0, "✓ #{ep} — #{tag} (#{elapsed}s)")
-
-              new_stats = if was_code_fix do
-                %{stats | code_fixed: stats.code_fixed + 1}
-              else
-                %{stats | instruction_rewritten: stats.instruction_rewritten + 1}
-              end
-
-              {updated_entry, new_stats}
-
-            {:failed, reason} ->
-              log(0, "✗ #{ep} — FAILED: #{reason} (#{elapsed}s)")
-              error_record = Map.put(entry, "retry_failure_reason", reason)
-              IO.write(errors_file, Jason.encode!(error_record) <> "\n")
-              {nil, %{stats | failed: stats.failed + 1}}
-          end
+          {:error, _} ->
+            log(0, "Skipping malformed JSON line")
+            acc
         end
       end)
 
+    File.close(output_file)
     File.close(errors_file)
 
-    # Rebuild output: kept entries + successful updates (filter out nils from failures)
-    final_entries = to_keep ++ Enum.reject(updated_entries, &is_nil/1)
-
-    log(0, "\nStep 4: Write updated output")
-    tmp_path = jsonl_path <> ".tmp"
-    File.write!(tmp_path, Enum.map_join(final_entries, "\n", &Jason.encode!/1) <> "\n")
+    # Swap the original file with the updated one
     File.rename!(tmp_path, jsonl_path)
-    log(1, "✓ Wrote #{length(final_entries)} entries to #{jsonl_path}")
 
     IO.puts("""
 
     ══════════════════════════════════
-      RETRY REPORT
+      RETRY REPORT (Incremental)
     ══════════════════════════════════
-      📝 Instruction rewritten:  #{stats.instruction_rewritten}
-      🔧 Code + instruction fixed: #{stats.code_fixed}
-      ✗ Failed (→ errors file):  #{stats.failed}
-      ⏭ Unchanged:               #{length(to_keep)}
-      Total output entries:      #{length(final_entries)}
+      📝 Instruction rewritten:  #{final_stats.instruction_rewritten}
+      🔧 Code + instruction fixed: #{final_stats.code_fixed}
+      ✗ Failed (→ errors file):  #{final_stats.failed}
+      ⏭ Unchanged/Skipped:        #{final_stats.skipped}
+      Total entries in file:     #{final_stats.skipped + final_stats.instruction_rewritten + final_stats.code_fixed}
 
       Output:  #{jsonl_path}
       Errors:  #{errors_path}
     """)
+  end
+
+  defp process_entry(entry, errors_file, output_file, stats) do
+    idx = entry["index"]
+    ep = entry["entry_point"] || entry["original_entry_point"] || "?"
+    t0 = System.monotonic_time(:millisecond)
+
+    IO.puts("\n" <> String.duplicate("─", 60))
+    log(0, "Processing idx=#{idx} #{ep}")
+    IO.puts(String.duplicate("─", 60))
+
+    module_code = entry["elixir_code"]
+    test_code = entry["elixir_test"]
+
+    if is_nil(module_code) or is_nil(test_code) do
+      log(1, "SKIP — missing code or tests")
+      IO.write(output_file, Jason.encode!(entry) <> "\n")
+      %{stats | skipped: stats.skipped + 1}
+    else
+      log(1, "Validating existing code...")
+      failures = validate(module_code, test_code)
+
+      result = if failures == [] do
+        log(1, "✓ Code passes all checks — rewriting instruction only")
+        rewrite_instruction(entry)
+      else
+        failed_detail = format_failure_summary(failures)
+        log(1, "✗ Code fails #{failed_detail} — fixing code + instruction")
+        fix_code_and_instruction(entry, failures)
+      end
+
+      elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
+
+      case result do
+        {:ok, updated_entry} ->
+          was_code_fix = failures != []
+          tag = if was_code_fix, do: "code+instruction fixed", else: "instruction rewritten"
+          log(0, "✓ #{ep} — #{tag} (#{elapsed}s)")
+
+          # WRITE IMMEDIATELY TO DISK
+          IO.write(output_file, Jason.encode!(updated_entry) <> "\n")
+
+          if was_code_fix do
+            %{stats | code_fixed: stats.code_fixed + 1}
+          else
+            %{stats | instruction_rewritten: stats.instruction_rewritten + 1}
+          end
+
+        {:failed, reason} ->
+          log(0, "✗ #{ep} — FAILED: #{reason} (#{elapsed}s)")
+          # Per your original logic: failing rows go to errors and are REMOVED from output
+          error_record = Map.put(entry, "retry_failure_reason", reason)
+          IO.write(errors_file, Jason.encode!(error_record) <> "\n")
+
+          # We don't write to output_file here, effectively "removing" it from the main file
+          %{stats | failed: stats.failed + 1}
+      end
+    end
   end
 
   defp format_failure_summary(failures) do
