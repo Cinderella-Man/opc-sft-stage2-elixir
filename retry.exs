@@ -536,14 +536,14 @@ defmodule Retrier do
         end
 
       _ ->
-        log(2, "✗ Review failed, keeping current version")
-        {:ok, entry}
+        log(2, "✗ Review failed")
+        {:failed, "Code review LLM call failed"}
     end
   end
 
-  defp do_refine(entry, _feedback, _prev_errors, attempt) when attempt > @max_refine_retries do
-    log(2, "✗ Refinement failed after #{@max_refine_retries} attempts, keeping current")
-    {:ok, entry}
+  defp do_refine(_entry, _feedback, _prev_errors, attempt) when attempt > @max_refine_retries do
+    log(2, "✗ Refinement failed after #{@max_refine_retries} attempts")
+    {:failed, "exceeded #{@max_refine_retries} refine retries"}
   end
 
   defp do_refine(entry, feedback, prev_errors, attempt) do
@@ -639,8 +639,8 @@ defmodule Retrier do
         end
 
       _ ->
-        log(2, "✗ Refine LLM call failed, keeping current")
-        {:ok, entry}
+        log(2, "✗ Refine LLM call failed")
+        {:failed, "Refine LLM call failed"}
     end
   end
 
