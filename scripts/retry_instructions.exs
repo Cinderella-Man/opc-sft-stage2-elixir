@@ -1,4 +1,4 @@
-# mix run scripts/retry_instructions.exs -- [file.jsonl] [--start N] [--indices 1,2,3]
+# mix run scripts/retry_instructions.exs [file.jsonl] [--start N] [--indices 1,2,3]
 
 alias Tunex.{CLI, LLM, Parser, JSONL, Progress}
 

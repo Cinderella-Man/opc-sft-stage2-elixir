@@ -1,4 +1,4 @@
-# mix run scripts/revalidate.exs -- [file.jsonl] [--delete]
+# mix run scripts/revalidate.exs [file.jsonl] [--delete]
 
 alias Tunex.{CLI, JSONL, Workspace, Validator, Report}
 

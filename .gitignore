@@ -29,7 +29,7 @@ convert_debug_educational_instruct.log
 educational_instruct_train.parquet
 convert_log_educational_instruct.txt
 elixir_sft_workspace*
-revalidation_workspace
+tunex_revalidate_workspace
 retry_workspace
 
 convert_debug_educational_instruct.log

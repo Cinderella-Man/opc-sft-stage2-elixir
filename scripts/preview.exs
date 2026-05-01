@@ -1,4 +1,4 @@
-# mix run scripts/preview.exs -- [--think]
+# mix run scripts/preview.exs [--think]
 
 alias Tunex.{LLM, Parser, Workspace, Validator, Report}
 

@@ -33,8 +33,11 @@ defmodule Tunex.LLM do
           true -> {:empty, "empty content, finish=#{finish}"}
         end
 
-      {:ok, %{status: s}} -> {:error, "HTTP #{s}"}
-      {:error, err} -> {:error, inspect(err, limit: 100)}
+      {:ok, %{status: s}} ->
+        {:error, "HTTP #{s}"}
+
+      {:error, err} ->
+        {:error, inspect(err, limit: 100)}
     end
   end
 end

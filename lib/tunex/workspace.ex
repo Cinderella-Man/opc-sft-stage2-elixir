@@ -109,9 +109,13 @@ defmodule Tunex.Workspace do
     content = File.read!(mix_exs)
 
     unless String.contains?(content, "credence") do
-      fixed = String.replace(content,
-        ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false}),
-        ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, github: "Cinderella-Man/credence", only: [:dev, :test], runtime: false}))
+      fixed =
+        String.replace(
+          content,
+          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false}),
+          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, github: "Cinderella-Man/credence", only: [:dev, :test], runtime: false})
+        )
+
       File.write!(mix_exs, fixed)
     end
   end

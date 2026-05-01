@@ -61,5 +61,6 @@ defmodule Tunex.Report do
   def count_tests(test_code) when is_binary(test_code) do
     test_code |> String.split("\n") |> Enum.count(&String.contains?(&1, "test \""))
   end
+
   def count_tests(_), do: 0
 end

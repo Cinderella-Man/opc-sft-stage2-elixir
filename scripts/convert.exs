@@ -1,4 +1,4 @@
-# mix run scripts/convert.exs -- [subset] [--workers N]
+# mix run scripts/convert.exs [subset] [--workers N]
 
 alias Tunex.{CLI, Dataset, LLM, Parser, Progress, Workspace, Validator, JSONL, Report}
 

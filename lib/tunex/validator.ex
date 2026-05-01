@@ -20,53 +20,87 @@ defmodule Tunex.Validator do
     failures = []
 
     # 1. Compile
-    {output, code} = System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
-      cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+    {output, code} =
+      System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
+        cd: workspace,
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", "test"}]
+      )
+
     compiled = code == 0
     failures = if compiled, do: failures, else: failures ++ [{:compile, clean_output(output)}]
 
     # 2. Format (auto-fix, don't fail)
     if compiled do
-      {_, code} = System.cmd("mix", ["format", "--check-formatted", "lib/solution.ex", "test/solution_test.exs"],
-        cd: workspace, stderr_to_stdout: true)
+      {_, code} =
+        System.cmd(
+          "mix",
+          ["format", "--check-formatted", "lib/solution.ex", "test/solution_test.exs"],
+          cd: workspace,
+          stderr_to_stdout: true
+        )
+
       if code != 0 do
         System.cmd("mix", ["format", "lib/solution.ex", "test/solution_test.exs"],
-          cd: workspace, stderr_to_stdout: true)
+          cd: workspace,
+          stderr_to_stdout: true
+        )
       end
     end
 
     # 3. Credo
-    failures = if compiled do
-      {output, _} = System.cmd("mix", ["credo", "list", "--strict", "--format", "oneline", "lib/solution.ex"],
-        cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
-      issues = output
-      |> String.split("\n")
-      |> Enum.filter(&String.contains?(&1, "lib/solution.ex"))
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
+    failures =
+      if compiled do
+        {output, _} =
+          System.cmd(
+            "mix",
+            ["credo", "list", "--strict", "--format", "oneline", "lib/solution.ex"],
+            cd: workspace,
+            stderr_to_stdout: true,
+            env: [{"MIX_ENV", "test"}]
+          )
 
-      if issues == [], do: failures, else: failures ++ [{:credo, Enum.join(issues, "\n")}]
-    else
-      failures
-    end
+        issues =
+          output
+          |> String.split("\n")
+          |> Enum.filter(&String.contains?(&1, "lib/solution.ex"))
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+
+        if issues == [], do: failures, else: failures ++ [{:credo, Enum.join(issues, "\n")}]
+      else
+        failures
+      end
 
     # 4. Credence
-    failures = if compiled do
-      {output, code} = System.cmd("mix", ["run", "--no-start", "run_credence.exs"],
-        cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
-      if code == 0, do: failures, else: failures ++ [{:credence, String.trim(output)}]
-    else
-      failures
-    end
+    failures =
+      if compiled do
+        {output, code} =
+          System.cmd("mix", ["run", "--no-start", "run_credence.exs"],
+            cd: workspace,
+            stderr_to_stdout: true,
+            env: [{"MIX_ENV", "test"}]
+          )
+
+        if code == 0, do: failures, else: failures ++ [{:credence, String.trim(output)}]
+      else
+        failures
+      end
 
     # 5. Tests
-    failures = if compiled do
-      {output, code} = System.cmd("mix", ["test", "test/solution_test.exs", "--no-deps-check"],
-        cd: workspace, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
-      if code == 0, do: failures, else: failures ++ [{:test, clean_output(output)}]
-    else
-      failures
-    end
+    failures =
+      if compiled do
+        {output, code} =
+          System.cmd("mix", ["test", "test/solution_test.exs", "--no-deps-check"],
+            cd: workspace,
+            stderr_to_stdout: true,
+            env: [{"MIX_ENV", "test"}]
+          )
+
+        if code == 0, do: failures, else: failures ++ [{:test, clean_output(output)}]
+      else
+        failures
+      end
 
     # Re-read (format may have changed files)
     final_mod = if compiled, do: File.read!(mod_path), else: module_code
