@@ -17,9 +17,29 @@ defmodule Tunex.Workspace do
     IO.puts("ISSUES: #{length(result.issues)} credence issue(s) found")
     for issue <- result.issues do
       line = if issue.meta[:line], do: "line #{issue.meta[:line]}", else: "unknown line"
-      IO.puts("  [#{issue.severity}] #{issue.rule}: #{issue.message} (#{line})")
+      IO.puts("#{issue.rule}: #{issue.message} (#{line})")
     end
     System.halt(1)
+  end
+  """
+
+  @credence_fix_script ~S"""
+  code = File.read!("lib/solution.ex")
+  result = Credence.fix(code)
+
+  if result.code != code do
+    File.write!("lib/solution.ex", result.code)
+    IO.puts("FIXED")
+  else
+    IO.puts("NO_CHANGES")
+  end
+
+  if result.issues != [] do
+    IO.puts("REMAINING_ISSUES: #{length(result.issues)} unfixable issue(s)")
+    for issue <- result.issues do
+      line = if issue.meta[:line], do: "line #{issue.meta[:line]}", else: "unknown line"
+      IO.puts("#{issue.rule}: #{issue.message} (#{line})")
+    end
   end
   """
 
@@ -43,7 +63,7 @@ defmodule Tunex.Workspace do
   defp deps do
         [
           {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-          {:credence, github: "Cinderella-Man/credence", only: [:dev, :test], runtime: false}
+          {:credence, github: "Cinderella-Man/credence", branch: "introduce-fixing", only: [:dev, :test], runtime: false}
         ]
   """
 
@@ -53,6 +73,7 @@ defmodule Tunex.Workspace do
     if File.exists?(Path.join(path, "mix.exs")) do
       ensure_credence_dep(path)
       ensure_credence_script(path)
+      ensure_credence_fix_script(path)
       ensure_deps(path)
     else
       IO.puts("Creating workspace: #{path}/")
@@ -62,6 +83,7 @@ defmodule Tunex.Workspace do
       inject_deps(path)
       write_credo_config(path)
       ensure_credence_script(path)
+      ensure_credence_fix_script(path)
       clean_defaults(path)
       ensure_deps(path)
       IO.puts("  ✓ Workspace #{path} ready")
@@ -113,7 +135,7 @@ defmodule Tunex.Workspace do
         String.replace(
           content,
           ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false}),
-          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, github: "Cinderella-Man/credence", only: [:dev, :test], runtime: false})
+          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, github: "Cinderella-Man/credence", branch: "introduce-fixing", only: [:dev, :test], runtime: false})
         )
 
       File.write!(mix_exs, fixed)
@@ -127,6 +149,12 @@ defmodule Tunex.Workspace do
   defp ensure_credence_script(path) do
     script = Path.join(path, "run_credence.exs")
     unless File.exists?(script), do: File.write!(script, @credence_script)
+  end
+
+  defp ensure_credence_fix_script(path) do
+    script = Path.join(path, "run_credence_fix.exs")
+    # Always overwrite to pick up script changes
+    File.write!(script, @credence_fix_script)
   end
 
   defp clean_defaults(path) do
