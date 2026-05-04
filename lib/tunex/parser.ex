@@ -71,6 +71,36 @@ defmodule Tunex.Parser do
   @doc "Convert Python entry point name to Elixir snake_case."
   def snake_name(name), do: name |> String.downcase() |> String.replace(~r/[^a-z0-9_]/, "_")
 
+  @doc """
+  Convert Python entry point name to idiomatic Elixir function name.
+
+  Applies snake_case conversion and then transforms `is_foo` → `foo?`
+  to follow the Elixir convention of using `?` suffix for boolean functions
+  instead of the Python `is_` prefix.
+
+  ## Examples
+
+      iex> Tunex.Parser.elixir_name("is_palindrome")
+      "palindrome?"
+
+      iex> Tunex.Parser.elixir_name("is_binary_search_tree")
+      "binary_search_tree?"
+
+      iex> Tunex.Parser.elixir_name("missing_number")
+      "missing_number"
+
+      iex> Tunex.Parser.elixir_name("IsValid")
+      "valid?"
+  """
+  def elixir_name(name) do
+    snake = snake_name(name)
+
+    case snake do
+      "is_" <> rest when rest != "" -> rest <> "?"
+      _ -> snake
+    end
+  end
+
   # ── Internal ───────────────────────────────────────────────────────
 
   defp strip_outer_fences(s) do

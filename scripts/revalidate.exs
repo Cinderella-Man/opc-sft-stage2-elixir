@@ -35,26 +35,31 @@ results =
       IO.puts("#{prefix} — SKIP (missing code or test)")
       {entry, :skip, []}
     else
-      # Step 1: Try credence auto-fix on the module code
-      {fix_status, module_code} =
-        case Validator.apply_credence_fix(entry["elixir_code"], ws) do
-          {:ok, fixed} -> {:ok, fixed}
-          {:error, original} -> {:error, original}
+      # Step 1: Try credence auto-fix on module + propagate renames to tests
+      {fix_status, module_code, test_code} =
+        case Validator.apply_credence_fix(entry["elixir_code"], entry["elixir_test"], ws) do
+          {:ok, fixed_mod, fixed_test} -> {:ok, fixed_mod, fixed_test}
+          {:error, orig_mod, orig_test} -> {:error, orig_mod, orig_test}
         end
 
-      credence_fixed? = String.trim(module_code) != String.trim(entry["elixir_code"])
+      mod_changed? = String.trim(module_code) != String.trim(entry["elixir_code"])
+      test_changed? = String.trim(test_code) != String.trim(entry["elixir_test"])
+      credence_fixed? = mod_changed? or test_changed?
 
       if credence_fixed? do
-        IO.puts("#{prefix} — credence auto-fixed code, validating...")
+        changes = [if(mod_changed?, do: "module"), if(test_changed?, do: "tests")]
+                  |> Enum.reject(&is_nil/1)
+                  |> Enum.join(" + ")
+        IO.puts("#{prefix} — credence auto-fixed #{changes}, validating...")
       end
 
       if fix_status == :error and not credence_fixed? do
         IO.puts("#{prefix} — credence fix failed (compile error), validating original...")
       end
 
-      # Step 2: Full validation on the (potentially fixed) code
+      # Step 2: Full validation on the (potentially fixed) code + tests
       {failures, final_mod, final_test} =
-        Validator.run(module_code, entry["elixir_test"], ws)
+        Validator.run(module_code, test_code, ws)
 
       final_changed? =
         String.trim(final_mod) != String.trim(entry["elixir_code"]) or
@@ -82,8 +87,8 @@ results =
           test_broke? = Enum.any?(failures, fn {stage, _} -> stage == :test end)
 
           if test_broke? do
-            IO.puts("    ⚠ WARNING: credence fix changed the code AND tests now fail")
-            IO.puts("      This may be a credence fix regression — tests may have passed before the fix")
+            IO.puts("    ⚠ WARNING: credence fix changed code AND tests now fail")
+            IO.puts("      This may be a credence fix regression — tests may have passed before")
           end
         end
 

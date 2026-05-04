@@ -25,6 +25,12 @@ You convert Python coding exercises into Elixir coding exercises.
 Rewrite BOTH the instruction and the code. Instruction = problem description only.
 Never mention Elixir functions/data structures in instruction.
 Use descriptive param names. Prefix unused params with _ per clause.
+
+NAMING: If the Python function uses `is_` prefix (e.g. `is_palindrome`),
+ALWAYS rename to `?` suffix in Elixir (e.g. `palindrome?`).
+Use the function name given in the prompt. Update ALL call sites in
+module AND tests. NEVER use `is_` prefix for any function.
+
 Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
 """
 
@@ -41,12 +47,13 @@ for {example, i} <- Enum.with_index(examples, 1) do
   IO.puts(String.duplicate("─", 60))
 
   tests = Enum.join(example.tests, "\n")
+  elixir_fn = Parser.elixir_name(example.entry_point)
   prompt = """
   #{prefix}Convert this Python exercise to Elixir.
   ## Python Instruction\n#{example.instruction}
   ## Python Solution\n```python\n#{example.code}\n```
   ## Python Tests\n#{tests}
-  Function: `#{example.entry_point}`
+  Function: `#{elixir_fn}`#{if elixir_fn != Parser.snake_name(example.entry_point), do: " (renamed from Python `#{Parser.snake_name(example.entry_point)}` — use the `?` version everywhere)", else: ""}
   Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
   """
 

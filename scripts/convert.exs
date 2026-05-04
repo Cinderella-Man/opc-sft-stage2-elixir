@@ -20,6 +20,12 @@ Idiomatic Elixir: pattern matching, multi-clause functions, pipes, guards,
 @doc/@spec. Descriptive parameter names (NEVER single letters). Prefix
 unused params with _ independently per clause.
 
+NAMING: If the Python function uses `is_` prefix (e.g. `is_palindrome`),
+ALWAYS rename it to `?` suffix in Elixir (e.g. `palindrome?`).
+Use the function name given in the prompt — it already has this applied.
+Update ALL call sites: module code, tests, and instruction must all use
+the new `?` name. NEVER use `is_` prefix for any function.
+
 Anti-patterns: single-letter names, Enum.at in loops, ++ in loops,
 length in guards, is_ prefix (use ?), Enum.count/1 (use length/1),
 List.foldl (use Enum.reduce), Enum.map |> Enum.max/min/sum/join,
@@ -33,11 +39,14 @@ review_prompt = ~S"""
 Expert Elixir reviewer. Actionable feedback on edge cases, idiom, correctness,
 performance, missing tests. If excellent: "NO_ISSUES_FOUND".
 Do NOT suggest catch-all raise clauses or unnecessary type guards.
+Check: any function using is_ prefix? Must use ? suffix instead (e.g. palindrome? not is_palindrome).
+Tests must call the ? version too.
 """
 
 refine_prompt = ~S"""
 Apply ALL suggestions. Instruction = problem only, never implementation.
 Keep same module/function names. Code must compile.
+If renaming is_ to ?, update ALL call sites: module, tests, instruction.
 Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
 """
 
@@ -56,7 +65,7 @@ defmodule ConvertLoop do
             if fails == [] do
               {:ok, %{instruction: instr, elixir_code: final_mod, elixir_test: final_test,
                       original_instruction: example.instruction, python_code: example.code,
-                      entry_point: Tunex.Parser.snake_name(example.entry_point),
+                      entry_point: Tunex.Parser.elixir_name(example.entry_point),
                       original_entry_point: example.entry_point, attempts: attempt}}
             else
               retry = """
@@ -71,7 +80,8 @@ defmodule ConvertLoop do
               ## Errors
               #{Tunex.Report.format_errors(fails)}
 
-              Common pitfalls: unused variable→prefix _ per clause; descriptive names in ALL clauses.
+              Common pitfalls: unused variable→prefix _ per clause; descriptive names in ALL clauses;
+              is_ prefix→use ? suffix (e.g. palindrome? not is_palindrome) in module AND tests.
               Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
               """
               attempt(example, retry, sys, opts, attempt + 1, ws)
@@ -177,12 +187,13 @@ unless pending == [] do
            entry_point: row["entry_point"], tests: row["testcase"] || []}
 
     tests = if is_list(ex.tests), do: Enum.join(ex.tests, "\n"), else: to_string(ex.tests)
+    elixir_fn = Parser.elixir_name(ex.entry_point)
     prompt = """
     Convert this Python exercise to Elixir.
     ## Python Instruction\n#{ex.instruction}
     ## Python Solution\n```python\n#{ex.code}\n```
     ## Python Tests\n#{tests}
-    Function: `#{Parser.snake_name(ex.entry_point)}`
+    Function: `#{elixir_fn}`#{if elixir_fn != Parser.snake_name(ex.entry_point), do: " (renamed from Python `#{Parser.snake_name(ex.entry_point)}` — use the `?` version everywhere)", else: ""}
     Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     """
 

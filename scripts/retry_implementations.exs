@@ -14,6 +14,11 @@ Use descriptive params (never single letters). Prefix unused params with _ per c
 Use ? suffix for booleans (not is_ prefix). Use Enum.reduce not List.foldl.
 Use Enum.map_join not map|>join. Use max/min not manual if comparisons.
 
+CRITICAL: If any function uses `is_` prefix, rename it to `?` suffix
+(e.g. `is_palindrome` → `palindrome?`). You MUST update the function name
+in the module AND in ALL test assertions. Tests that still call `is_foo`
+will fail with "undefined function" if the module defines `foo?`.
+
 Pitfalls: unused variable→_ per clause; undefined→renamed to _name but still used;
 descriptive_names→rename in ALL clauses.
 
@@ -25,10 +30,13 @@ review_prompt = ~S"""
 Expert Elixir reviewer. Actionable feedback on edge cases, idiom, correctness,
 performance, missing tests. If excellent: "NO_ISSUES_FOUND".
 Do NOT suggest catch-all raise clauses or unnecessary type guards.
+Check: any function using is_ prefix? Must use ? suffix instead.
+Tests must call the ? version too.
 """
 
 refine_prompt = ~S"""
 Apply ALL suggestions. Keep same module/function names. Do NOT change instruction.
+If renaming is_ to ?, update ALL call sites in module AND tests.
 Output: ---MODULE--- / ---TEST--- / ---END---
 """
 

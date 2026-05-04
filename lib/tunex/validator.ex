@@ -2,11 +2,13 @@ defmodule Tunex.Validator do
   @moduledoc """
   Runs the validation pipeline against Elixir code in a workspace.
 
-  Steps: compile → credence fix → re-compile → format → credo → credence check → test
+  Steps: compile → credence fix → propagate renames → re-compile → format → credo → credence check → test
 
   The credence fix step auto-fixes issues that Credence can handle
   deterministically (e.g. naming conventions, structural rewrites).
-  Unfixable issues are reported as failures and fed back to the LLM.
+  When credence renames `is_foo` → `foo?`, the rename is propagated
+  to the test file automatically. Unfixable issues are reported as
+  failures and fed back to the LLM.
 
   Returns `{failures, final_module_code, final_test_code}` where failures
   is a list of `{stage, message}` tuples. Format is auto-applied so
@@ -34,14 +36,29 @@ defmodule Tunex.Validator do
     compiled = code == 0
     failures = if compiled, do: failures, else: failures ++ [{:compile, clean_output(output)}]
 
-    # 2. Credence fix (auto-fix what it can)
+    # 2. Credence fix (auto-fix what it can) + propagate renames to tests
     compiled =
       if compiled do
         case run_credence_fix(workspace) do
-          {:fixed, true} -> true
-          {:fixed, false} -> true
-          :no_changes -> true
-          :error -> true
+          {:fixed, true} ->
+            # Credence changed the module — propagate is_ → ? renames to tests
+            fixed_mod = File.read!(mod_path)
+            updated_test = propagate_is_renames(module_code, fixed_mod, test_code)
+
+            if updated_test != test_code do
+              File.write!(test_path, updated_test)
+            end
+
+            true
+
+          {:fixed, false} ->
+            true
+
+          :no_changes ->
+            true
+
+          :error ->
+            true
         end
       else
         false
@@ -127,17 +144,14 @@ defmodule Tunex.Validator do
   end
 
   @doc """
-  Apply Credence auto-fix to module code without running the full pipeline.
+  Apply Credence auto-fix to module code and propagate renames to test code.
 
-  Writes the code to the workspace, compiles, runs `Credence.fix/2` via
-  the workspace script, and reads back the result. Returns the (potentially
-  fixed) code string regardless of whether remaining unfixable issues exist —
-  those are left for `run/3` to catch.
+  Writes the module to the workspace, compiles, runs `Credence.fix/2`,
+  detects `is_foo` → `foo?` renames and applies them to test code too.
 
-  Returns `{:ok, fixed_code}` if the code compiled and fix ran successfully,
-  or `{:error, original_code}` if compilation or the fix script failed.
+  Returns `{:ok, fixed_mod, fixed_test}` or `{:error, original_mod, original_test}`.
   """
-  def apply_credence_fix(module_code, workspace) do
+  def apply_credence_fix(module_code, test_code, workspace) do
     mod_path = Path.join(workspace, "lib/solution.ex")
 
     # Clean lib and write
@@ -153,27 +167,29 @@ defmodule Tunex.Validator do
       )
 
     if code != 0 do
-      {:error, module_code}
+      {:error, module_code, test_code}
     else
       case run_credence_fix(workspace) do
         {:fixed, true} ->
-          {:ok, File.read!(mod_path)}
+          fixed_mod = File.read!(mod_path)
+          fixed_test = propagate_is_renames(module_code, fixed_mod, test_code)
+          {:ok, fixed_mod, fixed_test}
 
         {:fixed, false} ->
           # Fix broke compilation — revert
           File.write!(mod_path, module_code)
-          {:error, module_code}
+          {:error, module_code, test_code}
 
         :no_changes ->
-          {:ok, module_code}
+          {:ok, module_code, test_code}
 
         :error ->
-          {:error, module_code}
+          {:error, module_code, test_code}
       end
     end
   end
 
-  # ── Credence Fix (shared by run/3 and apply_credence_fix/2) ────────
+  # ── Credence Fix (shared by run/3 and apply_credence_fix/3) ────────
 
   defp run_credence_fix(workspace) do
     mod_path = Path.join(workspace, "lib/solution.ex")
@@ -224,6 +240,50 @@ defmodule Tunex.Validator do
       true ->
         :no_changes
     end
+  end
+
+  # ── Rename Propagation ─────────────────────────────────────────────
+
+  @doc false
+  defp propagate_is_renames(original_mod, fixed_mod, test_code) do
+    old_fns = extract_function_names(original_mod)
+    new_fns = extract_function_names(fixed_mod)
+
+    # Find is_ functions that were renamed to ? form
+    renames =
+      old_fns
+      |> Enum.filter(&String.starts_with?(&1, "is_"))
+      |> Enum.flat_map(fn is_name ->
+        expected = String.trim_leading(is_name, "is_") <> "?"
+
+        if expected in new_fns do
+          [{is_name, expected}]
+        else
+          []
+        end
+      end)
+
+    case renames do
+      [] ->
+        test_code
+
+      _ ->
+        Enum.reduce(renames, test_code, fn {old_name, new_name}, code ->
+          # Replace function calls: Module.is_foo( → Module.foo?(
+          # Replace bare references: is_foo( → foo?(
+          # Replace string references: "is_foo" → "foo?" (in test names)
+          code
+          |> String.replace(".#{old_name}(", ".#{new_name}(")
+          |> String.replace(".#{old_name} ", ".#{new_name} ")
+          |> String.replace("&#{old_name}/", "&#{new_name}/")
+        end)
+    end
+  end
+
+  defp extract_function_names(code) do
+    Regex.scan(~r/def[p]?\s+(\w+[?!]?)/, code)
+    |> Enum.map(fn [_, name] -> name end)
+    |> Enum.uniq()
   end
 
   # ── Internal ───────────────────────────────────────────────────────
