@@ -8,3 +8,6 @@ config :tunex,
   max_tokens: 12_288,
   dataset_base:
     "https://huggingface.co/datasets/OpenCoder-LLM/opc-sft-stage2/resolve/refs%2Fconvert%2Fparquet"
+
+config :logger,
+  level: :debug
