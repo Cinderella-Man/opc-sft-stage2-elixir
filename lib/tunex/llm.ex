@@ -10,15 +10,15 @@ defmodule Tunex.LLM do
 
   def call(user_prompt, system_prompt, opts \\ []) do
     url = Keyword.get(opts, :url, Application.get_env(:tunex, :llm_url))
+    authorization = Keyword.get(opts, :authorization, Application.get_env(:tunex, :authorization))
     model = Keyword.get(opts, :model, Application.get_env(:tunex, :llm_model))
-    max_tokens = Keyword.get(opts, :max_tokens, Application.get_env(:tunex, :max_tokens, 12_288))
     timeout = Keyword.get(opts, :timeout, 600_000)
+    headers = %{Authorization: authorization}
 
     Logger.debug("""
     [LLM.call] ── REQUEST ──────────────────────────────────────
       url:        #{url}
       model:      #{model}
-      max_tokens: #{max_tokens}
       timeout:    #{timeout}ms
     [LLM.call] ── SYSTEM PROMPT ────────────────────────────────
     #{system_prompt}
@@ -33,19 +33,22 @@ defmodule Tunex.LLM do
         %{role: "user", content: user_prompt}
       ],
       model: model,
-      max_tokens: max_tokens
+      temperature: 1.0,
+      stream: false
     }
 
     t0 = System.monotonic_time(:millisecond)
 
     result =
-      case Req.post(url, json: body, receive_timeout: timeout) do
+      case Req.post(url, json: body, receive_timeout: timeout, headers: headers) do
         {:ok, %{status: 200, body: resp}} ->
           choice = resp["choices"] |> List.first()
           content = (choice["message"]["content"] || "") |> String.trim()
           finish = choice["finish_reason"]
 
-          Logger.info("[LLM.call] HTTP 200 — finish_reason=#{finish}, content_length=#{String.length(content)}")
+          Logger.info(
+            "[LLM.call] HTTP 200 — finish_reason=#{finish}, content_length=#{String.length(content)}"
+          )
 
           Logger.debug("""
           [LLM.call] ── RESPONSE ─────────────────────────────────

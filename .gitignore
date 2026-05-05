@@ -33,3 +33,8 @@ tunex_revalidate_workspace
 retry_workspace
 
 convert_debug_educational_instruct.log
+
+tunex_workspace*
+tunex_preview_*
+
+config/secrets*

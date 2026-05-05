@@ -22,7 +22,11 @@ defmodule Tunex.Validator do
     test_path = Path.join(workspace, "test/solution_test.exs")
 
     Logger.info("[Validator.run] ── START in #{workspace} ──")
-    Logger.debug("[Validator.run] module code (#{String.length(module_code)} chars):\n#{module_code}")
+
+    Logger.debug(
+      "[Validator.run] module code (#{String.length(module_code)} chars):\n#{module_code}"
+    )
+
     Logger.debug("[Validator.run] test code (#{String.length(test_code)} chars):\n#{test_code}")
 
     clean_workspace(workspace)
@@ -33,6 +37,7 @@ defmodule Tunex.Validator do
 
     # 1. Compile
     Logger.info("[Validator.run] step 1/6: compile")
+
     {output, code} =
       System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
         cd: workspace,
@@ -47,6 +52,7 @@ defmodule Tunex.Validator do
 
     # 2. Credence fix (auto-fix what it can) + propagate renames to tests
     Logger.info("[Validator.run] step 2/6: credence fix")
+
     compiled =
       if compiled do
         case run_credence_fix(workspace) do
@@ -88,8 +94,9 @@ defmodule Tunex.Validator do
 
     # 3. Format (auto-fix, don't fail)
     Logger.info("[Validator.run] step 3/6: format")
+
     if compiled do
-      {fmt_output, fmt_code} =
+      {_fmt_output, fmt_code} =
         System.cmd(
           "mix",
           ["format", "--check-formatted", "lib/solution.ex", "test/solution_test.exs"],
@@ -99,10 +106,13 @@ defmodule Tunex.Validator do
 
       if fmt_code != 0 do
         Logger.info("[Validator.run] code not formatted — auto-formatting")
-        {fmt_fix_output, _} = System.cmd("mix", ["format", "lib/solution.ex", "test/solution_test.exs"],
-          cd: workspace,
-          stderr_to_stdout: true
-        )
+
+        {fmt_fix_output, _} =
+          System.cmd("mix", ["format", "lib/solution.ex", "test/solution_test.exs"],
+            cd: workspace,
+            stderr_to_stdout: true
+          )
+
         Logger.debug("[Validator.run] format fix output: #{fmt_fix_output}")
       else
         Logger.debug("[Validator.run] code already formatted")
@@ -113,6 +123,7 @@ defmodule Tunex.Validator do
 
     # 4. Credo
     Logger.info("[Validator.run] step 4/6: credo")
+
     failures =
       if compiled do
         {output, credo_code} =
@@ -148,6 +159,7 @@ defmodule Tunex.Validator do
 
     # 5. Credence check (catch anything the fix step didn't cover)
     Logger.info("[Validator.run] step 5/6: credence check")
+
     failures =
       if compiled do
         {output, credence_code} =
@@ -174,6 +186,7 @@ defmodule Tunex.Validator do
 
     # 6. Tests
     Logger.info("[Validator.run] step 6/6: tests")
+
     failures =
       if compiled do
         {output, test_code_exit} =
@@ -202,9 +215,17 @@ defmodule Tunex.Validator do
     final_mod = if compiled, do: File.read!(mod_path), else: module_code
     final_test = if compiled, do: File.read!(test_path), else: test_code
 
-    Logger.info("[Validator.run] ── DONE — #{length(failures)} failure(s): #{inspect(Enum.map(failures, &elem(&1, 0)))} ──")
-    Logger.debug("[Validator.run] final module (#{String.length(final_mod)} chars):\n#{final_mod}")
-    Logger.debug("[Validator.run] final test (#{String.length(final_test)} chars):\n#{final_test}")
+    Logger.info(
+      "[Validator.run] ── DONE — #{length(failures)} failure(s): #{inspect(Enum.map(failures, &elem(&1, 0)))} ──"
+    )
+
+    Logger.debug(
+      "[Validator.run] final module (#{String.length(final_mod)} chars):\n#{final_mod}"
+    )
+
+    Logger.debug(
+      "[Validator.run] final test (#{String.length(final_test)} chars):\n#{final_test}"
+    )
 
     {failures, final_mod, final_test}
   end
@@ -315,7 +336,10 @@ defmodule Tunex.Validator do
 
       code != 0 ->
         # Script crashed or credence not available
-        Logger.warning("[run_credence_fix] script error (exit #{code}): #{String.slice(String.trim(output), 0, 200)}")
+        Logger.warning(
+          "[run_credence_fix] script error (exit #{code}): #{String.slice(String.trim(output), 0, 200)}"
+        )
+
         :error
 
       true ->
@@ -355,6 +379,7 @@ defmodule Tunex.Validator do
 
       _ ->
         Logger.info("[propagate_is_renames] applying renames: #{inspect(renames)}")
+
         Enum.reduce(renames, test_code, fn {old_name, new_name}, code ->
           # Replace function calls: Module.is_foo( → Module.foo?(
           # Replace bare references: is_foo( → foo?(

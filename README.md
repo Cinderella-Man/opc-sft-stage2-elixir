@@ -1,5 +1,7 @@
 # Elixir SFT Dataset Converter
 
+OUTDATED README - TODO
+
 Convert Python coding exercises into idiomatic Elixir — producing a validated, high-quality supervised fine-tuning (SFT) dataset for training Elixir-aware code LLMs.
 
 ## The Problem
@@ -66,7 +68,6 @@ The output records whether refinement was applied, the review feedback text, and
 
 ### Error Recovery
 
-- **Thinking model support**: Qwen3 and similar models split output into `reasoning_content` and `content`. If the model burns all tokens on thinking (empty `content`), the converter retries with `/no_think` and a shorter prompt.
 - **Parse failures**: If the LLM doesn't follow the delimiter format, the previous output is included in the retry prompt so it can see what went wrong.
 - **Auto-resume**: When restarted without an explicit start index, the converter reads the last `index` from both the output and errors JSONL files and resumes from the next row.
 - **Errors file**: Every failed row is saved to a separate `_errors.jsonl` with the full original data, failure reason, and timing — ready for a later retry pass.
@@ -229,7 +230,7 @@ Every step is logged to stdout with indentation showing the call hierarchy. A ty
 
 This was developed and tested with **Qwen3-27B** (Q5_K_M quantization) running on llama.cpp. Key considerations:
 
-- **Qwen3 is a thinking model.** It splits output into `reasoning_content` (chain-of-thought) and `content` (answer). With `max_tokens=2048`, it can burn the entire budget on thinking and produce empty `content`. The converter handles this by prepending `/no_think` to disable chain-of-thought, which is faster and sufficient for this task.
+- **Qwen3 is a thinking model.** It splits output into `reasoning_content` (chain-of-thought) and `content` (answer). With `max_tokens=2048`, it can burn the entire budget on thinking and produce empty `content`.
 - **Larger models produce better Elixir.** 27B+ parameter models generally know enough Elixir to produce idiomatic code. Smaller models (7B, 13B) tend to produce Python-with-different-syntax.
 - **The validation pipeline catches model mistakes.** Common errors include `a div b` instead of `div(a, b)`, missing `do` keywords, calling nonexistent functions like `String.alphanumeric?/1`, and incorrect pattern matching syntax. The retry loop with error feedback fixes most of these.
 

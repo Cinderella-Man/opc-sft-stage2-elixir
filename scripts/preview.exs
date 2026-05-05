@@ -1,9 +1,8 @@
-# mix run scripts/preview.exs [--think]
+# mix run scripts/preview.exs
 
 alias Tunex.{LLM, Parser, Workspace, Validator, Report}
 
-thinking? = "--think" in System.argv()
-max_tokens = if thinking?, do: 16_384, else: 12_288
+max_tokens = 16_384
 
 examples = [
   %{instruction: "Write a python function to find the missing number in a given list of integers that contains n distinct numbers taken from 0, 1, 2, ..., n.",
@@ -34,12 +33,10 @@ module AND tests. NEVER use `is_` prefix for any function.
 Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
 """
 
-IO.puts("Tunex Preview | #{length(examples)} examples, thinking=#{thinking?}\n")
+IO.puts("Tunex Preview | #{length(examples)} examples\n")
 Workspace.setup("tunex_preview_workspace")
 ws = "tunex_preview_workspace"
 opts = [max_tokens: max_tokens]
-
-prefix = unless thinking?, do: "/no_think\n", else: ""
 
 for {example, i} <- Enum.with_index(examples, 1) do
   IO.puts("\n" <> String.duplicate("─", 60))
@@ -49,7 +46,7 @@ for {example, i} <- Enum.with_index(examples, 1) do
   tests = Enum.join(example.tests, "\n")
   elixir_fn = Parser.elixir_name(example.entry_point)
   prompt = """
-  #{prefix}Convert this Python exercise to Elixir.
+  Convert this Python exercise to Elixir.
   ## Python Instruction\n#{example.instruction}
   ## Python Solution\n```python\n#{example.code}\n```
   ## Python Tests\n#{tests}
