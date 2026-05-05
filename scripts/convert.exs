@@ -22,11 +22,15 @@ Idiomatic Elixir: pattern matching, multi-clause functions, pipes, guards,
 @doc/@spec. Descriptive parameter names (NEVER single letters). Prefix
 unused params with _ independently per clause.
 
-NAMING: If the Python function uses `is_` prefix (e.g. `is_palindrome`),
-ALWAYS rename it to `?` suffix in Elixir (e.g. `palindrome?`).
-Use the function name given in the prompt — it already has this applied.
-Update ALL call sites: module code, tests, and instruction must all use
-the new `?` name. NEVER use `is_` prefix for any function.
+NAMING (CRITICAL — violations will be rejected):
+- If the Python function uses `is_` prefix (e.g. `is_palindrome`),
+  you MUST rename it to `?` suffix in Elixir (e.g. `palindrome?`).
+- NEVER define a function starting with `is_` — this is invalid Elixir style.
+- Use the function name given in the prompt — it already has `?` applied.
+- Update ALL call sites: module code, tests, and instruction must ALL use
+  the `?` name. NEVER use `is_` prefix for any function anywhere in your output.
+- General Elixir naming: snake_case for functions and variables, PascalCase for modules.
+- Boolean-returning functions MUST end with `?`.
 
 Anti-patterns: single-letter names, Enum.at in loops, ++ in loops,
 length in guards, is_ prefix (use ?), Enum.count/1 (use length/1),
@@ -52,6 +56,76 @@ If renaming is_ to ?, update ALL call sites: module, tests, instruction.
 Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
 """
 
+# ── Naming Fixup Helper ─────────────────────────────────────────────
+
+defmodule NamingFixup do
+  @moduledoc """
+  Programmatic safety net: if the LLM still produces `is_foo` functions
+  despite being told to use `foo?`, fix it before validation.
+  """
+
+  require Logger
+
+  @doc """
+  Scan module + test code for `is_` prefixed function definitions.
+  If the entry_point was supposed to be `foo?`, rename `is_foo` → `foo?`
+  everywhere in both module and test code.
+
+  Returns `{module_code, test_code, renamed?}`.
+  """
+  def fix_is_prefix(module_code, test_code, original_entry_point) do
+    expected_elixir = Tunex.Parser.elixir_name(original_entry_point)
+    snake_python = Tunex.Parser.snake_name(original_entry_point)
+
+    Logger.debug("[NamingFixup] original_entry_point=#{original_entry_point} snake=#{snake_python} expected_elixir=#{expected_elixir}")
+
+    # Only applies when we expect a ? function but the LLM might have used is_ form
+    if String.ends_with?(expected_elixir, "?") do
+      is_form = snake_python  # e.g. "is_palindrome"
+
+      # Check if the module still has def is_foo instead of def foo?
+      has_is_def = String.contains?(module_code, "def #{is_form}(") or
+                   String.contains?(module_code, "def #{is_form}\n") or
+                   String.contains?(module_code, "defp #{is_form}(")
+
+      if has_is_def do
+        Logger.warning("[NamingFixup] LLM used '#{is_form}' instead of '#{expected_elixir}' — applying programmatic rename")
+
+        fixed_mod = rename_in_code(module_code, is_form, expected_elixir)
+        fixed_test = rename_in_code(test_code, is_form, expected_elixir)
+
+        Logger.debug("[NamingFixup] module BEFORE rename:\n#{module_code}")
+        Logger.debug("[NamingFixup] module AFTER rename:\n#{fixed_mod}")
+        Logger.debug("[NamingFixup] test BEFORE rename:\n#{test_code}")
+        Logger.debug("[NamingFixup] test AFTER rename:\n#{fixed_test}")
+
+        {fixed_mod, fixed_test, true}
+      else
+        Logger.debug("[NamingFixup] module already uses '#{expected_elixir}' — no fixup needed")
+        {module_code, test_code, false}
+      end
+    else
+      Logger.debug("[NamingFixup] entry_point '#{expected_elixir}' is not a ? function — skipping")
+      {module_code, test_code, false}
+    end
+  end
+
+  defp rename_in_code(code, is_form, question_form) do
+    code
+    |> String.replace("def #{is_form}(", "def #{question_form}(")
+    |> String.replace("defp #{is_form}(", "defp #{question_form}(")
+    |> String.replace("def #{is_form}\n", "def #{question_form}\n")
+    |> String.replace(".#{is_form}(", ".#{question_form}(")
+    |> String.replace(".#{is_form} ", ".#{question_form} ")
+    |> String.replace("&#{is_form}/", "&#{question_form}/")
+    # Also handle bare calls in tests like: is_palindrome("foo")
+    |> String.replace("#{is_form}(", "#{question_form}(")
+    # Handle string references in test descriptions
+    |> String.replace("\"#{is_form}\"", "\"#{question_form}\"")
+    |> String.replace("#{is_form} ", "#{question_form} ")
+  end
+end
+
 # ── Attempt + Refine Loops ───────────────────────────────────────────
 
 defmodule ConvertLoop do
@@ -73,9 +147,16 @@ defmodule ConvertLoop do
 
         case Tunex.Parser.parse_full(content) do
           {:ok, instr, mod, test} ->
-            Logger.info("[attempt #{attempt}] parse OK — running validator")
-            Logger.debug("[attempt #{attempt}] instruction=#{String.length(instr || "")} mod=#{String.length(mod)} test=#{String.length(test)} chars")
+            Logger.info("[attempt #{attempt}] parse OK — instruction=#{String.length(instr || "")} mod=#{String.length(mod)} test=#{String.length(test)} chars")
+            Logger.debug("[attempt #{attempt}] parsed instruction:\n#{instr}")
+            Logger.debug("[attempt #{attempt}] parsed module:\n#{mod}")
+            Logger.debug("[attempt #{attempt}] parsed test:\n#{test}")
 
+            # Safety-net: fix is_ → ? naming if LLM ignored the instruction
+            {mod, test, renamed?} = NamingFixup.fix_is_prefix(mod, test, example.entry_point)
+            if renamed?, do: Logger.warning("[attempt #{attempt}] NamingFixup applied is_ → ? rename")
+
+            Logger.info("[attempt #{attempt}] running validator")
             {fails, final_mod, final_test} = Tunex.Validator.run(mod, test, ws)
 
             if fails == [] do
@@ -87,7 +168,7 @@ defmodule ConvertLoop do
                       refined: false}}
             else
               Logger.warning("[attempt #{attempt}] validation FAILED with #{length(fails)} error(s): #{inspect(Enum.map(fails, &elem(&1, 0)))}")
-              Logger.debug("[attempt #{attempt}] errors: #{Tunex.Report.format_errors(fails)}")
+              Logger.debug("[attempt #{attempt}] validation errors:\n#{Tunex.Report.format_errors(fails)}")
 
               retry = """
               Your previous conversion had errors. Fix them.
@@ -101,6 +182,11 @@ defmodule ConvertLoop do
               ## Errors
               #{Tunex.Report.format_errors(fails)}
 
+              CRITICAL REMINDER: In Elixir, boolean functions use `?` suffix, NOT `is_` prefix.
+              `is_palindrome` → `palindrome?`, `is_valid` → `valid?`, etc.
+              Use the function name `#{Tunex.Parser.elixir_name(example.entry_point)}` everywhere
+              (module, tests, instruction). NEVER use `is_` prefix.
+
               Common pitfalls: unused variable→prefix _ per clause; descriptive names in ALL clauses;
               is_ prefix→use ? suffix (e.g. palindrome? not is_palindrome) in module AND tests.
               Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
@@ -111,7 +197,7 @@ defmodule ConvertLoop do
 
           :error ->
             Logger.warning("[attempt #{attempt}] parse FAILED — could not extract sections from LLM output")
-            Logger.debug("[attempt #{attempt}] raw output (first 500 chars): #{String.slice(content, 0, 500)}")
+            Logger.debug("[attempt #{attempt}] raw LLM output (first 1000 chars):\n#{String.slice(content, 0, 1000)}")
             attempt(example, prompt, sys, opts, attempt + 1, ws)
         end
 
@@ -147,7 +233,7 @@ defmodule ConvertLoop do
           {:ok, %{entry | refined: false}}
         else
           Logger.info("[refine] reviewer found issues — starting refinement loop")
-          Logger.debug("[refine] feedback (first 500 chars): #{String.slice(fb, 0, 500)}")
+          Logger.debug("[refine] full feedback:\n#{fb}")
           do_refine(entry, fb, nil, 1, refine_sys, opts, ws)
         end
 
@@ -182,6 +268,8 @@ defmodule ConvertLoop do
       ## Working Tests\n```elixir\n#{entry.elixir_test}\n```
       ## Previous (ERRORS)\n#{prev}
       ## Errors\n#{Tunex.Report.format_errors(errs)}
+
+      REMINDER: Use `?` suffix for boolean functions, NOT `is_` prefix.
       Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
       """
     else
@@ -192,6 +280,8 @@ defmodule ConvertLoop do
       ## Module\n```elixir\n#{entry.elixir_code}\n```
       ## Tests\n```elixir\n#{entry.elixir_test}\n```
       ## Feedback\n#{fb}
+
+      REMINDER: Use `?` suffix for boolean functions, NOT `is_` prefix.
       Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
       """
     end
@@ -205,6 +295,13 @@ defmodule ConvertLoop do
         case Tunex.Parser.parse_full(content) do
           {:ok, instr, mod, test} ->
             Logger.info("[do_refine #{attempt}] parse OK — running validator")
+            Logger.debug("[do_refine #{attempt}] parsed module:\n#{mod}")
+            Logger.debug("[do_refine #{attempt}] parsed test:\n#{test}")
+
+            # Safety-net rename in refinement too
+            {mod, test, renamed?} = NamingFixup.fix_is_prefix(mod, test, entry.original_entry_point)
+            if renamed?, do: Logger.warning("[do_refine #{attempt}] NamingFixup applied is_ → ? rename")
+
             {fails, fm, ft} = Tunex.Validator.run(mod, test, ws)
 
             if fails == [] do
@@ -213,13 +310,13 @@ defmodule ConvertLoop do
                       elixir_code: fm, elixir_test: ft, refined: true}}
             else
               Logger.warning("[do_refine #{attempt}] validation FAILED with #{length(fails)} error(s): #{inspect(Enum.map(fails, &elem(&1, 0)))}")
-              Logger.debug("[do_refine #{attempt}] errors: #{Tunex.Report.format_errors(fails)}")
+              Logger.debug("[do_refine #{attempt}] validation errors:\n#{Tunex.Report.format_errors(fails)}")
               do_refine(entry, fb, {content, fails}, attempt + 1, sys, opts, ws)
             end
 
           :error ->
             Logger.warning("[do_refine #{attempt}] parse FAILED — retrying")
-            Logger.debug("[do_refine #{attempt}] raw output (first 500 chars): #{String.slice(content, 0, 500)}")
+            Logger.debug("[do_refine #{attempt}] raw LLM output (first 1000 chars):\n#{String.slice(content, 0, 1000)}")
             do_refine(entry, fb, nil, attempt + 1, sys, opts, ws)
         end
 
@@ -282,20 +379,26 @@ unless pending == [] do
            entry_point: row["entry_point"], tests: row["testcase"] || []}
 
     Logger.info("[idx=#{idx}] entry_point=#{ex.entry_point}")
-    Logger.debug("[idx=#{idx}] instruction length=#{String.length(ex.instruction || "")}, code length=#{String.length(ex.code || "")}")
+    Logger.debug("[idx=#{idx}] instruction:\n#{ex.instruction}")
+    Logger.debug("[idx=#{idx}] python code:\n#{ex.code}")
 
     tests = if is_list(ex.tests), do: Enum.join(ex.tests, "\n"), else: to_string(ex.tests)
     elixir_fn = Parser.elixir_name(ex.entry_point)
-    Logger.debug("[idx=#{idx}] elixir function name: #{elixir_fn}")
+    Logger.info("[idx=#{idx}] python entry_point=#{ex.entry_point} → elixir function=#{elixir_fn}")
+
+    renamed? = elixir_fn != Parser.snake_name(ex.entry_point)
+    Logger.info("[idx=#{idx}] is_ → ? rename required: #{renamed?}")
 
     prompt = """
     Convert this Python exercise to Elixir.
     ## Python Instruction\n#{ex.instruction}
     ## Python Solution\n```python\n#{ex.code}\n```
     ## Python Tests\n#{tests}
-    Function: `#{elixir_fn}`#{if elixir_fn != Parser.snake_name(ex.entry_point), do: " (renamed from Python `#{Parser.snake_name(ex.entry_point)}` — use the `?` version everywhere)", else: ""}
+    Function: `#{elixir_fn}`#{if renamed?, do: " (renamed from Python `#{Parser.snake_name(ex.entry_point)}` — you MUST use `#{elixir_fn}` everywhere: def, tests, docs. NEVER use `#{Parser.snake_name(ex.entry_point)}`)", else: ""}
     Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
     """
+
+    Logger.debug("[idx=#{idx}] full initial prompt:\n#{prompt}")
 
     t0 = System.monotonic_time(:millisecond)
     Logger.info("[idx=#{idx}] starting attempt loop")
@@ -319,11 +422,14 @@ unless pending == [] do
     case result do
       {:ok, entry} ->
         IO.puts("✓ [#{idx}] #{ep} (#{elapsed}s)")
-        Logger.debug("[idx=#{idx}] writing success to JSONL (refined=#{entry.refined})")
+        Logger.info("[idx=#{idx}] SUCCESS refined=#{entry.refined} attempts=#{entry.attempts}")
+        Logger.debug("[idx=#{idx}] final entry_point=#{entry.entry_point}")
+        Logger.debug("[idx=#{idx}] final module:\n#{entry.elixir_code}")
+        Logger.debug("[idx=#{idx}] final test:\n#{entry.elixir_test}")
         JSONL.append_to(out, Map.put(entry, :index, idx))
       {:failed, reason} ->
         IO.puts("✗ [#{idx}] #{ep}: #{reason} (#{elapsed}s)")
-        Logger.debug("[idx=#{idx}] writing failure to errors JSONL")
+        Logger.warning("[idx=#{idx}] FAILED: #{reason}")
         JSONL.append_to(err, %{index: idx, entry_point: ep, failure_reason: reason})
     end
   end)
