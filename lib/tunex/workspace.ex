@@ -63,7 +63,7 @@ defmodule Tunex.Workspace do
   defp deps do
         [
           {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-          {:credence, "~> 0.3", only: [:dev, :test], runtime: false}
+          {:credence, git: "https://github.com/Cinderella-Man/credence.git", branch: "main", only: [:dev, :test], runtime: false}
         ]
   """
 
@@ -94,6 +94,8 @@ defmodule Tunex.Workspace do
     IO.puts("Updating credence to latest in #{path}...")
     System.cmd("mix", ["deps.update", "credence"], cd: path, stderr_to_stdout: true)
     System.cmd("mix", ["deps.compile", "credence", "--force"], cd: path, stderr_to_stdout: true)
+    System.cmd("mix", ["deps.compile", "credence", "--force"], cd: path, stderr_to_stdout: true,
+      env: [{"MIX_ENV", "test"}])
     IO.puts("  ✓ Credence updated")
   end
 
@@ -135,7 +137,7 @@ defmodule Tunex.Workspace do
         String.replace(
           content,
           ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false}),
-          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, "~> 0.3", only: [:dev, :test], runtime: false})
+          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, git: "https://github.com/Cinderella-Man/credence.git", branch: "main", only: [:dev, :test], runtime: false})
         )
 
       File.write!(mix_exs, fixed)
@@ -166,6 +168,10 @@ defmodule Tunex.Workspace do
     unless File.exists?(Path.join(path, "deps/credence")) do
       System.cmd("mix", ["deps.get"], cd: path, stderr_to_stdout: true)
       System.cmd("mix", ["deps.compile"], cd: path, stderr_to_stdout: true)
+      # Also compile deps for test env — the validator runs credence fix
+      # with MIX_ENV=test and --no-compile, so deps must be pre-built
+      System.cmd("mix", ["deps.compile"], cd: path, stderr_to_stdout: true,
+        env: [{"MIX_ENV", "test"}])
     end
   end
 end

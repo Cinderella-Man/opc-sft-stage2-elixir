@@ -2,17 +2,17 @@ defmodule Tunex.Validator do
   @moduledoc """
   Runs the validation pipeline against Elixir code in a workspace.
 
-  Steps: compile → credence fix → propagate renames → re-compile → format → credo → credence check → test
+  Steps: credence fix → propagate renames → compile → format → credo → credence check → test
 
-  The credence fix step auto-fixes issues that Credence can handle
-  deterministically (e.g. naming conventions, structural rewrites).
-  When credence renames `is_foo` → `foo?`, the rename is propagated
-  to the test file automatically. Unfixable issues are reported as
-  failures and fed back to the LLM.
+  Credence runs FIRST — before compilation — because:
+  - Syntax phase fixes parse errors (e.g. `div` infix from Python)
+  - Semantic phase fixes compiler warnings (unused vars, undefined fns)
+  - Pattern phase fixes anti-patterns (sort+reverse, is_prefix, etc.)
+
+  This prevents wasting LLM retries on issues Credence can auto-fix.
 
   Returns `{failures, final_module_code, final_test_code}` where failures
-  is a list of `{stage, message}` tuples. Format is auto-applied so
-  final code may differ from input.
+  is a list of `{stage, message}` tuples.
   """
 
   require Logger
@@ -35,8 +35,42 @@ defmodule Tunex.Validator do
 
     failures = []
 
-    # 1. Compile
-    Logger.info("[Validator.run] step 1/6: compile")
+    # 1. Credence fix (runs on ANY code — even non-compiling)
+    Logger.info("[Validator.run] step 1/6: credence fix")
+
+    {current_mod, current_test, credence_changed?} =
+      case run_credence_fix(workspace) do
+        {:fixed, true} ->
+          Logger.info("[Validator.run] credence fixed code — propagating renames")
+          fixed_mod = File.read!(mod_path)
+          Logger.debug("[Validator.run] module BEFORE credence fix:\n#{module_code}")
+          Logger.debug("[Validator.run] module AFTER credence fix:\n#{fixed_mod}")
+          updated_test = propagate_is_renames(module_code, fixed_mod, test_code)
+
+          if updated_test != test_code do
+            Logger.info("[Validator.run] test code updated with propagated renames")
+            Logger.debug("[Validator.run] test BEFORE rename propagation:\n#{test_code}")
+            Logger.debug("[Validator.run] test AFTER rename propagation:\n#{updated_test}")
+            File.write!(test_path, updated_test)
+          end
+
+          {fixed_mod, updated_test, true}
+
+        {:fixed, false} ->
+          Logger.warning("[Validator.run] credence fix produced invalid code — reverted")
+          {module_code, test_code, false}
+
+        :no_changes ->
+          Logger.info("[Validator.run] credence: no changes needed")
+          {module_code, test_code, false}
+
+        :error ->
+          Logger.warning("[Validator.run] credence fix script errored — continuing with original")
+          {module_code, test_code, false}
+      end
+
+    # 2. Compile
+    Logger.info("[Validator.run] step 2/6: compile")
 
     {output, code} =
       System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
@@ -48,48 +82,35 @@ defmodule Tunex.Validator do
     compiled = code == 0
     Logger.info("[Validator.run] compile exit=#{code} compiled=#{compiled}")
     Logger.debug("[Validator.run] compile output:\n#{output}")
-    failures = if compiled, do: failures, else: failures ++ [{:compile, clean_output(output)}]
 
-    # 2. Credence fix (auto-fix what it can) + propagate renames to tests
-    Logger.info("[Validator.run] step 2/6: credence fix")
+    # If credence fix broke compilation, revert to original and retry
+    {compiled, failures} =
+      if not compiled and credence_changed? do
+        Logger.warning("[Validator.run] credence fix may have broken compilation — reverting")
+        File.write!(mod_path, module_code)
+        File.write!(test_path, test_code)
 
-    compiled =
-      if compiled do
-        case run_credence_fix(workspace) do
-          {:fixed, true} ->
-            Logger.info("[Validator.run] credence fixed code — propagating renames")
-            # Credence changed the module — propagate is_ → ? renames to tests
-            fixed_mod = File.read!(mod_path)
-            Logger.debug("[Validator.run] module BEFORE credence fix:\n#{module_code}")
-            Logger.debug("[Validator.run] module AFTER credence fix:\n#{fixed_mod}")
-            updated_test = propagate_is_renames(module_code, fixed_mod, test_code)
+        {revert_output, revert_code} =
+          System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
+            cd: workspace,
+            stderr_to_stdout: true,
+            env: [{"MIX_ENV", "test"}]
+          )
 
-            if updated_test != test_code do
-              Logger.info("[Validator.run] test code updated with propagated renames")
-              Logger.debug("[Validator.run] test BEFORE rename propagation:\n#{test_code}")
-              Logger.debug("[Validator.run] test AFTER rename propagation:\n#{updated_test}")
-              File.write!(test_path, updated_test)
-            else
-              Logger.debug("[Validator.run] no renames needed in test code")
-            end
+        revert_compiled = revert_code == 0
+        Logger.info("[Validator.run] revert compile exit=#{revert_code}")
 
-            true
-
-          {:fixed, false} ->
-            Logger.warning("[Validator.run] credence fix broke compilation — reverted")
-            true
-
-          :no_changes ->
-            Logger.info("[Validator.run] credence: no changes needed")
-            true
-
-          :error ->
-            Logger.warning("[Validator.run] credence fix script errored — continuing")
-            true
+        if revert_compiled do
+          {true, failures}
+        else
+          {false, failures ++ [{:compile, clean_output(revert_output)}]}
         end
       else
-        Logger.info("[Validator.run] skipping credence fix (compile failed)")
-        false
+        if compiled do
+          {true, failures}
+        else
+          {false, failures ++ [{:compile, clean_output(output)}]}
+        end
       end
 
     # 3. Format (auto-fix, don't fail)
@@ -233,8 +254,9 @@ defmodule Tunex.Validator do
   @doc """
   Apply Credence auto-fix to module code and propagate renames to test code.
 
-  Writes the module to the workspace, compiles, runs `Credence.fix/2`,
-  detects `is_foo` → `foo?` renames and applies them to test code too.
+  No pre-compilation needed — Credence handles non-compiling code via
+  its Syntax phase. Writes the module, runs `Credence.fix/2`, detects
+  `is_foo` → `foo?` renames and applies them to test code.
 
   Returns `{:ok, fixed_mod, fixed_test}` or `{:error, original_mod, original_test}`.
   """
@@ -247,43 +269,35 @@ defmodule Tunex.Validator do
     for f <- Path.wildcard(Path.join(workspace, "lib/*.ex")), do: File.rm(f)
     File.write!(mod_path, module_code)
 
-    # Must compile before credence can analyze the AST
-    {_, code} =
-      System.cmd("mix", ["compile", "--force"],
-        cd: workspace,
-        stderr_to_stdout: true,
-        env: [{"MIX_ENV", "test"}]
-      )
+    case run_credence_fix(workspace) do
+      {:fixed, true} ->
+        fixed_mod = File.read!(mod_path)
+        fixed_test = propagate_is_renames(module_code, fixed_mod, test_code)
+        Logger.info("[apply_credence_fix] fix applied and renames propagated")
+        {:ok, fixed_mod, fixed_test}
 
-    if code != 0 do
-      Logger.warning("[apply_credence_fix] compile failed — returning original code")
-      {:error, module_code, test_code}
-    else
-      case run_credence_fix(workspace) do
-        {:fixed, true} ->
-          fixed_mod = File.read!(mod_path)
-          fixed_test = propagate_is_renames(module_code, fixed_mod, test_code)
-          Logger.info("[apply_credence_fix] fix applied and renames propagated")
-          {:ok, fixed_mod, fixed_test}
+      {:fixed, false} ->
+        # Fix produced invalid code — revert
+        File.write!(mod_path, module_code)
+        Logger.warning("[apply_credence_fix] fix produced invalid code — reverted")
+        {:error, module_code, test_code}
 
-        {:fixed, false} ->
-          # Fix broke compilation — revert
-          File.write!(mod_path, module_code)
-          Logger.warning("[apply_credence_fix] fix broke compilation — reverted")
-          {:error, module_code, test_code}
+      :no_changes ->
+        Logger.info("[apply_credence_fix] no changes needed")
+        {:ok, module_code, test_code}
 
-        :no_changes ->
-          Logger.info("[apply_credence_fix] no changes needed")
-          {:ok, module_code, test_code}
-
-        :error ->
-          Logger.warning("[apply_credence_fix] credence error — returning original")
-          {:error, module_code, test_code}
-      end
+      :error ->
+        Logger.warning("[apply_credence_fix] credence error — returning original")
+        {:error, module_code, test_code}
     end
   end
 
-  # ── Credence Fix (shared by run/3 and apply_credence_fix/3) ────────
+  # ── Credence Fix ────────────────────────────────────────────────────
+  #
+  # Uses --no-compile so the script runs even when solution.ex has
+  # syntax errors. Credence reads the file as a string and its Syntax
+  # phase handles parse errors. Deps (including Credence) are already
+  # compiled from workspace setup.
 
   defp run_credence_fix(workspace) do
     mod_path = Path.join(workspace, "lib/solution.ex")
@@ -292,7 +306,7 @@ defmodule Tunex.Validator do
     Logger.debug("[run_credence_fix] running fix script in #{workspace}")
 
     {output, code} =
-      System.cmd("mix", ["run", "run_credence_fix.exs"],
+      System.cmd("mix", ["run", "--no-compile", "run_credence_fix.exs"],
         cd: workspace,
         stderr_to_stdout: true,
         env: [{"MIX_ENV", "test"}]
@@ -305,7 +319,8 @@ defmodule Tunex.Validator do
     cond do
       fixed? ->
         Logger.info("[run_credence_fix] credence reported FIXED — verifying compilation")
-        # Verify the fix still compiles
+
+        # Verify the fix compiles cleanly
         {recompile_out, recompile_code} =
           System.cmd("mix", ["compile", "--warnings-as-errors", "--force"],
             cd: workspace,
@@ -381,9 +396,6 @@ defmodule Tunex.Validator do
         Logger.info("[propagate_is_renames] applying renames: #{inspect(renames)}")
 
         Enum.reduce(renames, test_code, fn {old_name, new_name}, code ->
-          # Replace function calls: Module.is_foo( → Module.foo?(
-          # Replace bare references: is_foo( → foo?(
-          # Replace string references: "is_foo" → "foo?" (in test names)
           code
           |> String.replace(".#{old_name}(", ".#{new_name}(")
           |> String.replace(".#{old_name} ", ".#{new_name} ")

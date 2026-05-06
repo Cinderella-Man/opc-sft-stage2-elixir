@@ -166,12 +166,12 @@ end
 defmodule ConvertLoop do
   require Logger
 
-  def attempt(_example, _prompt, _sys, _opts, attempt, _ws, _tlog) when attempt > 5 do
+  def attempt(_example, _prompt, _sys, _opts, attempt, _ws, _tlog, last_data) when attempt > 5 do
     Logger.warning("[attempt] giving up after #{attempt - 1} attempts")
-    {:failed, "exceeded retries"}
+    {:failed, %{reason: "exceeded retries", attempts: attempt - 1, last: last_data}}
   end
 
-  def attempt(example, prompt, sys, opts, attempt, ws, tlog) do
+  def attempt(example, prompt, sys, opts, attempt, ws, tlog, last_data \\ nil) do
     Logger.info("[attempt #{attempt}] calling LLM for entry_point=#{example.entry_point}")
     Logger.debug("[attempt #{attempt}] prompt length=#{String.length(prompt)} chars")
 
@@ -196,6 +196,16 @@ defmodule ConvertLoop do
 
             Logger.info("[attempt #{attempt}] running validator")
             {fails, final_mod, final_test} = Tunex.Validator.run(mod, test, ws)
+
+            # Capture latest parsed data — carried forward on failure
+            current_data = %{
+              instruction: instr,
+              elixir_code: final_mod,
+              elixir_test: final_test,
+              raw_module: mod,
+              raw_test: test,
+              validation_failures: fails
+            }
 
             if fails == [] do
               Logger.info("[attempt #{attempt}] validation PASSED")
@@ -267,7 +277,7 @@ defmodule ConvertLoop do
               Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
               """
               Logger.info("[attempt #{attempt}] retrying with error feedback")
-              attempt(example, retry, sys, opts, attempt + 1, ws, tlog)
+              attempt(example, retry, sys, opts, attempt + 1, ws, tlog, current_data)
             end
 
           :error ->
@@ -285,7 +295,8 @@ defmodule ConvertLoop do
               outcome: :parse_error
             })
 
-            attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
+            # Keep last_data from previous attempt (this one didn't parse)
+            attempt(example, prompt, sys, opts, attempt + 1, ws, tlog, last_data)
         end
 
       {:empty, reason} ->
@@ -301,7 +312,7 @@ defmodule ConvertLoop do
           outcome: :empty
         })
 
-        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
+        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog, last_data)
 
       {:error, reason} ->
         Logger.error("[attempt #{attempt}] LLM call error: #{reason}")
@@ -316,7 +327,7 @@ defmodule ConvertLoop do
           outcome: :error
         })
 
-        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
+        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog, last_data)
 
       other ->
         Logger.error("[attempt #{attempt}] LLM unexpected result: #{inspect(other)}")
@@ -331,7 +342,7 @@ defmodule ConvertLoop do
           outcome: :unexpected
         })
 
-        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
+        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog, last_data)
     end
   end
 
@@ -707,16 +718,21 @@ unless pending == [] do
           refined: entry.refined
         })
 
-      {:failed, reason} ->
+      {:failed, failure_info} ->
+        last = failure_info[:last] || %{}
         TrajectoryLogger.log_summary(tlog, %{
-          total_attempts: 5,
+          total_attempts: failure_info.attempts,
           total_refinements: CallCounter.refinements(),
           total_llm_calls: CallCounter.llm_calls(),
           final_outcome: :failed,
-          failure_reason: reason,
+          failure_reason: failure_info.reason,
           elapsed_s: elapsed,
           original_instruction: ex.instruction,
-          python_code: ex.code
+          python_code: ex.code,
+          final_instruction: last[:instruction],
+          final_module: last[:elixir_code],
+          final_test: last[:elixir_test],
+          validation_failures: last[:validation_failures]
         })
     end
 
@@ -732,10 +748,32 @@ unless pending == [] do
         Logger.debug("[idx=#{idx}] final module:\n#{entry.elixir_code}")
         Logger.debug("[idx=#{idx}] final test:\n#{entry.elixir_test}")
         JSONL.append_to(out, Map.put(entry, :index, idx))
-      {:failed, reason} ->
-        IO.puts("✗ [#{idx}] #{ep}: #{reason} (#{elapsed}s)")
-        Logger.warning("[idx=#{idx}] FAILED: #{reason}")
-        JSONL.append_to(err, %{index: idx, entry_point: ep, failure_reason: reason})
+
+      {:failed, failure_info} ->
+        IO.puts("✗ [#{idx}] #{ep}: #{failure_info.reason} (#{elapsed}s)")
+        Logger.warning("[idx=#{idx}] FAILED: #{failure_info.reason}")
+        last = failure_info[:last] || %{}
+        JSONL.append_to(err, %{
+          index: idx,
+          entry_point: Tunex.Parser.elixir_name(ep),
+          original_entry_point: ep,
+          failure_reason: failure_info.reason,
+          attempts: failure_info.attempts,
+          llm_calls: CallCounter.llm_calls(),
+          refinements: CallCounter.refinements(),
+          # Original data (mirrors success record)
+          original_instruction: row["instruction"],
+          python_code: row["code"],
+          python_tests: row["testcase"],
+          # Last LLM output (nil if LLM never produced parseable output)
+          instruction: last[:instruction],
+          elixir_code: last[:elixir_code],
+          elixir_test: last[:elixir_test],
+          # What failed in the last validation
+          validation_failures:
+            (last[:validation_failures] || [])
+            |> Enum.map(fn {stage, msg} -> "#{stage}: #{msg}" end)
+        })
     end
   end)
 
