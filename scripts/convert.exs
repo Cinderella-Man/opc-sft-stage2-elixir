@@ -2,7 +2,7 @@
 
 require Logger
 
-alias Tunex.{CLI, Dataset, LLM, Parser, Progress, Workspace, Validator, JSONL, Report}
+alias Tunex.{CLI, Dataset, LLM, Parser, Progress, Workspace, Validator, JSONL, Report, TrajectoryLogger}
 
 max_retries = Application.get_env(:tunex, :max_retries, 5)
 max_refine = Application.get_env(:tunex, :max_refine_retries, 5)
@@ -55,6 +55,41 @@ Keep same module/function names. Code must compile.
 If renaming is_ to ?, update ALL call sites: module, tests, instruction.
 Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
 """
+
+# ── LLM Call with Timing ────────────────────────────────────────────
+
+defmodule TimedLLM do
+  @moduledoc "Wrapper around LLM.call that returns latency."
+
+  def call(prompt, sys, opts) do
+    t0 = System.monotonic_time(:millisecond)
+    result = Tunex.LLM.call(prompt, sys, opts)
+    latency = System.monotonic_time(:millisecond) - t0
+    {result, latency}
+  end
+end
+
+# ── LLM Call Counter (per-process) ──────────────────────────────────
+
+defmodule CallCounter do
+  @moduledoc "Track LLM call counts and refinement counts via process dictionary."
+
+  def reset do
+    Process.put(:llm_calls, 0)
+    Process.put(:refinement_attempts, 0)
+  end
+
+  def inc_llm_calls do
+    Process.put(:llm_calls, (Process.get(:llm_calls) || 0) + 1)
+  end
+
+  def inc_refinements do
+    Process.put(:refinement_attempts, (Process.get(:refinement_attempts) || 0) + 1)
+  end
+
+  def llm_calls, do: Process.get(:llm_calls) || 0
+  def refinements, do: Process.get(:refinement_attempts) || 0
+end
 
 # ── Naming Fixup Helper ─────────────────────────────────────────────
 
@@ -131,16 +166,19 @@ end
 defmodule ConvertLoop do
   require Logger
 
-  def attempt(_example, _prompt, _sys, _opts, attempt, _ws) when attempt > 5 do
+  def attempt(_example, _prompt, _sys, _opts, attempt, _ws, _tlog) when attempt > 5 do
     Logger.warning("[attempt] giving up after #{attempt - 1} attempts")
     {:failed, "exceeded retries"}
   end
 
-  def attempt(example, prompt, sys, opts, attempt, ws) do
+  def attempt(example, prompt, sys, opts, attempt, ws, tlog) do
     Logger.info("[attempt #{attempt}] calling LLM for entry_point=#{example.entry_point}")
     Logger.debug("[attempt #{attempt}] prompt length=#{String.length(prompt)} chars")
 
-    case Tunex.LLM.call(prompt, sys, opts) do
+    CallCounter.inc_llm_calls()
+    {llm_result, latency_ms} = TimedLLM.call(prompt, sys, opts)
+
+    case llm_result do
       {:ok, content} ->
         Logger.info("[attempt #{attempt}] LLM returned #{String.length(content)} chars")
         Logger.debug("[attempt #{attempt}] parsing LLM response")
@@ -161,6 +199,25 @@ defmodule ConvertLoop do
 
             if fails == [] do
               Logger.info("[attempt #{attempt}] validation PASSED")
+
+              # ── Log successful attempt ──
+              TrajectoryLogger.log_attempt(tlog, %{
+                attempt_number: attempt,
+                prompt: prompt,
+                raw_response: content,
+                llm_result: :ok,
+                llm_latency_ms: latency_ms,
+                parse_ok: true,
+                instruction: instr,
+                module_code: mod,
+                test_code: test,
+                naming_fixup_applied: renamed?,
+                validation_failures: [],
+                final_module_code: final_mod,
+                final_test_code: final_test,
+                outcome: :passed
+              })
+
               {:ok, %{instruction: instr, elixir_code: final_mod, elixir_test: final_test,
                       original_instruction: example.instruction, python_code: example.code,
                       entry_point: Tunex.Parser.elixir_name(example.entry_point),
@@ -169,6 +226,24 @@ defmodule ConvertLoop do
             else
               Logger.warning("[attempt #{attempt}] validation FAILED with #{length(fails)} error(s): #{inspect(Enum.map(fails, &elem(&1, 0)))}")
               Logger.debug("[attempt #{attempt}] validation errors:\n#{Tunex.Report.format_errors(fails)}")
+
+              # ── Log failed attempt (validation) ──
+              TrajectoryLogger.log_attempt(tlog, %{
+                attempt_number: attempt,
+                prompt: prompt,
+                raw_response: content,
+                llm_result: :ok,
+                llm_latency_ms: latency_ms,
+                parse_ok: true,
+                instruction: instr,
+                module_code: mod,
+                test_code: test,
+                naming_fixup_applied: renamed?,
+                validation_failures: fails,
+                final_module_code: final_mod,
+                final_test_code: final_test,
+                outcome: :failed
+              })
 
               retry = """
               Your previous conversion had errors. Fix them.
@@ -192,30 +267,75 @@ defmodule ConvertLoop do
               Output: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
               """
               Logger.info("[attempt #{attempt}] retrying with error feedback")
-              attempt(example, retry, sys, opts, attempt + 1, ws)
+              attempt(example, retry, sys, opts, attempt + 1, ws, tlog)
             end
 
           :error ->
             Logger.warning("[attempt #{attempt}] parse FAILED — could not extract sections from LLM output")
             Logger.debug("[attempt #{attempt}] raw LLM output (first 1000 chars):\n#{String.slice(content, 0, 1000)}")
-            attempt(example, prompt, sys, opts, attempt + 1, ws)
+
+            # ── Log parse failure ──
+            TrajectoryLogger.log_attempt(tlog, %{
+              attempt_number: attempt,
+              prompt: prompt,
+              raw_response: content,
+              llm_result: :ok,
+              llm_latency_ms: latency_ms,
+              parse_ok: false,
+              outcome: :parse_error
+            })
+
+            attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
         end
 
       {:empty, reason} ->
         Logger.warning("[attempt #{attempt}] LLM returned empty: #{reason}")
-        attempt(example, prompt, sys, opts, attempt + 1, ws)
+
+        # ── Log empty response ──
+        TrajectoryLogger.log_attempt(tlog, %{
+          attempt_number: attempt,
+          prompt: prompt,
+          raw_response: nil,
+          llm_result: :empty,
+          llm_latency_ms: latency_ms,
+          outcome: :empty
+        })
+
+        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
 
       {:error, reason} ->
         Logger.error("[attempt #{attempt}] LLM call error: #{reason}")
-        attempt(example, prompt, sys, opts, attempt + 1, ws)
+
+        # ── Log error ──
+        TrajectoryLogger.log_attempt(tlog, %{
+          attempt_number: attempt,
+          prompt: prompt,
+          raw_response: nil,
+          llm_result: :error,
+          llm_latency_ms: latency_ms,
+          outcome: :error
+        })
+
+        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
 
       other ->
         Logger.error("[attempt #{attempt}] LLM unexpected result: #{inspect(other)}")
-        attempt(example, prompt, sys, opts, attempt + 1, ws)
+
+        # ── Log unexpected ──
+        TrajectoryLogger.log_attempt(tlog, %{
+          attempt_number: attempt,
+          prompt: prompt,
+          raw_response: inspect(other),
+          llm_result: :unexpected,
+          llm_latency_ms: latency_ms,
+          outcome: :unexpected
+        })
+
+        attempt(example, prompt, sys, opts, attempt + 1, ws, tlog)
     end
   end
 
-  def refine(entry, review_sys, refine_sys, opts, ws) do
+  def refine(entry, review_sys, refine_sys, opts, ws, tlog) do
     Logger.info("[refine] starting review for entry_point=#{entry.entry_point}")
 
     review = """
@@ -226,38 +346,85 @@ defmodule ConvertLoop do
     If excellent: NO_ISSUES_FOUND
     """
 
-    case Tunex.LLM.call(review, review_sys, opts) do
+    CallCounter.inc_llm_calls()
+    {llm_result, latency_ms} = TimedLLM.call(review, review_sys, opts)
+
+    case llm_result do
       {:ok, fb} ->
-        if String.contains?(fb, "NO_ISSUES_FOUND") do
+        no_issues = String.contains?(fb, "NO_ISSUES_FOUND")
+
+        # ── Log review ──
+        TrajectoryLogger.log_review(tlog, %{
+          prompt: review,
+          raw_response: fb,
+          llm_result: :ok,
+          llm_latency_ms: latency_ms,
+          no_issues_found: no_issues,
+          module_code: entry.elixir_code,
+          test_code: entry.elixir_test
+        })
+
+        if no_issues do
           Logger.info("[refine] reviewer says NO_ISSUES_FOUND — skipping refinement")
           {:ok, %{entry | refined: false}}
         else
           Logger.info("[refine] reviewer found issues — starting refinement loop")
           Logger.debug("[refine] full feedback:\n#{fb}")
-          do_refine(entry, fb, nil, 1, refine_sys, opts, ws)
+          do_refine(entry, fb, nil, 1, refine_sys, opts, ws, tlog)
         end
 
       {:empty, reason} ->
         Logger.warning("[refine] review LLM returned empty: #{reason} — skipping refinement")
+
+        TrajectoryLogger.log_review(tlog, %{
+          prompt: review,
+          raw_response: nil,
+          llm_result: :empty,
+          llm_latency_ms: latency_ms,
+          module_code: entry.elixir_code,
+          test_code: entry.elixir_test
+        })
+
         {:ok, %{entry | refined: false}}
 
       {:error, reason} ->
         Logger.error("[refine] review LLM error: #{reason} — skipping refinement")
+
+        TrajectoryLogger.log_review(tlog, %{
+          prompt: review,
+          raw_response: nil,
+          llm_result: :error,
+          llm_latency_ms: latency_ms,
+          module_code: entry.elixir_code,
+          test_code: entry.elixir_test
+        })
+
         {:ok, %{entry | refined: false}}
 
       other ->
         Logger.warning("[refine] review LLM unexpected result: #{inspect(other)} — skipping refinement")
+
+        TrajectoryLogger.log_review(tlog, %{
+          prompt: review,
+          raw_response: inspect(other),
+          llm_result: :unexpected,
+          llm_latency_ms: latency_ms,
+          module_code: entry.elixir_code,
+          test_code: entry.elixir_test
+        })
+
         {:ok, %{entry | refined: false}}
     end
   end
 
-  defp do_refine(entry, _fb, _prev, attempt, _sys, _opts, _ws) when attempt > 5 do
+  defp do_refine(entry, _fb, _prev, attempt, _sys, _opts, _ws, _tlog) when attempt > 5 do
     Logger.warning("[do_refine] giving up after #{attempt - 1} refinement attempts — keeping last good version")
     {:ok, entry}
   end
 
-  defp do_refine(entry, fb, prev_errors, attempt, sys, opts, ws) do
+  defp do_refine(entry, fb, prev_errors, attempt, sys, opts, ws, tlog) do
     Logger.info("[do_refine #{attempt}] building refinement prompt")
+    CallCounter.inc_refinements()
 
     prompt = if prev_errors do
       {prev, errs} = prev_errors
@@ -288,7 +455,10 @@ defmodule ConvertLoop do
 
     Logger.info("[do_refine #{attempt}] calling LLM")
 
-    case Tunex.LLM.call(prompt, sys, opts) do
+    CallCounter.inc_llm_calls()
+    {llm_result, latency_ms} = TimedLLM.call(prompt, sys, opts)
+
+    case llm_result do
       {:ok, content} ->
         Logger.info("[do_refine #{attempt}] LLM returned #{String.length(content)} chars")
 
@@ -306,30 +476,126 @@ defmodule ConvertLoop do
 
             if fails == [] do
               Logger.info("[do_refine #{attempt}] validation PASSED — refinement successful")
+
+              # ── Log successful refinement ──
+              TrajectoryLogger.log_refinement(tlog, %{
+                refinement_attempt: attempt,
+                prompt: prompt,
+                raw_response: content,
+                llm_result: :ok,
+                llm_latency_ms: latency_ms,
+                parse_ok: true,
+                module_before: entry.elixir_code,
+                module_after: mod,
+                test_before: entry.elixir_test,
+                test_after: test,
+                naming_fixup_applied: renamed?,
+                validation_failures: [],
+                final_module_code: fm,
+                final_test_code: ft,
+                outcome: :passed,
+                reviewer_feedback: fb
+              })
+
               {:ok, %{entry | instruction: instr || entry.instruction,
                       elixir_code: fm, elixir_test: ft, refined: true}}
             else
               Logger.warning("[do_refine #{attempt}] validation FAILED with #{length(fails)} error(s): #{inspect(Enum.map(fails, &elem(&1, 0)))}")
               Logger.debug("[do_refine #{attempt}] validation errors:\n#{Tunex.Report.format_errors(fails)}")
-              do_refine(entry, fb, {content, fails}, attempt + 1, sys, opts, ws)
+
+              # ── Log failed refinement ──
+              TrajectoryLogger.log_refinement(tlog, %{
+                refinement_attempt: attempt,
+                prompt: prompt,
+                raw_response: content,
+                llm_result: :ok,
+                llm_latency_ms: latency_ms,
+                parse_ok: true,
+                module_before: entry.elixir_code,
+                module_after: mod,
+                test_before: entry.elixir_test,
+                test_after: test,
+                naming_fixup_applied: renamed?,
+                validation_failures: fails,
+                final_module_code: fm,
+                final_test_code: ft,
+                outcome: :failed,
+                reviewer_feedback: fb
+              })
+
+              do_refine(entry, fb, {content, fails}, attempt + 1, sys, opts, ws, tlog)
             end
 
           :error ->
             Logger.warning("[do_refine #{attempt}] parse FAILED — retrying")
             Logger.debug("[do_refine #{attempt}] raw LLM output (first 1000 chars):\n#{String.slice(content, 0, 1000)}")
-            do_refine(entry, fb, nil, attempt + 1, sys, opts, ws)
+
+            # ── Log refinement parse failure ──
+            TrajectoryLogger.log_refinement(tlog, %{
+              refinement_attempt: attempt,
+              prompt: prompt,
+              raw_response: content,
+              llm_result: :ok,
+              llm_latency_ms: latency_ms,
+              parse_ok: false,
+              module_before: entry.elixir_code,
+              test_before: entry.elixir_test,
+              outcome: :parse_error,
+              reviewer_feedback: fb
+            })
+
+            do_refine(entry, fb, nil, attempt + 1, sys, opts, ws, tlog)
         end
 
       {:empty, reason} ->
         Logger.warning("[do_refine #{attempt}] LLM returned empty: #{reason} — keeping current version")
+
+        TrajectoryLogger.log_refinement(tlog, %{
+          refinement_attempt: attempt,
+          prompt: prompt,
+          raw_response: nil,
+          llm_result: :empty,
+          llm_latency_ms: latency_ms,
+          module_before: entry.elixir_code,
+          test_before: entry.elixir_test,
+          outcome: :empty,
+          reviewer_feedback: fb
+        })
+
         {:ok, entry}
 
       {:error, reason} ->
         Logger.error("[do_refine #{attempt}] LLM error: #{reason} — keeping current version")
+
+        TrajectoryLogger.log_refinement(tlog, %{
+          refinement_attempt: attempt,
+          prompt: prompt,
+          raw_response: nil,
+          llm_result: :error,
+          llm_latency_ms: latency_ms,
+          module_before: entry.elixir_code,
+          test_before: entry.elixir_test,
+          outcome: :error,
+          reviewer_feedback: fb
+        })
+
         {:ok, entry}
 
       other ->
         Logger.warning("[do_refine #{attempt}] LLM unexpected result: #{inspect(other)} — keeping current version")
+
+        TrajectoryLogger.log_refinement(tlog, %{
+          refinement_attempt: attempt,
+          prompt: prompt,
+          raw_response: inspect(other),
+          llm_result: :unexpected,
+          llm_latency_ms: latency_ms,
+          module_before: entry.elixir_code,
+          test_before: entry.elixir_test,
+          outcome: :unexpected,
+          reviewer_feedback: fb
+        })
+
         {:ok, entry}
     end
   end
@@ -364,9 +630,11 @@ Logger.info("#{length(pending)} pending indices, #{MapSet.size(completed)} alrea
 unless pending == [] do
   out = JSONL.open_append(output_path)
   err = JSONL.open_append(errors_path)
+  traj_logger = TrajectoryLogger.open(subset)
   opts = [max_tokens: max_tokens]
 
   Logger.info("Starting processing with max_tokens=#{max_tokens}, concurrency=#{concurrency}")
+  Logger.info("Trajectory logging to: #{traj_logger.path}")
 
   pending
   |> Enum.map(fn idx -> {Enum.at(all_rows, idx), idx} end)
@@ -374,6 +642,9 @@ unless pending == [] do
     wid = Workspace.checkout()
     ws = Workspace.pool_path("tunex_workspace", wid)
     Logger.info("[idx=#{idx}] checked out workspace #{wid} (#{ws})")
+
+    # Reset per-task counters
+    CallCounter.reset()
 
     ex = %{instruction: row["instruction"], code: row["code"],
            entry_point: row["entry_point"], tests: row["testcase"] || []}
@@ -400,13 +671,16 @@ unless pending == [] do
 
     Logger.debug("[idx=#{idx}] full initial prompt:\n#{prompt}")
 
+    # Create task-scoped trajectory logger context
+    tlog = TrajectoryLogger.with_context(traj_logger, idx, ex.entry_point)
+
     t0 = System.monotonic_time(:millisecond)
     Logger.info("[idx=#{idx}] starting attempt loop")
 
-    result = case ConvertLoop.attempt(ex, prompt, system_prompt, opts, 1, ws) do
+    result = case ConvertLoop.attempt(ex, prompt, system_prompt, opts, 1, ws, tlog) do
       {:ok, entry} ->
         Logger.info("[idx=#{idx}] attempt loop succeeded (#{entry.attempts} attempt(s)) — starting refine")
-        ConvertLoop.refine(entry, review_prompt, refine_prompt, opts, ws)
+        ConvertLoop.refine(entry, review_prompt, refine_prompt, opts, ws, tlog)
       fail ->
         Logger.warning("[idx=#{idx}] attempt loop failed: #{inspect(fail)}")
         fail
@@ -415,6 +689,37 @@ unless pending == [] do
     Workspace.checkin(wid)
     elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
     Logger.info("[idx=#{idx}] finished in #{elapsed}s — result: #{if match?({:ok, _}, result), do: "OK", else: "FAILED"}")
+
+    # ── Log trajectory summary ──
+    case result do
+      {:ok, entry} ->
+        TrajectoryLogger.log_summary(tlog, %{
+          total_attempts: entry.attempts,
+          total_refinements: CallCounter.refinements(),
+          total_llm_calls: CallCounter.llm_calls(),
+          final_outcome: :success,
+          elapsed_s: elapsed,
+          original_instruction: ex.instruction,
+          python_code: ex.code,
+          final_instruction: entry.instruction,
+          final_module: entry.elixir_code,
+          final_test: entry.elixir_test,
+          refined: entry.refined
+        })
+
+      {:failed, reason} ->
+        TrajectoryLogger.log_summary(tlog, %{
+          total_attempts: 5,
+          total_refinements: CallCounter.refinements(),
+          total_llm_calls: CallCounter.llm_calls(),
+          final_outcome: :failed,
+          failure_reason: reason,
+          elapsed_s: elapsed,
+          original_instruction: ex.instruction,
+          python_code: ex.code
+        })
+    end
+
     {row, idx, result, elapsed}
   end, max_concurrency: concurrency, timeout: :infinity, ordered: false)
   |> Enum.each(fn {:ok, {row, idx, result, elapsed}} ->
@@ -436,6 +741,7 @@ unless pending == [] do
 
   File.close(out)
   File.close(err)
+  TrajectoryLogger.close(traj_logger)
   Logger.info("All files closed")
 end
 

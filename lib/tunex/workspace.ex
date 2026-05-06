@@ -63,7 +63,7 @@ defmodule Tunex.Workspace do
   defp deps do
         [
           {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-          {:credence, github: "Cinderella-Man/credence", branch: "introduce-fixing", only: [:dev, :test], runtime: false}
+          {:credence, "~> 0.3", only: [:dev, :test], runtime: false}
         ]
   """
 
@@ -135,7 +135,7 @@ defmodule Tunex.Workspace do
         String.replace(
           content,
           ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false}),
-          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, github: "Cinderella-Man/credence", branch: "introduce-fixing", only: [:dev, :test], runtime: false})
+          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, "~> 0.3", only: [:dev, :test], runtime: false})
         )
 
       File.write!(mix_exs, fixed)
