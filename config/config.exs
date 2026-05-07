@@ -1,7 +1,7 @@
 import Config
 
 config :tunex,
-  active_provider: :local_qwen,
+  active_provider: :local_qwen_thinking,
   max_retries: 5,
   max_refine_retries: 5,
   providers: %{
@@ -10,7 +10,7 @@ config :tunex,
       model: "mimo-v2.5-pro",
       stream: false
     },
-    local_qwen: %{
+    local_qwen_non_thinking: %{
       url: "http://localhost:8000/v1/chat/completions",
       model: "Qwen/Qwen3.6-27B",
       temperature: 0.7,
@@ -21,6 +21,16 @@ config :tunex,
       chat_template_kwargs: %{
         enable_thinking: false
       },
+      stream: false
+    },
+    local_qwen_thinking: %{
+      url: "http://localhost:8000/v1/chat/completions",
+      model: "Qwen/Qwen3.6-27B",
+      temperature: 0.7,
+      top_p: 0.8,
+      top_k: 20,
+      presence_penalty: 1.5,
+      max_tokens: 8192,
       stream: false
     }
   },
