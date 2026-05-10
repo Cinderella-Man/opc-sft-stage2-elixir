@@ -37,6 +37,9 @@ length in guards, is_ prefix (use ?), Enum.count/1 (use length/1),
 List.foldl (use Enum.reduce), Enum.map |> Enum.max/min/sum/join,
 catch-all raise clauses, manual max/min with if.
 
+TEST rules: the test module MUST include `use ExUnit.Case, async: false` right
+after the `defmodule`. Every test file needs this — without it ExUnit won't run.
+
 OUTPUT: ---INSTRUCTION--- / ---MODULE--- / ---TEST--- / ---END---
 Nothing else. No markdown fences.
 """

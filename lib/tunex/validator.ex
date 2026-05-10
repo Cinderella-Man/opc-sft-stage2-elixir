@@ -31,6 +31,7 @@ defmodule Tunex.Validator do
 
     clean_workspace(workspace)
     File.write!(mod_path, module_code)
+    test_code = ensure_exunit_case(test_code)
     File.write!(test_path, test_code)
 
     failures = []
@@ -411,6 +412,26 @@ defmodule Tunex.Validator do
   end
 
   # ── Internal ───────────────────────────────────────────────────────
+
+  @doc false
+  defp ensure_exunit_case(test_code) do
+    if String.contains?(test_code, "use ExUnit.Case") do
+      test_code
+    else
+      Logger.warning("[Validator] test code missing `use ExUnit.Case` — injecting")
+
+      # Insert `use ExUnit.Case, async: false` after the first `defmodule ... do` line
+      case Regex.replace(~r/(defmodule\s+\S+\s+do\s*\n)/, test_code, "\\1  use ExUnit.Case, async: false\n", global: false) do
+        ^test_code ->
+          # Regex didn't match (malformed module?) — prepend as last resort
+          Logger.warning("[Validator] could not find defmodule line — prepending use ExUnit.Case")
+          "use ExUnit.Case, async: false\n\n" <> test_code
+
+        fixed ->
+          fixed
+      end
+    end
+  end
 
   defp clean_workspace(workspace) do
     for f <- Path.wildcard(Path.join(workspace, "lib/*.ex")), do: File.rm(f)
