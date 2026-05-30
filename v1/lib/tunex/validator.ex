@@ -39,7 +39,7 @@ defmodule Tunex.Validator do
     # 1. Credence fix (runs on ANY code — even non-compiling)
     Logger.info("[Validator.run] step 1/6: credence fix")
 
-    {_current_mod, _current_test, credence_changed?} =
+    {current_mod, current_test, credence_changed?} =
       case run_credence_fix(workspace) do
         {:fixed, true} ->
           Logger.info("[Validator.run] credence fixed code — propagating renames")

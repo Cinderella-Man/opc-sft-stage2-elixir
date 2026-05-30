@@ -1,40 +1,28 @@
-# The directory Mix will write compiled artifacts to.
+# Build + deps
 /_build/
-
-# If you run "mix test --cover", coverage assets end up here.
 /cover/
-
-# The directory Mix downloads your dependencies sources to.
 /deps/
-
-# Where third-party dependencies like ExDoc output generated docs.
 /doc/
-
-# Ignore .fetch files in case you like to edit your project deps locally.
 /.fetch
-
-# If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
-
-# Also ignore archive artifacts (built via "mix archive.build").
 *.ez
-
-# Ignore package tarball (built via "mix hex.build").
 tunex-*.tar
 
-# Temporary files, for example, from tests.
-/tmp/
+# Run-scoped + cached state (regenerable / large)
+/var/
 
-convert_debug_educational_instruct.log
-educational_instruct_train.parquet
-convert_log_educational_instruct.txt
-elixir_sft_workspace*
-tunex_revalidate_workspace
-retry_workspace
+# Secrets (real values live here; commit secrets.dummy.exs only)
+/config/secrets.exs
 
-convert_debug_educational_instruct.log
+# Datasets
+*.parquet
 
-tunex_workspace*
-tunex_preview_*
-
-config/secrets.exs
+# v1 generated artifacts (v1 is reference-only; keep source, ignore build/output)
+/v1/_build/
+/v1/deps/
+/v1/.elixir_ls/
+/v1/*.parquet
+/v1/tunex_workspace*/
+/v1/output_v1/
+/v1/elixir_sft_*.jsonl
+/v1/config/secrets.exs

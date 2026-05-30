@@ -1,12 +1,20 @@
 defmodule Tunex.Workspace do
   @moduledoc """
-  Manages Mix project workspaces for code validation.
+  A single Mix project workspace for code validation, wired to the local
+  credence clone as a **path dependency**.
 
-  Handles creating Mix projects, injecting deps (credo + credence),
-  writing the credence runner script, and managing a pool of workspaces
-  for parallel workers.
+  v2 runs a single stream (one GPU, one clone), so there is no workspace pool.
+  The workspace compiles + validates against the local checkout at
+  `Tunex.Config.credence_clone()`; the loop calls `recompile_credence/1` after
+  an accepted rule so validation always sees the last-committed ruleset.
   """
 
+  require Logger
+
+  alias Tunex.Config
+
+  # Credence check script (used by Validator step 5). Plain stdout, captured
+  # into the row log.
   @credence_script ~S"""
   code = File.read!("lib/solution.ex")
   result = Credence.analyze(code)
@@ -23,6 +31,10 @@ defmodule Tunex.Workspace do
   end
   """
 
+  # Credence fix script. Emits FIXED / NO_CHANGES, then the full
+  # `applied_rules` list (the before/after fix trace the rule-gen agent reads)
+  # and any remaining unfixable issues. `applied_rules` entries are
+  # `{module, count | :reverted}` with full module names.
   @credence_fix_script ~S"""
   code = File.read!("lib/solution.ex")
   result = Credence.fix(code)
@@ -33,6 +45,8 @@ defmodule Tunex.Workspace do
   else
     IO.puts("NO_CHANGES")
   end
+
+  IO.puts("APPLIED_RULES: #{inspect(result.applied_rules)}")
 
   if result.issues != [] do
     IO.puts("REMAINING_ISSUES: #{length(result.issues)} unfixable issue(s)")
@@ -59,104 +73,94 @@ defmodule Tunex.Workspace do
   }
   """
 
-  @deps_block ~S"""
-  defp deps do
-        [
-          {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-          {:credence, git: "https://github.com/Cinderella-Man/credence.git", branch: "main", only: [:dev, :test], runtime: false}
-        ]
+  @doc "Default single-workspace path (`var/run/workspace`)."
+  def default_path, do: Config.run_path("workspace")
+
+  @doc """
+  Ensure the workspace exists and is wired to the credence path dep. Idempotent.
+  On first creation it runs `deps.get` + `deps.compile` (dev + test).
   """
-
-  # ── Single Workspace ──────────────────────────────────────────────
-
-  def setup(path) do
+  def setup(path \\ default_path()) do
     if File.exists?(Path.join(path, "mix.exs")) do
-      ensure_credence_dep(path)
-      ensure_credence_script(path)
-      ensure_credence_fix_script(path)
+      inject_deps(path)
+      write_credo_config(path)
+      write_scripts(path)
       ensure_deps(path)
     else
-      IO.puts("Creating workspace: #{path}/")
+      Logger.info("[Workspace] creating workspace: #{path}/")
+      # `mix new` prompts (and `System.cmd` has no stdin → hangs) if the target
+      # dir already exists. `mix tunex.reset` pre-creates it, so clear any
+      # non-project dir first.
+      File.rm_rf!(path)
+      File.mkdir_p!(Path.dirname(path))
       {output, code} = System.cmd("mix", ["new", path], stderr_to_stdout: true)
       if code != 0, do: raise("mix new failed: #{output}")
 
       inject_deps(path)
       write_credo_config(path)
-      ensure_credence_script(path)
-      ensure_credence_fix_script(path)
+      write_scripts(path)
       clean_defaults(path)
-      ensure_deps(path)
-      IO.puts("  ✓ Workspace #{path} ready")
+      bootstrap_deps(path)
+      Logger.info("[Workspace] ✓ #{path} ready")
     end
+
+    path
   end
 
-  def update_credence(path) do
-    IO.puts("Updating credence to latest in #{path}...")
-    System.cmd("mix", ["deps.update", "credence"], cd: path, stderr_to_stdout: true)
-    System.cmd("mix", ["deps.compile", "credence", "--force"], cd: path, stderr_to_stdout: true)
-    System.cmd("mix", ["deps.compile", "credence", "--force"], cd: path, stderr_to_stdout: true,
-      env: [{"MIX_ENV", "test"}])
-    IO.puts("  ✓ Credence updated")
+  @doc "Remove generated solution + test files between rows."
+  def clean_workspace(path \\ default_path()) do
+    for f <- Path.wildcard(Path.join(path, "lib/*.ex")), do: File.rm(f)
+    for f <- Path.wildcard(Path.join(path, "test/*_test.exs")), do: File.rm(f)
+    :ok
   end
 
-  # ── Pool Management ───────────────────────────────────────────────
+  @doc """
+  Force-recompile the credence path dep in the workspace (dev + test) so a
+  newly-committed rule takes effect. Called after an accepted rule and at boot.
+  """
+  def recompile_credence(path \\ default_path()) do
+    Logger.info("[Workspace] recompiling credence path dep in #{path}")
 
-  def setup_pool(base_path, count) do
-    Enum.each(0..(count - 1), fn id -> setup(pool_path(base_path, id)) end)
-    Agent.start_link(fn -> Enum.to_list(0..(count - 1)) end, name: :workspace_pool)
+    for env <- ~w(dev test) do
+      System.cmd("mix", ["deps.compile", "credence", "--force"],
+        cd: path,
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", env}]
+      )
+    end
+
+    Logger.info("[Workspace] ✓ credence recompiled")
+    :ok
   end
 
-  def pool_path(base_path, id), do: "#{base_path}_#{id}"
+  # ── Internal ────────────────────────────────────────────────────────
 
-  def checkout do
-    Agent.get_and_update(:workspace_pool, fn
-      [id | rest] -> {id, rest}
-      [] -> {:wait, []}
-    end)
+  defp deps_block do
+    clone = Config.credence_clone()
+
+    ~s"""
+    defp deps do
+        [
+          {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+          {:credence, path: "#{clone}", only: [:dev, :test], runtime: false}
+        ]
+    """
   end
-
-  def checkin(id) do
-    Agent.update(:workspace_pool, fn ids -> [id | ids] end)
-  end
-
-  # ── Internal ───────────────────────────────────────────────────────
 
   defp inject_deps(path) do
     mix_exs = Path.join(path, "mix.exs")
     content = File.read!(mix_exs)
-    fixed = Regex.replace(~r/defp deps do\n\s+\[.*?\]/s, content, @deps_block)
+    fixed = Regex.replace(~r/defp deps do\n\s+\[.*?\]/s, content, deps_block())
     File.write!(mix_exs, fixed)
-  end
-
-  defp ensure_credence_dep(path) do
-    mix_exs = Path.join(path, "mix.exs")
-    content = File.read!(mix_exs)
-
-    unless String.contains?(content, "credence") do
-      fixed =
-        String.replace(
-          content,
-          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false}),
-          ~s({:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n        {:credence, git: "https://github.com/Cinderella-Man/credence.git", branch: "main", only: [:dev, :test], runtime: false})
-        )
-
-      File.write!(mix_exs, fixed)
-    end
   end
 
   defp write_credo_config(path) do
     File.write!(Path.join(path, ".credo.exs"), @credo_config)
   end
 
-  defp ensure_credence_script(path) do
-    script = Path.join(path, "run_credence.exs")
-    unless File.exists?(script), do: File.write!(script, @credence_script)
-  end
-
-  defp ensure_credence_fix_script(path) do
-    script = Path.join(path, "run_credence_fix.exs")
-    # Always overwrite to pick up script changes
-    File.write!(script, @credence_fix_script)
+  defp write_scripts(path) do
+    File.write!(Path.join(path, "run_credence.exs"), @credence_script)
+    File.write!(Path.join(path, "run_credence_fix.exs"), @credence_fix_script)
   end
 
   defp clean_defaults(path) do
@@ -164,14 +168,21 @@ defmodule Tunex.Workspace do
     for f <- Path.wildcard(Path.join(path, "test/*_test.exs")), do: File.rm(f)
   end
 
-  defp ensure_deps(path) do
-    unless File.exists?(Path.join(path, "deps/credence")) do
-      System.cmd("mix", ["deps.get"], cd: path, stderr_to_stdout: true)
-      System.cmd("mix", ["deps.compile"], cd: path, stderr_to_stdout: true)
-      # Also compile deps for test env — the validator runs credence fix
-      # with MIX_ENV=test and --no-compile, so deps must be pre-built
-      System.cmd("mix", ["deps.compile"], cd: path, stderr_to_stdout: true,
-        env: [{"MIX_ENV", "test"}])
+  defp bootstrap_deps(path) do
+    System.cmd("mix", ["deps.get"], cd: path, stderr_to_stdout: true)
+
+    for env <- ~w(dev test) do
+      System.cmd("mix", ["deps.compile"], cd: path, stderr_to_stdout: true, env: [{"MIX_ENV", env}])
+      # Compile the (empty) workspace app once so `workspace.app` exists; the
+      # credence-fix step runs `mix run --no-compile` (to tolerate a broken
+      # solution.ex) and needs the app file present.
+      System.cmd("mix", ["compile"], cd: path, stderr_to_stdout: true, env: [{"MIX_ENV", env}])
     end
+  end
+
+  # Path deps don't populate `deps/`; the built dep lives under `_build`.
+  defp ensure_deps(path) do
+    built? = File.exists?(Path.join(path, "_build/test/lib/credence/ebin"))
+    unless built?, do: bootstrap_deps(path)
   end
 end
