@@ -33,7 +33,11 @@ run). Old code preserved runnable under `v1/`.
    auto-invalidates). Token floor **32k**. **Truncation** (output didn't fit) → retry once with a
    **raised ceiling** (up to Mimo's 131k max), *not* a same-ceiling re-roll; if it still truncates →
    durable **negative-cache blacklist** (`verdict: :blacklist, reason: :untranslatable`, no payload). A
-   truncated/partial translation is **never** cached as usable.
+   truncated/partial translation is **never** cached as usable. **Truncation is fully internal to
+   `Pipeline.Translate`** — it never surfaces `{:truncated, _}` to its caller; it returns either a complete
+   translation or a terminal `:untranslatable` blacklist. The cache record is written **exactly once per
+   row, after round-trip resolves** (#2), carrying the final payload + verdict; `:untranslatable`
+   (couldn't produce a complete translation) **dominates** `:roundtrip_fail`.
 
 2. **Round-trip check (blacklist filter)** = run the Elixir reference against the translated tests via a
    **fix-free runner** (`mix compile --warnings-as-errors` + `mix test` ONLY — **no Credence-fix, no
@@ -77,15 +81,20 @@ run). Old code preserved runnable under `v1/`.
    - **Test strategy:** prompt the agent to **iterate with targeted tests** (`mix test
      test/<phase>/<rule>_test.exs` — fast) and **run the full suite once before finishing** to catch
      collateral breakage; the Gate's full-suite-green is the authoritative backstop regardless.
-   - **Decision signal:** the agent's final message carries a parseable `DECISION:` line
-     (`gave_up: <reason>` vs a rule proposal). This drives ledger-writing + provenance; the **Gate** (not
-     the agent's self-report) decides commit/reject.
+   - **Decision signal:** the agent's final message carries a parseable `DECISION:` line, **one of three
+     verbs**: `no_opportunity` (looked, found nothing worth a rule — the majority), `gave_up: <pattern +
+     minimal snippet>` (saw a real pattern, tried, couldn't land a working rule = a **dead-end**), or a
+     **rule proposal**. This drives routing + ledger-writing + provenance; the **Gate** (not the agent's
+     self-report) decides commit/reject. (See #6/#15 for the full routing table.)
 
 6. **Trust boundary / Gate** = the agent **edits only** (no git creds). **If the working tree is clean
-   after the agent exits (a `gave_up` with no edits), the Gate — and its full-suite `mix test` — is
-   skipped entirely** (nothing to verify). So the expensive full-suite run happens only on rows where a
-   rule was actually proposed (the minority). Otherwise our Elixir **Gate** stages everything
-   (`git add -A`) and enforces a **hard 5-part contract** on `git diff --cached`:
+   after the agent exits, the Gate — and its full-suite `mix test` — is skipped entirely** (nothing to
+   verify); the row is routed by `DECISION` (#15 routing table), not gated. So the expensive full-suite
+   run happens only on rows where a rule was actually proposed (the minority). On a **dirty** tree our
+   Elixir **Gate** stages everything (`git add -A`) and enforces a **hard 5-part contract** on `git diff
+   --cached`. **Check order = cheap-first, fail-fast:** run the instant structural checks **(b) → (c) →
+   (e)** first, then **(d) mutation**, then **(a) full suite** last (don't pay the slow suite on a row that
+   fails scope):
    - **(a)** full Credence `mix test` **green**;
    - **(b)** diff touches **`lib/`** (a rule/infra file changed);
    - **(c)** diff touches **`test/`** (a regression test added/modified);
@@ -96,10 +105,13 @@ run). Old code preserved runnable under `v1/`.
    - **(e) scope check** — the diff touches **only `lib/` and `test/`**; anything else (`mix.exs`,
      `config/`, `.formatter.exs`, `deps/`, README, CI) → reject.
 
-   **Deletions/renames are allowed** (a rename is delete+add; supersession is legitimate consolidation) —
-   the **branch-protected `main` + manual PR review** is the backstop for "was this removal warranted,"
-   not the Gate. All checks pass → `commit → recompile → push` (#11/#14). Any miss →
-   `git checkout -- . && git clean -fd` discard + `gave_up` + append to `decisions.md` + escalate.
+   **Renames and supersession-with-replacement are allowed** — they are encoded as delete+add, so the
+   *add* side touches `lib/` + `test/` and the mutation check runs on the new test; they pass the normal
+   contract. **Standalone pure deletion is rejected:** if **every** `lib/` change in the staged diff is a
+   deletion (no add/modify), the Gate **rejects + escalates** — removing a rule is a human-only decision
+   (the branch-protected `main` + manual PR is where consolidation/removal is judged), never an autonomous
+   single-row action. All checks pass → `commit → recompile → push` (#11/#14). Any miss →
+   `git checkout -- . && git clean -fd` discard + a **Gate-rejection** entry to `decisions.md` + escalate.
    The commit message **tags the decision type and flags removals** (e.g.
    `cred-gen: supersede X [removes rule Y] [row 4127]`) to direct human PR attention.
 
@@ -107,8 +119,8 @@ run). Old code preserved runnable under `v1/`.
    deterministic improvement, however small; volume is fine. Two safety nets make over-firing acceptable:
    - **Generation-time gate:** every add/extend/bugfix ships a **new regression test** (Gate-enforced via
      diff-touches-`test/` + the mutation check). New rules *should* include a "must-NOT-fire on good code"
-     case (good hygiene; not separately gated). Pure deletion/rename needs no new test. Compile-failing
-     fixes self-revert via Credence's `:reverted` gate (harmless).
+     case (good hygiene; not separately gated). Compile-failing fixes self-revert via Credence's
+     `:reverted` gate (harmless). (Standalone pure deletion is not a bot action — see #6.)
    - **Self-correction of over-firing (NEW — supersedes the old "not self-corrected" caveat):** because
      the CredenceRuleGenerator runs **every row** and reads the **full Credence fix trace** (before/after +
      `applied_rules`), a rule that wrongly rewrites correct code surfaces at the **first occurrence** it
@@ -122,23 +134,28 @@ run). Old code preserved runnable under `v1/`.
 8. **Dedup (no issue-id machinery).** Two mechanisms, no exact keys:
    - **Emergent:** once a rule is committed + Credence recompiled, it auto-fixes that pattern → the
      pattern vanishes from all future output → the agent never sees it → never re-proposes it.
-   - **`var/run/decisions.md` ledger** for *dead-ends* (patterns the agent couldn't turn into a rule, or
-     the Gate rejected): **written by the orchestrator** (not the agent — keeps the agent sandboxed to the
-     clone), **inlined into every CredenceRuleGenerator prompt** so the agent won't retry them. **The agent composes the
-     entry** when it gives up (its `DECISION: gave_up` block carries a one-line pattern description + a
-     minimal offending snippet); the orchestrator appends it verbatim. **On a Gate rejection** (the agent
-     thought it succeeded), the orchestrator instead composes a terse entry from the Gate failure reason +
-     the attempted rule. **Append-always** (no auto-dedup — the agent reading the ledger is what prevents
-     re-proposing; redundancy is cheap). **Run-scoped** (in `var/run/`, wiped by `mix tunex.reset`) — a
-     dead-end on a small Qwen may be solvable after a model swap, so a fresh run re-attempts.
+   - **`var/run/decisions.md` ledger** for *dead-ends only* — patterns the agent saw but couldn't turn
+     into a working rule (`DECISION: gave_up`), Gate rejections, and phantoms. **It is NOT written for
+     `no_opportunity` rows** (the majority), so it stays **small** — a few entries per thousand rows —
+     and the **whole ledger is inlined into every CredenceRuleGenerator prompt** (no bounded window
+     needed) so the agent won't retry them. **Written by the orchestrator** (not the agent — keeps the
+     agent sandboxed to the clone): on `gave_up` the agent's block carries a one-line pattern + minimal
+     snippet, appended verbatim; on a **Gate rejection** the orchestrator composes a terse entry from the
+     failure reason + attempted rule; on a **phantom** (claimed success, clean tree) it notes "agent
+     reported success but produced no diff." **Append-always** (no auto-dedup — the agent reading the
+     ledger is what prevents re-proposing; redundancy is cheap and the file is small). **Run-scoped** (in
+     `var/run/`, wiped by `mix tunex.reset`) — a dead-end on a small Qwen may be solvable after a model
+     swap, so a fresh run re-attempts.
    - **DROPPED entirely:** `Tunex.Issues`, the issue-id scheme (`credence:`/`credo:`/`compile:`/
      `test:generic`), the compile-error regex bank, the `gave_up` set, `test:generic` collapse. The agent
      reads any failures straight from the raw log; nothing else consumes structured issue-ids.
 
 9. **Single forward pass — NO infinite loop, NO re-passes, NO convergence/wipe.** Walks the ~118k-row
-   dataset once in a **seeded-shuffle order** (deterministic permutation of `0..n-1` from a fixed seed
-   persisted in `var/run/`; a representative *sample*, not parquet's topic-clustered order, maximizing
-   failure-mode diversity; resume reproducible). 118k × minutes ≈ years ⇒ never finishes; run for days,
+   dataset once in a **seeded-shuffle order** (deterministic permutation of `0..n-1` from a seed **generated
+   via `:rand` at first boot and persisted to `var/run/seed`**; a representative *sample*, not parquet's
+   topic-clustered order, maximizing failure-mode diversity. Within a run, resume re-derives the same
+   permutation; `mix tunex.reset` wipes the seed → the next run gets a **new** seed = a fresh sample
+   order). 118k × minutes ≈ years ⇒ never finishes; run for days,
    then stop. Everything just **persists for the run** — translation cache, blacklist, `decisions.md`,
    `escalated/`, `committed/`, append-only SFT output, committed rules. `Progress` gives crash-resume.
    **Re-init is MANUAL:** `mix tunex.reset` (wipes `var/run/`, keeps `var/cache/`), then rerun. Rules are
@@ -200,7 +217,16 @@ run). Old code preserved runnable under `v1/`.
     subprocess stdout. **Per-row lifecycle:** on completion **delete the log** — UNLESS the agent
     **gave up** → **move** to **`escalated/<index>.log`** (manual queue), OR the row **committed a rule** →
     **move** to **`committed/<index>.log`** (rule provenance; pair it with the agent's JSON transcript).
-    Invariant: the only logs surviving on disk are `escalated/` and `committed/`.
+    **Routing table** (by CredenceRuleGenerator outcome — a real attempt is what earns a surviving log):
+    | Outcome | Tree | `decisions.md` | Log destination |
+    |---|---|---|---|
+    | ordinary convert (rule-gen not reached) / `no_opportunity` | clean | — | **delete** |
+    | `gave_up` (dead-end: saw a pattern, couldn't land it) | clean | append | **`escalated/`** |
+    | phantom (claimed success, clean tree) | clean | append (note) | **`escalated/`** |
+    | rule proposed → Gate **reject** | dirty | append | **`escalated/`** |
+    | rule proposed → Gate **pass** | dirty | — | **`committed/`** (+ CC JSON transcript) |
+    Invariant: surviving logs are exactly `escalated/` (attempted, not committed) + `committed/` (landed);
+    everything else is deleted.
 
 16. **Storage layout = keep-vs-wipe split:**
     - **`var/cache/`** — survives re-init. `translations.jsonl` = Mimo's instruction+tests+reference
@@ -268,10 +294,11 @@ Pipeline:
                              on validation failure (no separate Refine stage — dropped)
 Evolve:
   Tunex.Evolve.CredenceRuleGenerator        builds the prompt (raw row log + decisions.md + task), invokes ClaudeCode in
-                             the clone (≤30 turns, sandboxed), parses DECISION; on gave_up → ledger +
-                             escalate. (Drives the Claude Code agent.)
-  Tunex.Evolve.Gate          git add -A → 5-part contract (full mix test green + diff touches lib/ + diff
-                             touches test/ + mutation check + scope check); else discard
+                             the clone (≤30 turns, sandboxed), parses the 3-way DECISION; routes
+                             no_opportunity→delete / gave_up→ledger+escalate / dirty→Gate. (Drives the agent.)
+  Tunex.Evolve.Gate          dirty tree only: git add -A → 5-part contract cheap-first (touches lib/ +
+                             touches test/ + scope + mutation + full mix test green); pure-deletion →
+                             reject; else discard
   Tunex.Evolve.Git           commit (tagged msg) → recompile → push origin evolution (non-fatal push)
 Tunex.Budget                 accumulate Mimo usage×price (Translate + CC JSON); runaway ceiling; fatal/
                              transient classification; graceful System.halt
@@ -296,10 +323,13 @@ Anthropic pool / Claude-the-model escalation; prompt-cache-prefix injection of t
 6. **CredenceRuleGenerator** (decoupled learning track — does NOT change this row's emitted result): on **every** row,
    `Tunex.Evolve.CredenceRuleGenerator` invokes the Claude Code agent (Mimo, ≤30 turns, sandboxed, `cwd`=clone) with the
    raw row log + `decisions.md` + the open-ended task. Agent reads/greps rule files itself, edits, runs
-   `mix test`, emits `DECISION:`. If the tree is clean (no edits) the Gate is skipped. Else **Gate** runs
-   the 5-part contract; pass → **Git** `commit → recompile →
-   push origin evolution` (non-fatal push) + move log to `committed/`; fail/gave_up → discard, append a
-   dead-end entry to `decisions.md`, move log to `escalated/`.
+   `mix test`, emits a three-way `DECISION:`. Route by tree state + `DECISION` (#15 table):
+   - **clean tree + `no_opportunity`** → delete log (no ledger);
+   - **clean tree + `gave_up`** (dead-end) → append dead-end to `decisions.md` → `escalated/`;
+   - **clean tree + rule proposal** (phantom) → append note → `escalated/`;
+   - **dirty tree** → **Gate** (cheap checks → mutation → full suite): pass → **Git** `commit → recompile
+     → push origin evolution` (non-fatal push) + `committed/`; reject → `git checkout -- . && git clean
+     -fd` discard + append to `decisions.md` + `escalated/`.
 7. Append the SFT success/error record (synced) **based on step 5** (independent of step 6); a
    hard-errored row emits an error record and is **done — not retried on resume**. Delete the row log
    unless step 6 moved it. `Progress.mark_done` (**LAST**, after the synced append); next row. Runs
@@ -318,11 +348,15 @@ own `mix test` in the same clone; the Gate's mutation check and `Git.recompile` 
   `lib/tunex/evolve/{credence_rule_generator,gate,git}.ex`, `docs/plan.md`, `var/run/{escalated,committed}/`.
   Add `:xiaomi_mimo_2_5_pro` provider + `stages` map + CC env/paths to `config/config.exs`; Mimo key +
   CC auth token in `secrets.exs`; `mod:` in `mix.exs`.
-- **Modify:** `workspace.ex` (path dep, drop pool, `recompile_credence`), `validator.ex` (Credence
-  before/after trace capture), `llm.ex` (per-stage provider + T1.4 fixes). Move the Solve prompt into
-  `Pipeline.Solve` (rewritten Python-free).
-- **Copy & adapt:** `parser.ex`, `dataset.ex`, `progress.ex`, `jsonl.ex`, `report.ex`, `naming` helpers.
-- **Snapshot to `v1/`:** whole current project.
+- **Modify:** `workspace.ex` (path dep, drop pool, `recompile_credence`), `validator.ex` (confirm the
+  credence before/after + `applied_rules` trace is `Logger`ed — largely already present in v1), `llm.ex`
+  (per-stage provider + T1.4 three-way mapping/error fixes). Move the Solve prompt into `Pipeline.Solve`
+  (rewritten Python-free).
+- **Copy & adapt:** `parser.ex` (gains `parse_translate/1` + absorbs `NamingFixup.fix_is_prefix` — both
+  *extracted from* `scripts/convert.exs`, which is **not** a lib module), `dataset.ex`, `progress.ex`,
+  `jsonl.ex`, `report.ex`. `ConvertLoop.attempt` (also script-local) is the **structural template** for
+  `Pipeline.Solve`, not a copied module; `TimedLLM`/`CallCounter` are dropped (Logger + Budget replace).
+- **Snapshot to `v1/`:** whole current project (v1 is never edited afterward — pure reference).
 
 ## Implementation tasks
 
@@ -333,9 +367,10 @@ preserved. Reshape into the most obvious v2 form; don't contort v2 to match a v1
 runnable under `v1/` only as reference.
 
 ### M0 — Snapshot to `v1/` + new app skeleton
-- **T0.1** Move the entire current project into `v1/` (`mix.exs, mix.lock, lib/, scripts/, config/,
-  .formatter.exs, test/, *.jsonl, *.parquet, tunex_workspace_0/, README.md, output_v1/`). Leave at root
-  only `.git/` + `plan.md`. Verify `cd v1 && mix run scripts/convert.exs educational_instruct --start 0`.
+- **T0.1** Move **everything except `.git/` and `plan.md`** into `v1/` (i.e. `mix.exs, mix.lock, lib/,
+  scripts/, config/, .formatter.exs, test/, docs/, *.jsonl, *.parquet, tunex_workspace_0/, README.md,
+  output_v1/, _build/, deps/`). Root afterward = `.git/` + `plan.md` only. **Done-when:** `cd v1 && mix
+  run scripts/convert.exs educational_instruct --start 0` runs the old path unchanged.
 - **T0.2** `plan.md` → `docs/plan.md`.
 - **T0.3** New root `mix.exs`: `app: :tunex`, `mod: {Tunex.Application, []}`, deps `{:req,"~> 0.5"},
   {:explorer,"~> 0.10"},{:jason,"~> 1.4"}` (**no `:logger_file_backend`** — RowLog uses OTP's native
@@ -351,23 +386,33 @@ runnable under `v1/` only as reference.
 - **T1.1** `config.exs`: **rename `:xiaomi` → `:xiaomi_mimo_2_5_pro`** (`model: "mimo-v2.5-pro"`), update
   `secrets.exs` to match, **add a floor `max_tokens`/`max_completion_tokens`** (currently none → Mimo
   truncates). Keep `max_retries: 5` (Refine dropped → no `max_refine_retries`). Add
-  `subset: "educational_instruct"` + a
-  persisted **shuffle seed**. Add `stages %{translate: :xiaomi_mimo_2_5_pro, solve: :local_qwen_thinking}`
-  (the rule-gen stage is hardcoded). Add **CC config**: `claude_code %{base_url, auth_token (secrets), model:
+  `subset: "educational_instruct"`. Add **token floors per chat stage**: translate **32k**, solve **8k**
+  (both in provider/`stages` config so the GPU-less remote-dev path can override). Add `stages
+  %{translate: :xiaomi_mimo_2_5_pro, solve: :local_qwen_thinking}` (the rule-gen stage is hardcoded). Add
+  **CC config**: `claude_code %{base_url, auth_token (secrets), model:
   "mimo-v2.5-pro[1m]", max_turns: 30}`, `credence_clone` path, and the `var/cache/` vs `var/run/` paths.
   Add **Budget config**: per-token price + runaway ceiling.
 - **T1.2** `Tunex.Config`: `provider_for(stage)` = `TUNEX_<STAGE>_PROVIDER` env → `stages[stage]` (chat
   stages only); CC + path helpers.
 - **T1.3** `config/secrets.exs` (gitignored): Mimo chat `Authorization` header + CC `ANTHROPIC_AUTH_TOKEN`.
   *(No git creds — SSH key lives in the clone's remote.)*
-- **T1.4** **Fix `LLM.call`** (Translate/Solve only): (1) merge per-call `opts` overrides
-  (`max_tokens`/`temperature`) into `body_params`; (2) return **classified errors** `{:error, {:http,
-  status, body}}` / `{:error, {:network, reason}}`; (3) read `usage`; (4) **reorder `handle_response`** so
-  `finish_reason == "length"` returns `{:truncated, content}` **even when content is non-empty**. Then
-  `LLM.for_stage(stage, …)` injects `active_provider` + the stage's token floor. **Translate:**
-  `{:truncated, _}` = hard error — retry once with a **raised ceiling** (up to 131k), never cache a
-  partial; still truncated → negative-cache blacklist (`reason: :untranslatable`). **Solve:**
-  `{:truncated, _}` = normal failed attempt → retry.
+- **T1.4** **Fix `LLM.call`** (Translate/Solve only):
+  1. merge per-call `opts` overrides (`max_tokens`/`temperature`) into `body_params`;
+  2. return **classified errors** `{:error, {:http, status, body}}` / `{:error, {:network, reason}}`
+     (replaces the flattened `"HTTP <status>"`);
+  3. read + return `usage`;
+  4. **rewrite `handle_response` to the three-way mapping** (fixes the bug where `content != ""` wins
+     before the length check, silently accepting truncated output): `finish_reason == "length"` →
+     `{:truncated, content}` (any content, incl. `""`); else `content != ""` → `{:ok, content}`; else →
+     `{:empty, finish_reason}`.
+  Then `LLM.for_stage(stage, …)` injects `active_provider` + the stage's token floor (translate 32k, solve
+  8k). **Per-stage truncation handling differs (document the asymmetry):**
+  - **Translate** owns its truncation entirely (see #1) — retry once with a **raised ceiling** (≤131k),
+    never cache a partial; still truncated → `:untranslatable` blacklist. `Pipeline.Translate` never
+    surfaces `{:truncated, _}` upward.
+  - **Solve**: `{:truncated, _}` = a normal failed attempt → **same-ceiling re-roll** (NOT a raised
+    ceiling — a stuck solve is wandering, not a too-small budget) → burns `max_retries` → error record.
+  - `{:empty, _}` = hard error both stages (Solve retries; Translate treats as failed translation).
 
 ### M2 — Workspace: single + path dep + richer scripts  *(dep: M0)*
 - **T2.1** `workspace.ex`: delete pool fns; **single workspace at `var/run/workspace/`**, `clean_workspace`
@@ -385,15 +430,25 @@ runnable under `v1/` only as reference.
   `blacklisted?/1` = `verdict == :blacklist`. A blacklist may be a payload-less negative-cache entry
   (truncation). Survives `mix tunex.reset`.
 - **T3.2** `Pipeline.Translate` (Mimo, **token floor 32k**): instruction + tests + **reference**; canonical
-  names injected; markers `---INSTRUCTION---/---TEST---/---REFERENCE---/---END---` →
-  `Parser.parse_translate/1`. **Never cache a truncated/`:empty` response;** cache only complete parses.
-  On `{:truncated,_}` retry once with a raised ceiling, then negative-cache blacklist (`:untranslatable`).
+  names injected; markers `---INSTRUCTION---/---TEST---/---REFERENCE---/---END---` → **new**
+  `Parser.parse_translate/1` (added to the copied Parser — v1's `parse_full` uses `---MODULE---` for the
+  old tangled solution; the v2 reference is validation-only, hence its own `---REFERENCE---` marker).
+  Handles `{:truncated,_}` **internally** (retry once with a raised ceiling ≤131k, then `:untranslatable`
+  blacklist) so callers only ever see a complete translation or a terminal blacklist. **Never cache a
+  truncated/`:empty` response;** the verdict + payload are written by `RoundTrip` (T3.3) in a single
+  `Cache.put` after round-trip resolves — not here.
 - **T3.3** `Pipeline.RoundTrip`: reference vs tests via a **fix-free runner** (write reference+tests,
-  `mix compile --warnings-as-errors` + `mix test` ONLY). Fail → re-translate once (bypass cache) → else
-  `Cache` writes `verdict: :blacklist, reason: :roundtrip_fail` + skip. Cache the verdict with the
-  translation (run once, not per pass).
-- **T3.4** `Pipeline.Solve` (Qwen, **Python-blind**): reuse the loop skeleton of `ConvertLoop.attempt` +
-  `NamingFixup.fix_is_prefix`, `Validator.run/3`, `Parser.parse_module_test`. **Rewrite ALL prompts
+  `mix compile --warnings-as-errors` + `mix test` ONLY — no credence/credo/format). Pass → `Cache.put`
+  `verdict: :ok` + the payload, proceed to Solve. Fail → **re-translate once** (calls Translate again,
+  *not reading* the cache; that re-translation gets its own internal truncation handling); still fail →
+  `Cache.put` `verdict: :blacklist, reason: :roundtrip_fail` + skip. **`Cache.put` is called exactly once
+  per row, here**, with the final `(payload, verdict, reason)` — so no stale `:ok` is ever persisted. If
+  the re-translation truncates terminally, the verdict is `:untranslatable` (dominates `:roundtrip_fail`,
+  per #1).
+- **T3.4** `Pipeline.Solve` (Qwen, **Python-blind**): structure it on the `ConvertLoop.attempt` retry
+  skeleton (extracted from `scripts/convert.exs:169`, not a lib module), using the copied
+  `Parser.fix_is_prefix/3` (folded in from `NamingFixup`, `convert.exs:99`), `Validator.run/3`, and
+  `Parser.parse_module_test`. **Rewrite ALL prompts
   Python-free** (v1 prompts at convert.exs:13–45,261–281,677–684 are saturated with Python — MUST NOT be
   reused). New system = "write idiomatic Elixir satisfying this Elixir spec + tests" (no Python mention);
   new user = Elixir instruction + tests + canonical fn name ONLY; new retry = previous Elixir attempt +
@@ -402,8 +457,11 @@ runnable under `v1/` only as reference.
 - **T3.5** `Tunex.RowLog` — thin manager of a native `:logger` file handler (`:logger_std_h`):
   `open(index)` → swap path to `var/run/logs/<index>.log`; `path/0` (CredenceRuleGenerator reads after a forced
   filesync); `close/0` deletes; `escalate(index)` moves to `escalated/`; `commit(index)` moves to
-  `committed/`. Handler added in `Tunex.Application`. `Validator` also returns the credence-fix **trace**
-  (before/after/`applied_rules`) → logged for the CredenceRuleGenerator.
+  `committed/`. Handler added in `Tunex.Application`. The credence-fix **trace**
+  (before/after/`applied_rules`) reaches the agent **via Logger → the row-log** — v1's `Validator` already
+  `Logger.debug`s before/after, so no new Validator return contract is needed for the agent; any explicit
+  trace return is only for the SFT/Budget record. **Done-when:** after a row, `var/run/logs/<index>.log`
+  contains the solve output + the full credence before/after + the `applied_rules` line.
 
 ### M4 — Evolve: CredenceRuleGenerator (Claude Code) → gate → git  *(dep: M2,M3)*
 - **T4.1** `Tunex.ClaudeCode`: build argv (`claude -p <prompt> --output-format json --add-dir <clone>
@@ -411,14 +469,20 @@ runnable under `v1/` only as reference.
   30`) + env (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`; **no git creds**), run via
   `System.cmd` (cwd=clone), parse JSON → `{result_text, usage, num_turns}`; feed usage to Budget; extract
   the `DECISION:` line; max-turns-without-finish → `gave_up`.
-- **T4.2** `Tunex.Evolve.CredenceRuleGenerator`: build the prompt = raw row log (`RowLog.path` contents) + current
-  `decisions.md` + open-ended task; call `ClaudeCode`; route on `DECISION`. On `gave_up` → append a
-  dead-end entry (pattern + snippet) to `decisions.md` → `Gate`/escalate.
-- **T4.3** `Tunex.Evolve.Gate`: `git add -A` → **5-part contract** (#6): full `mix test` green + diff
-  touches `lib/` + diff touches `test/` + **mutation check** (snapshot touched `lib/`, restore to HEAD —
-  `checkout HEAD` tracked, `rm` new — run changed *added/modified* test files, assert non-zero exit incl.
-  compile error, restore) + **scope check** (only `lib/` + `test/`). Any miss → `git checkout -- . &&
-  git clean -fd` + append to `decisions.md`.
+- **T4.2** `Tunex.Evolve.CredenceRuleGenerator`: build the prompt = raw row log (`RowLog.path` contents,
+  after a forced filesync) + the **full** `decisions.md` + the open-ended task; call `ClaudeCode`; **route
+  on tree state + the three-way `DECISION`** (#15 table): clean+`no_opportunity` → delete log; clean+
+  `gave_up` → append dead-end (agent's pattern+snippet) to `decisions.md` → escalate; clean+rule-proposal
+  (phantom) → append note → escalate; dirty → hand to `Gate`. The orchestrator (not the agent) writes
+  every `decisions.md` entry.
+- **T4.3** `Tunex.Evolve.Gate` (dirty tree only): `git add -A` → **single-path 5-part contract** (#6),
+  run **cheap-first/fail-fast**: **(b)** diff touches `lib/` → **(c)** diff touches `test/` → **(e)** scope
+  = only `lib/`+`test/` → **(d)** mutation (snapshot touched `lib/`; restore to HEAD — `checkout HEAD`
+  tracked, `rm` new untracked; run the *added/modified* test files; assert non-zero exit incl. a
+  compile-error-on-revert = RED; restore) → **(a)** full `mix test` green (last, it's the slow one).
+  **Pure-deletion guard:** if every staged `lib/` change is a deletion (no add/modify) → reject (rule
+  removal is human-only; renames/supersession are delete+add and pass normally). Any miss → `git checkout
+  -- . && git clean -fd` + orchestrator appends a Gate-rejection entry to `decisions.md` → escalate.
 - **T4.4** `Tunex.Evolve.Git`: **`commit → recompile → push`**. `git -C clone add -A && commit -m
   "cred-gen: <decision> <rule> [removes …] [row <idx>]"` → `recompile_credence` (auto-dedups) →
   `git push origin evolution` **non-fatal** (warn + continue on failure; boot catch-up reconciles). On
@@ -430,11 +494,17 @@ runnable under `v1/` only as reference.
   (`5xx`/network) → bounded retry+backoff → halt if it won't clear; always **log raw body**. **Runaway $
   ceiling** sized for a CC CredenceRuleGenerator session every row; fallback to session-count if `usage` absent. **"Halt"
   = graceful `Tunex.shutdown(reason)`** → flush/sync/close handles → `System.halt(1)`.
-- **T5.2** `Tunex.Orchestrator` GenServer — **single seeded-shuffle pass**: boot **preflight** (fail fast
-  w/ guidance, incl. CC smoke test) + reconciliation (#14);
-  per-row flow over the permutation (translate→roundtrip→solve→validate→rule-gen→gate→git→append SFT (synced)
-  →`RowLog.commit/escalate/close`→`Progress.mark_done` **LAST**); advance until killed/exhausted, then
-  exit. **Per-row `try/rescue`** (#13).
+- **T5.2** `Tunex.Orchestrator` GenServer — **single seeded-shuffle pass**:
+  - **Boot:** **preflight** (fail fast w/ guidance, incl. CC smoke test, #14) → **reconciliation** (#14) →
+    load-or-generate the shuffle seed (`var/run/seed`; `:rand` on first boot) → derive the permutation →
+    resume from `Progress`.
+  - **Per row** over the permutation: skip + `mark_done` if cache-blacklisted; else
+    translate → roundtrip → solve → validate → rule-gen → **route** (delete / `escalate` / Gate→`commit`,
+    per #15) → append the SFT success/error record (synced, based on **validate**, independent of
+    rule-gen) → `RowLog` delete/escalate/commit → `Progress.mark_done` **LAST**.
+  - Advance until killed or the permutation is exhausted, then exit cleanly. **Per-row `try/rescue`** (#13):
+    a throwing row → log + `git checkout -- . && git clean -fd` the clone + skip + `mark_done`, never crash
+    the loop.
 - **T5.3** `Tunex.Application`: supervision tree (Orchestrator child; `:transient`/`:permanent` so an
   unexpected crash restarts → reconciliation, but `System.halt` ends cleanly); add the row-file `:logger`
   handler; `mix run --no-halt`.
@@ -453,19 +523,23 @@ runnable under `v1/` only as reference.
 7. **CredenceRuleGenerator create/extend/bugfix:** novel idiom → new rule + regression test; hallucinated fn → added to
    an existing conversion-list rule; over-firing rule → bugfixed + a test locking the case.
 8. **Gate:** rejects (a) no new regression test, (b) a test that stays green when the rule is
-   stashed (mutation), (c) a diff touching files outside `lib/`+`test/` (scope), and allows a
-   rename/supersession (delete+add). Pass → `commit → recompile → push origin evolution` (non-fatal push).
+   stashed (mutation), (c) a diff touching files outside `lib/`+`test/` (scope), and (d) a **standalone
+   pure deletion** (all `lib/` changes are deletions) → escalated; **allows** a rename/supersession
+   (delete+add) since the add side satisfies the contract. Pass → `commit → recompile → push origin
+   evolution` (non-fatal push). Confirm cheap checks run before the full suite (fail-fast).
 9. **Dedup:** a committed rule's pattern stops recurring in later rows' output (emergent); a dead-end
    logged to `decisions.md` is not re-attempted (it's inlined into the next prompt).
-10. **CredenceRuleGenerator gave_up / max-turns:** force it → log moved to `escalated/`, working tree clean, dead-end
-    appended to `decisions.md`.
+10. **CredenceRuleGenerator outcomes:** `no_opportunity` → log **deleted**, no ledger entry; `gave_up`
+    (dead-end) or max-turns-hit → log **`escalated/`** + dead-end appended to `decisions.md`, tree clean;
+    phantom (claimed success, clean tree) → `escalated/` + ledger note.
 11. **Git safety:** bot push to `main` rejected (branch protection); push to `evolution` succeeds.
 12. **Mimo exhaustion / runaway:** graceful `shutdown` halts cleanly (handles flushed/synced, no torn
     lines); ceiling trips on absurd spend; CC `total_cost_usd` ignored, Mimo `usage` accumulated.
 13. **Single pass + resume:** kill mid-run → restart → `Progress` skips done rows, blacklist (cache) +
     `decisions.md` reload, run continues forward; dataset exhaustion/kill → clean exit.
-14. **Log lifecycle:** a pure convert success leaves **no** log; a gave-up row's log sits in `escalated/`;
-    a rule-committing row's log + CC transcript sit in `committed/`.
+14. **Log lifecycle (invariant):** a pure convert success **and** a `no_opportunity` row leave **no** log;
+    a dead-end / phantom / Gate-rejected row's log sits in `escalated/`; a rule-committing row's log + CC
+    transcript sit in `committed/`. Nothing else survives on disk.
 15. **Boot recovery:** kill mid-rule-generation (dirty tree) **+ un-pushed commits** → restart → `reset --hard
     HEAD` discards WIP but **keeps** un-pushed commits, best-effort push catch-up, credence recompiled.
 16. `cd /home/car/projects/credence && mix test` green before/after.
