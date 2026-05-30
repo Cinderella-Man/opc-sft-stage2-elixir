@@ -68,10 +68,19 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
      a must-NOT-fire-on-good-code case), run `mix test test/<phase>/<rule>_test.exs`
      until green, then run the full `mix test` ONCE. You cannot run git.
 
+     CHECK-ONLY rules are first-class — use them when a clean auto-fix is too
+     complex (e.g. the fix needs many coordinated edits or an algorithm rewrite).
+     Implement `check/2` to FLAG the anti-pattern (return an Issue) and
+     `fix_patches/2` returning `[]` (no auto-fix). Credence still reports the
+     issue, the rule is fully Gate-passable, and "the auto-fix is too hard" is
+     therefore NOT a reason to give up — write the detector. Scope the check
+     PRECISELY (e.g. `List.replace_at`/`Enum.at` on an `Enum.reduce` accumulator,
+     not all `List.replace_at`) and include a must-NOT-fire-on-good-code test.
+
   4. Reserve `no_opportunity` for code that is genuinely ALREADY idiomatic. If you
-     SEE a real idiomatic/deterministic gap but cannot land a clean,
-     behavior-preserving rule for it, answer `gave_up: <pattern + snippet>` — it
-     is escalated for a human to review (valuable, not a failure). Don't keep
+     SEE a real idiomatic/deterministic gap but cannot even write a precise
+     CHECK-ONLY detector for it, answer `gave_up: <pattern + snippet>` — it is
+     escalated for a human to review (valuable, not a failure). Don't keep
      reading files just to be sure.
 
   End your FINAL message with EXACTLY ONE of these lines:
