@@ -9,6 +9,11 @@ config :tunex,
       headers: %{
         Authorization: "Bearer tp-xxxxxxxxxxxxxxxxxx"
       }
+    },
+    xiaomi_mimo_2_5: %{
+      headers: %{
+        Authorization: "Bearer tp-xxxxxxxxxxxxxxxxxx"
+      }
     }
   },
   # Claude Code → Mimo Anthropic-compatible endpoint (ANTHROPIC_AUTH_TOKEN).

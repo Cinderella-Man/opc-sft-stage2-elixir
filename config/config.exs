@@ -22,6 +22,17 @@ config :tunex,
       max_completion_tokens: 32_768,
       stream: false
     },
+    # Non-pro V2.5 (310B MoE, 15B active) — the SOLVE model. Weaker than the pro,
+    # so its less-idiomatic output is the rule-discovery feedstock; translate +
+    # rule-gen stay on the stronger pro. (Replaces the deprecated mimo-v2-pro,
+    # which auto-routes to V2.5 on 2026-06-01 and is removed by 2026-06-30.)
+    xiaomi_mimo_2_5: %{
+      url: "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions",
+      model: "mimo-v2.5",
+      token_param: :max_completion_tokens,
+      max_completion_tokens: 16_384,
+      stream: false
+    },
     local_qwen_non_thinking: %{
       url: "http://localhost:8000/v1/chat/completions",
       model: "Qwen/Qwen3.6-27B",
@@ -49,19 +60,20 @@ config :tunex,
 
   # ── Stage → provider (the rule-gen stage is hardcoded, not here) ────
   # Overridable per-stage via TUNEX_TRANSLATE_PROVIDER / TUNEX_SOLVE_PROVIDER
-  # (the GPU-less remote-dev path sets TUNEX_SOLVE_PROVIDER=xiaomi_mimo_2_5_pro).
+  # (e.g. set solve to :local_qwen_thinking once a GPU is available).
   stages: %{
     translate: :xiaomi_mimo_2_5_pro,
-    solve: :local_qwen_thinking
+    solve: :xiaomi_mimo_2_5
   },
 
   # ── Per-stage output-token floors ───────────────────────────────────
-  # Translate needs room for instruction + tests + reference (32k floor);
-  # Solve emits a single module+tests (8k floor). On Translate truncation the
-  # ceiling is raised up to `translate_ceiling` (≤ Mimo's 131k max).
+  # Translate needs room for instruction + tests + reference (32k floor). Solve
+  # emits one module+tests, but V2.5 is a REASONING model (reasoning tokens count
+  # against the cap), so 16k avoids truncation re-rolls on harder problems. On
+  # Translate truncation the ceiling is raised up to `translate_ceiling`.
   stage_max_tokens: %{
     translate: 32_768,
-    solve: 8_192
+    solve: 16_384
   },
   translate_ceiling: 131_072,
 
