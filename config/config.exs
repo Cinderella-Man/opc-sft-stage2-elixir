@@ -96,6 +96,16 @@ config :tunex,
   # ── Credence clone (path dep target + push origin) ──────────────────
   credence_clone: "/home/car/projects/credence",
 
+  # Commit identity the app sets on the clone (Preflight). MUST use a GitHub
+  # *noreply* email — a real email triggers GH007 "push would publish a private
+  # email address" when the account has email-privacy protection, which silently
+  # fails the (non-fatal) push and strands commits locally. Find yours at
+  # GitHub → Settings → Emails (format: <id>+<login>@users.noreply.github.com).
+  git_identity: %{
+    name: "Kamil Skowron",
+    email: "1019893+Cinderella-Man@users.noreply.github.com"
+  },
+
   # ── Storage layout (keep-vs-wipe split, see plan #16) ───────────────
   cache_dir: "var/cache",
   run_dir: "var/run",

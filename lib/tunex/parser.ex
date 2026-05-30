@@ -71,6 +71,13 @@ defmodule Tunex.Parser do
   def parse_module_test(content) do
     content = strip_outer_fences(content)
 
+    case split_markers(content) do
+      {:ok, module_code, test_code} -> {:ok, module_code, test_code}
+      :error -> split_bare_modules(content)
+    end
+  end
+
+  defp split_markers(content) do
     with [_, rest] <- String.split(content, "---MODULE---", parts: 2),
          [module_code, rest] <- String.split(rest, "---TEST---", parts: 2) do
       test_code = rest |> String.split("---END---", parts: 2) |> List.first() |> strip_fences()
@@ -83,6 +90,27 @@ defmodule Tunex.Parser do
       end
     else
       _ -> :error
+    end
+  end
+
+  # Fallback: the model dropped the markers and emitted two bare modules (common
+  # on retries). Split at the test module — `defmodule …Test do`, which is also
+  # the block carrying `use ExUnit.Case`. Everything before it is the solution.
+  defp split_bare_modules(content) do
+    case Regex.split(~r/\n(?=defmodule\s+[\w.]*Test\b)/, content, parts: 2) do
+      [module_code, test_code] ->
+        module_code = String.trim(module_code)
+        test_code = String.trim(test_code)
+
+        if String.contains?(module_code, "defmodule") and
+             String.contains?(test_code, "use ExUnit.Case") do
+          {:ok, module_code, test_code}
+        else
+          :error
+        end
+
+      _ ->
+        :error
     end
   end
 

@@ -85,6 +85,7 @@ defmodule Tunex.Preflight do
 
     git(clone, ["reset", "--hard", "HEAD"])
     git(clone, ["clean", "-fd"])
+    set_git_identity(clone)
 
     local = rev(clone, "HEAD")
     origin = rev(clone, "origin/#{@branch}")
@@ -160,6 +161,15 @@ defmodule Tunex.Preflight do
   end
 
   # ── Helpers ─────────────────────────────────────────────────────────
+
+  # Set the clone's commit identity from config (noreply email — see config.exs)
+  # so the bot's commits push cleanly even after a fresh re-clone.
+  defp set_git_identity(clone) do
+    identity = Config.git_identity()
+    if identity[:name], do: git(clone, ["config", "user.name", identity[:name]])
+    if identity[:email], do: git(clone, ["config", "user.email", identity[:email]])
+    :ok
+  end
 
   defp current_branch(clone), do: rev_parse(clone, ["--abbrev-ref", "HEAD"])
   defp rev(clone, ref), do: rev_parse(clone, [ref]) |> String.slice(0, 12)

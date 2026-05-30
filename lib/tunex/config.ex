@@ -43,6 +43,7 @@ defmodule Tunex.Config do
   # ── Paths ───────────────────────────────────────────────────────────
 
   def credence_clone, do: Application.fetch_env!(:tunex, :credence_clone)
+  def git_identity, do: Application.get_env(:tunex, :git_identity, %{})
   def cache_dir, do: Application.get_env(:tunex, :cache_dir, "var/cache")
   def run_dir, do: Application.get_env(:tunex, :run_dir, "var/run")
 

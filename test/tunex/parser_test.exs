@@ -40,6 +40,45 @@ defmodule Tunex.ParserTest do
     end
   end
 
+  describe "parse_module_test/1" do
+    test "parses marker form" do
+      content = "---MODULE---\ndefmodule Solution do\n  def f, do: 1\nend\n---TEST---\ndefmodule SolutionTest do\n  use ExUnit.Case\nend\n---END---"
+      assert {:ok, mod, test} = Parser.parse_module_test(content)
+      assert mod =~ "def f"
+      assert test =~ "use ExUnit.Case"
+    end
+
+    # Regression: on retries the model drops the ---MODULE---/---TEST--- markers
+    # and emits two bare defmodules. Must still parse (else valid fixes are lost).
+    test "falls back to bare two-module output (no markers)" do
+      content = """
+      defmodule Solution do
+        def convert(str, num_rows) when num_rows >= byte_size(str), do: str
+        def convert(str, _num_rows), do: str
+      end
+
+      defmodule SolutionTest do
+        use ExUnit.Case, async: false
+
+        test "convert with one row" do
+          assert Solution.convert("A", 1) == "A"
+        end
+      end
+      """
+
+      assert {:ok, mod, test} = Parser.parse_module_test(content)
+      assert mod =~ "def convert"
+      assert mod =~ "byte_size"
+      refute mod =~ "defmodule SolutionTest"
+      assert test =~ "use ExUnit.Case"
+      assert test =~ "Solution.convert"
+    end
+
+    test "returns :error when only a module is present" do
+      assert :error = Parser.parse_module_test("defmodule Solution do\n  def f, do: 1\nend")
+    end
+  end
+
   describe "fix_is_prefix/3" do
     test "renames is_foo to foo? in module and test when canonical is a predicate" do
       mod = "defmodule Solution do\n  def is_palindrome(s), do: s == String.reverse(s)\nend"
