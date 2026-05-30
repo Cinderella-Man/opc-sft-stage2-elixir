@@ -1,4 +1,4 @@
-# Plan: Self-Evolving Elixir SFT Converter (v2 app)
+# Plan: Self-Evolving Elixir SFT Converter (Tunex v2)
 
 ## Primary goal (read first)
 **Generate and validate/improve as many Credence rules as possible.** Converting the SFT dataset is
@@ -10,511 +10,477 @@ that works?" Dataset quality is a secondary byproduct.
 `scripts/convert.exs` (790 lines) outgrew a script. Today convert→refine→validate run in one tangled
 flow where the local LLM sees Python instruction/code/tests *while* writing the Elixir solution —
 causing **translationese / source-language interference** (Python idioms bleed into Elixir). That bleed
-is useful: it is exactly the non-idiomatic code that reveals **missing Credence rules**. Validation
-depends on **Credence** (custom AST linter, local clone at `/home/car/projects/credence`, 87 rules,
-138 test files, rules auto-discovered from `lib/{pattern,syntax,semantic}`).
+is useful: it is exactly the non-idiomatic code that reveals **missing Credence rules**. Crucially,
+non-idiomatic-but-correct Elixir **compiles, passes tests, and trips no linter issue** — so the
+*output code itself* is the rule-discovery signal, not any error/issue. Validation depends on
+**Credence** (custom AST linter, local clone at `/home/car/projects/credence`; **90 rules** across
+`lib/{pattern,syntax,semantic}` — 77/6/7; 138 test files; rules auto-discovered by `@behaviour` scan).
 
-Restructure main dir into a proper OTP app running a self-evolving loop. Per SFT row: translate
-(remote) → solve (local, Python-blind) → refine/validate → **learn** (Mimo authors/extends/fixes a
-Credence rule). The app walks the **~118k-row dataset once, forward**, until the user stops it (118k ×
-minutes-per-solve ≈ years, so it never finishes a pass — it runs for days, then the user stops it,
-inspects/PRs the new rules, and manually reinitializes for the next run). Old code preserved runnable
-under `v1/`.
+Restructure into a proper OTP app running a self-evolving loop. Per SFT row: translate (remote) → solve
+(local, Python-blind) → validate → **learn** (a Claude-Code agent, driven by Mimo, generates/
+extends/fixes a Credence rule). The app walks the **~118k-row dataset once, forward**, in a seeded-
+shuffle order, until the user stops it (118k × minutes-per-row ≈ years, so it never finishes a pass — it
+runs for days, the user stops it, inspects/PRs the new rules, then manually reinitializes for the next
+run). Old code preserved runnable under `v1/`.
 
-### Confirmed decisions
-1. **Translate** = remote **Xiaomi Mimo**; produces Elixir instruction + Elixir tests **+ an Elixir
-   reference solution (validation-only, never emitted/trained)**. Cached **forever**, key =
-   `sha256(system_prompt + rendered_user_prompt + model)` (prompt change auto-invalidates).
-2. **Round-trip check** = run the Elixir reference solution against the translated Elixir tests via a
+---
+
+## Confirmed decisions
+
+1. **Translate** = remote **Xiaomi Mimo** (`mimo-v2.5-pro`, plain chat-completions); produces Elixir
+   instruction + Elixir tests **+ an Elixir reference solution (validation-only, never emitted/trained)**.
+   Cached **forever**, key = `sha256(system_prompt + rendered_user_prompt + model)` (prompt change
+   auto-invalidates). Token floor **32k**. **Truncation** (output didn't fit) → retry once with a
+   **raised ceiling** (up to Mimo's 131k max), *not* a same-ceiling re-roll; if it still truncates →
+   durable **negative-cache blacklist** (`verdict: :blacklist, reason: :untranslatable`, no payload). A
+   truncated/partial translation is **never** cached as usable.
+
+2. **Round-trip check (blacklist filter)** = run the Elixir reference against the translated tests via a
    **fix-free runner** (`mix compile --warnings-as-errors` + `mix test` ONLY — **no Credence-fix, no
-   credo, no credence-check**); require PASS before running Solve. Credence-fix is for Qwen's messy
-   output, not Mimo's clean canonical-named reference — and since the verdict is **cached forever**,
-   running the evolving (sometimes over-firing) rule set over the reference could permanently blacklist
-   usable rows when a transient bad rule rewrites it. The fix-free runner makes the cached verdict a
-   **pure function of `(reference, tests)`**, immune to the rule set. Fail → re-translate once → else
-   **permanently blacklist the row** ("broken by definition"). **Verdict is cached with the translation**
-   (deterministic → run once, not per pass). *Purpose:* keep future passes cheap by never re-attempting
-   rows that can't work — **not** data quality.
+   credo, no credence-check**); require PASS before Solve. Fix-free makes the verdict a **pure function
+   of `(reference, tests)`**, immune to the evolving rule set. Fail → re-translate once → else
+   **permanently blacklist the row** (`verdict: :blacklist, reason: :roundtrip_fail` — "broken by
+   definition"). **Verdict cached with the translation** (run once, not per pass). *Purpose:* never waste
+   an expensive Solve+CredenceRuleGenerator session on a mistranslated/ unsatisfiable row — **not** data quality.
+
 3. **Canonical names** = module pinned to `Solution`; function = deterministic Elixir name from
-   `entry_point` (`Parser.elixir_name`, e.g. is_palindrome→palindrome?). **Injected into the prompts**
-   (translate + reference + solve) and **trusted** — the only programmatic enforcement is `NamingFixup`'s
-   `is_ → ?` fix (convert.exs:99–165); module/function naming is NOT hard-enforced. A mismatch just fails
-   validation (tests target the canonical name) → normal retry. No separate enforcement step.
-4. **Solve** = **local Qwen**, Python-blind (prompt = ONLY Elixir instruction + Elixir tests).
-   Env-swappable to a remote provider for GPU-less dev. Retry + refine loop reused from v1. Qwen's
-   non-idiomatic output is the **rule-discovery feedstock**.
-5. **Evolve = Mimo only** (Claude dropped entirely). Deterministic **issue-dedup gate** (Elixir) in
-   front of **CredenceRuleGenerator**:
-   a. **CredenceRuleGenerator = Mimo hand-rolled loop, ≤3 rounds.** Always receives the **full current rule set**
-      (full source of all ~87 files in `lib/{pattern,syntax,semantic}`) + the row log + `RuleHelpers`/`Issue`
-      API + the row's **novel issues**. **Combined decide+implement, no moduledoc/triage split** — the full
-      bodies are both the extend-vs-create decision context AND the few-shot library for writing new rules.
-      **Prompt structure for cache hits:** stable corpus + API + examples → **system prompt** (cacheable
-      prefix; Mimo = **1M window**, cache ~**$0.2–0.4/M**); per-row content (row log + novel issues) → **last
-      in the user message**. (Each accepted rule busts the prefix cache once → size the runaway ceiling for
-      periodic full-price re-caches.) Round 1 is a **4-way decision** per issue:
-      **(1) Extend** an existing rule (e.g. add `Map.sort → Enum.sort` to a conversion-list rule),
-      **(2) Create** a new rule, **(3) Bugfix** an existing rule (over-firing / wrong-fix — CredenceRuleGenerator
-      *judges this by reading the RowLog*, which shows code before/after each `Credence.fix` + which
-      rules fired (`applied_rules` = `[{module, count | :reverted}]` — **full module names, not rule
-      atoms**); there is **no** `rule_regression` issue-id), **(4) `NO_RULE`**
-      (logic bug, nothing a rule can do). Mimo writes rule + **a mandatory regression test** (see #7);
-      our Elixir runs `mix test`, feeds failures back, ≤3 rounds.
-   b. **On CredenceRuleGenerator failure** (still red after 3 rounds): **move** the row's log into the
-      **`escalated/`** dir for later human review; mark the issue(s) `gave-up`; move on. **No Claude.**
-6. **Trust boundary / commit** = CredenceRuleGenerator **edits only** (no git creds in its env). After it exits, our
-   Elixir **Gate** enforces a **hard 4-part contract**: (a) full Credence `mix test` **green**, (b) the
-   diff touches **`test/**`** (a regression test was added/modified), (c) the diff touches **`lib/**`** (a
-   rule actually changed), (d) **mutation check** — stash the `lib/` change, re-run the **changed test
-   file(s)**; they MUST go **RED** (the test genuinely exercises the rule, not an `assert true` proxy);
-   restore. All four → `commit → recompile → push` (see #15/#11). Any miss → `git checkout -- .` discard.
-   **Apply is full-file overwrite** (CredenceRuleGenerator emits validated `{path, content}` blocks), never patches.
-7. **Rule quality is guaranteed at authoring time, not policed afterward.** Every add/extend/bugfix
-   MUST ship a **new regression test** (new rule: fires on bad code AND must-NOT-fire on good code;
-   bugfix: locks in the case it was wrongly firing on; extend: covers the new entry) — **absolutely
-   required**, enforced by the Gate (#6). The **main SFT flow is decoupled**: it never detects buggy
-   rules. Consequence (accepted): an over-firing rule whose damage shows up only as a wrong-answer test
-   failure looks like `test:generic` and is **not** self-corrected through the main flow; we rely on the
-   mandatory regression test + full suite to keep rules correct when committed. Rules that fail to
-   *compile* still self-revert via Credence's `:reverted` gate (harmless).
-8. **Rule edits** = CredenceRuleGenerator may **extend, create, OR bugfix** existing rules (see 5a). Enabled by giving
-   CredenceRuleGenerator the full current rule set in context.
-9. **Single forward pass — NO infinite loop, NO re-passes, NO convergence/wipe.** The program walks the
-   ~118k-row dataset once, in a **seeded-shuffle order** (deterministic permutation of `0..n-1` from a
-   fixed seed persisted in `var/run/`, **NOT** parquet order — so the prefix actually executed in the
-   limited wall-clock is a representative *sample* of all rows, not a contiguous topic-cluster, maximizing
-   failure-mode/rule diversity; resume unaffected since the permutation is reproducible), until killed.
-   (One Qwen solve takes minutes; 118k ≈ years, so it
-   will never actually finish — it's run for a few days at a time, then stopped.) There is no end-of-pass
-   wipe and no ephemeral/persistent split: **everything just persists for the run** — translation cache,
-   blacklist, the `gave-up` dedup set, `escalated/`, the **append-only SFT output** (one record
-   per row, like v1), and the committed Credence rules.
-   **Within-run dedup:** once a rule is committed + Credence recompiled, that issue stops appearing for
-   later rows (auto-dedup, no `resolved` set); the **`gave-up`** set dedups the unsolvable ones (each
-   gave-up issue is attempted once per run).
-   **Re-initialization is MANUAL:** to get more/different failures (e.g. swap to a smaller LLM), the user
-   reinitializes the project from scratch and reruns. By then the committed rules are already pushed on
-   `evolution`, and the user manually opens a PR to merge them into `main`.
-   **No saved-code re-runs, no `Evolve.Revalidate`, no over-fire detection** — rule quality is
-   guaranteed at authoring time (#7). The program **exits like any normal script** when killed or (in
-   theory) when the dataset is exhausted.
-10. **Issues (replaces per-row signatures)** = dedup at the level of the **individual issue id**, not
-    the row. **One set: `gave-up`** (no `resolved` set — a committed rule + recompile makes its issue
-    stop appearing, so resolved self-dedups). A row triggers CredenceRuleGenerator iff it has ≥1 issue
-    **not** in `gave-up`; it handles only those issues; failures add their ids to `gave-up`.
-    **Issue-id scheme:**
-    - `credence:<rule_name>` — a rule still fires after fix.
-    - `credo:<check_name>`.
-    - `compile:<kind>:<token>` — via a small **regex-extractor bank** over common Elixir compile-error
-      shapes (e.g. `compile:undef:Map.sort/1`); unmatched → **`compile:other`** catch-all.
-    - `test:generic` — all other (logic-bug) test failures **collapse into one id**. CredenceRuleGenerator returns
-      `NO_RULE` once → marked `gave-up` → **all future logic-bug rows are deduped out of authoring**
-      (kills the biggest noise source). Refine still tries to fix the logic for the dataset byproduct;
-      only *rule-authoring* is suppressed.
-11. **Git topology (simplified)** = **single canonical repo** `Cinderella-Man/credence`, **cloned by the
-    user** at `/home/car/projects/credence` with an **already-authenticated `origin`** (**SSH key** — the
-    current clone's `origin` is `git@github.com:Cinderella-Man/credence.git` — or a credential helper)
-    **and a commit identity configured**, **checked out on a hand-created `evolution` branch** (the clone
-    currently has only `main` — the user must create + push `evolution` before first run). The bot just
-    runs plain `git commit` + **`git push origin evolution`** — **the app never handles credentials**.
-    **`main` is branch-protected** (the hard safety rail). No fork, no second account. Same clone is what
-    the loop compiles against (path dep) and pushes from.
-12. **Providers** = `stages` map (`translate→mimo`, `solve→local_qwen`, `author→mimo`) + per-stage
-    `TUNEX_*_PROVIDER` env overrides; `providers` map (url/model), keys in env/`secrets.exs`. **No
-    `claude_code` / `evolve_escalation` stage.**
-13. **Budget (single concern)** = **Mimo is the only paid dependency** and runs **essentially uncapped**
-    with a **runaway-safety ceiling** only (abort if daily spend is absurd, e.g. 50× expected — catches
-    infinite-loop bugs, not rationing; size it for periodic prefix-cache busts, #5a). **Mimo token
-    exhaustion → halt the whole program** (nothing works without Mimo) **via a graceful `shutdown(reason)`
-    wrapper**: log raw body → flush/close RowLog → `File.sync`+close the SFT/error/gave-up handles →
-    **`System.halt(1)`** (see #16/T6.4). Per-row appends use `:file.datasync` and `Progress.mark_done` is
-    the **last** step per row, so even an abrupt kill leaves whole lines (worst case: one row re-processed).
-    **No Anthropic pool, no `Evolve.Budget` module.**
-14. **Runtime** = supervised **Orchestrator GenServer**, `mix run --no-halt`, single stream (no
-    parallel workers, one GPU). After accepted rule: `mix deps.compile credence --force`.
-15. **Boot reconciliation** = on start: **`git reset --hard HEAD && git clean -fd`** (reset to **HEAD**,
-    NOT `origin/evolution` — preserve all local commits, incl. un-pushed rules from a non-fatal-push run
-    (#11); discard only half-written working-tree WIP); log "evolution at <sha>, origin at <sha>, N ahead";
-    **best-effort** `git push origin evolution` catch-up (non-fatal); force-recompile credence; resume
-    from `Progress`.
-16. **Logging = plain `Logger`, no special structured logger.** v1 already `Logger.debug/info`s
-    everything (every LLM call in/out, code before/after each `Credence.fix`, all validator output).
-    Keep the **default `:logger` console handler** (watch live) **and** add a **native `:logger` file
-    handler** (OTP's `:logger_std_h` — **NOT** the legacy `:logger_file_backend`, which rests on the
-    backend API Elixir 1.19 extracted out of core), **both at `:debug`**. Per row, swap the file handler's
-    path via `:logger.update_handler_config(:row_file, :config, %{file: ~c"var/run/logs/<index>.log"})`;
-    the row's raw log file **is the literal input** CredenceRuleGenerator reads (force a filesync — swap the
-    file away or `:logger_std_h` sync — before reading). `applied_rules` lands in it for free:
-    `run_credence_fix.exs` does `IO.puts(inspect(applied_rules))` (entries are `{module, count |
-    :reverted}` tuples — full module names) and the Validator already `Logger`s the captured subprocess
-    stdout (validator.ex:316). **No Markdown digest, no JSONL events, no JSON channel.**
-    **Per-row lifecycle:** when the row finishes (CredenceRuleGenerator — the last step — is done),
-    **delete the log** — UNLESS the rule generator **gave up** → **move** it into **`escalated/`** for
-    manual review, OR the row **committed a rule** → **move** it into **`committed/<index>.log`** (rule
-    provenance: every pushed rule keeps the log that motivated it, for PR review). Invariant: the *only*
-    logs that survive on disk are the `escalated/` (manual queue) and `committed/` (rule provenance) ones.
-17. **CredenceRuleGenerator loop bounds** = ≤3 rounds; clean working tree between rows.
-18. **Storage layout = keep-vs-wipe split** (so re-init removes generated solutions but NOT tasks or
-    blacklist):
+   `entry_point` (`Parser.elixir_name`, e.g. `is_palindrome`→`palindrome?`). **Injected into all prompts**
+   (translate + reference + solve) and **trusted**; the only programmatic enforcement is `NamingFixup`'s
+   `is_ → ?` fix. A mismatch just fails validation (tests target the canonical name) → normal retry.
+
+4. **Solve** = **local Qwen**, Python-blind (prompt = ONLY Elixir instruction + Elixir tests + canonical
+   fn name). **Plain single-shot generation + retry** — reuse v1's `ConvertLoop.attempt` loop skeleton;
+   the Validator runs the pipeline and feeds failures back into the retry prompt. **No agent harness**
+   (a 3090 cannot host Claude Code's payload, and Solve needs no tools). Env-swappable to a remote
+   provider for GPU-less dev (`TUNEX_SOLVE_PROVIDER=xiaomi_mimo_2_5_pro`). Qwen's non-idiomatic output is
+   the **rule-discovery feedstock**.
+
+5. **Evolve = a Claude-Code agent driven by Mimo.** The CredenceRuleGenerator shells out to the **Claude Code
+   CLI** (`claude -p … --output-format json`) with **`cwd` = the credence clone** and
+   `ANTHROPIC_MODEL=mimo-v2.5-pro[1m]`.
+   - **"Claude Code" (the harness) ≠ "Claude" (the model).** The model behind it is **Mimo** — so this
+     does **not** reintroduce the Anthropic/Claude dependency that was deliberately cut. Mimo stays the
+     **only paid model**.
+   - **Runs on EVERY row** (not gated on issues): the most valuable rows — clean, passing, non-idiomatic —
+     have **zero** issues, so an issue-gate would skip exactly the rows that matter. Trades row-throughput
+     (~2× per-row time) for rule-discovery thoroughness — the correct trade for the primary goal.
+   - **Input = the row's full raw log** (the output code + the Credence before/after fix trace). The agent
+     **reads rule files off the filesystem itself** (`Read`/`Grep` in the clone) — **no rule-body
+     injection, no index, no retrieval protocol.** Prompt is tiny: raw log + the current `decisions.md`
+     ledger + an open-ended task ("do you see any, even smallest, opportunities to deterministically
+     improve this output code with a new/extended rule? or any bug in an existing rule visible in the
+     fix trace?").
+   - **Sandbox (trust boundary):** `--allowedTools "Read Grep Glob Edit Write Bash(mix test:*)"`,
+     `--disallowedTools "Bash(git:*)"`, `--add-dir <clone>`, `--max-turns 30` (config), **no git
+     credentials in its env**. The agent edits + runs `mix test`; it cannot commit or push.
+   - **`--max-turns` hit without finishing → treated as `gave_up`.**
+   - **Test strategy:** prompt the agent to **iterate with targeted tests** (`mix test
+     test/<phase>/<rule>_test.exs` — fast) and **run the full suite once before finishing** to catch
+     collateral breakage; the Gate's full-suite-green is the authoritative backstop regardless.
+   - **Decision signal:** the agent's final message carries a parseable `DECISION:` line
+     (`gave_up: <reason>` vs a rule proposal). This drives ledger-writing + provenance; the **Gate** (not
+     the agent's self-report) decides commit/reject.
+
+6. **Trust boundary / Gate** = the agent **edits only** (no git creds). **If the working tree is clean
+   after the agent exits (a `gave_up` with no edits), the Gate — and its full-suite `mix test` — is
+   skipped entirely** (nothing to verify). So the expensive full-suite run happens only on rows where a
+   rule was actually proposed (the minority). Otherwise our Elixir **Gate** stages everything
+   (`git add -A`) and enforces a **hard 5-part contract** on `git diff --cached`:
+   - **(a)** full Credence `mix test` **green**;
+   - **(b)** diff touches **`lib/`** (a rule/infra file changed);
+   - **(c)** diff touches **`test/`** (a regression test added/modified);
+   - **(d) mutation check** (on **added/modified** test files only): snapshot the touched `lib/` files →
+     restore `lib/` to HEAD (`git checkout HEAD -- <tracked>`; `rm` new untracked) → run the changed test
+     file(s) → assert **non-zero exit** (the test genuinely needs the rule; **a compile error on revert
+     counts as RED**) → restore the snapshot;
+   - **(e) scope check** — the diff touches **only `lib/` and `test/`**; anything else (`mix.exs`,
+     `config/`, `.formatter.exs`, `deps/`, README, CI) → reject.
+
+   **Deletions/renames are allowed** (a rename is delete+add; supersession is legitimate consolidation) —
+   the **branch-protected `main` + manual PR review** is the backstop for "was this removal warranted,"
+   not the Gate. All checks pass → `commit → recompile → push` (#11/#14). Any miss →
+   `git checkout -- . && git clean -fd` discard + `gave_up` + append to `decisions.md` + escalate.
+   The commit message **tags the decision type and flags removals** (e.g.
+   `cred-gen: supersede X [removes rule Y] [row 4127]`) to direct human PR attention.
+
+7. **Eager rule generation — even micro-rules are welcome.** The agent proposes a rule for *any* genuine
+   deterministic improvement, however small; volume is fine. Two safety nets make over-firing acceptable:
+   - **Generation-time gate:** every add/extend/bugfix ships a **new regression test** (Gate-enforced via
+     diff-touches-`test/` + the mutation check). New rules *should* include a "must-NOT-fire on good code"
+     case (good hygiene; not separately gated). Pure deletion/rename needs no new test. Compile-failing
+     fixes self-revert via Credence's `:reverted` gate (harmless).
+   - **Self-correction of over-firing (NEW — supersedes the old "not self-corrected" caveat):** because
+     the CredenceRuleGenerator runs **every row** and reads the **full Credence fix trace** (before/after +
+     `applied_rules`), a rule that wrongly rewrites correct code surfaces at the **first occurrence** it
+     over-fires — as a broken test or a visibly-wrong before/after — and the agent fixes it as a
+     **bugfix**. The old "over-firing looks like `test:generic` and isn't self-corrected" limitation was an
+     artifact of the deleted issue-gated generator; with every-row generation + full-trace input, over-firing
+     *is* catchable. The **main SFT *emission*** stays decoupled (the row's emitted result never depends on
+     whether a rule was generated), but the **CredenceRuleGenerator track is the self-correction path.**
+   - **Final curation** = the human PR from `evolution` → protected `main`.
+
+8. **Dedup (no issue-id machinery).** Two mechanisms, no exact keys:
+   - **Emergent:** once a rule is committed + Credence recompiled, it auto-fixes that pattern → the
+     pattern vanishes from all future output → the agent never sees it → never re-proposes it.
+   - **`var/run/decisions.md` ledger** for *dead-ends* (patterns the agent couldn't turn into a rule, or
+     the Gate rejected): **written by the orchestrator** (not the agent — keeps the agent sandboxed to the
+     clone), **inlined into every CredenceRuleGenerator prompt** so the agent won't retry them. **The agent composes the
+     entry** when it gives up (its `DECISION: gave_up` block carries a one-line pattern description + a
+     minimal offending snippet); the orchestrator appends it verbatim. **On a Gate rejection** (the agent
+     thought it succeeded), the orchestrator instead composes a terse entry from the Gate failure reason +
+     the attempted rule. **Append-always** (no auto-dedup — the agent reading the ledger is what prevents
+     re-proposing; redundancy is cheap). **Run-scoped** (in `var/run/`, wiped by `mix tunex.reset`) — a
+     dead-end on a small Qwen may be solvable after a model swap, so a fresh run re-attempts.
+   - **DROPPED entirely:** `Tunex.Issues`, the issue-id scheme (`credence:`/`credo:`/`compile:`/
+     `test:generic`), the compile-error regex bank, the `gave_up` set, `test:generic` collapse. The agent
+     reads any failures straight from the raw log; nothing else consumes structured issue-ids.
+
+9. **Single forward pass — NO infinite loop, NO re-passes, NO convergence/wipe.** Walks the ~118k-row
+   dataset once in a **seeded-shuffle order** (deterministic permutation of `0..n-1` from a fixed seed
+   persisted in `var/run/`; a representative *sample*, not parquet's topic-clustered order, maximizing
+   failure-mode diversity; resume reproducible). 118k × minutes ≈ years ⇒ never finishes; run for days,
+   then stop. Everything just **persists for the run** — translation cache, blacklist, `decisions.md`,
+   `escalated/`, `committed/`, append-only SFT output, committed rules. `Progress` gives crash-resume.
+   **Re-init is MANUAL:** `mix tunex.reset` (wipes `var/run/`, keeps `var/cache/`), then rerun. Rules are
+   already pushed on `evolution`; the user manually PRs them to `main`.
+
+10. **Providers — hardcoded per stage** (no `mechanism` field; they never change at will):
+    - `translate` → Mimo via `LLM.call` (`/v1/chat/completions`),
+    - `solve` → local Qwen via `LLM.call`,
+    - `rule-gen` → Mimo via the **Claude Code subprocess** (`/anthropic` endpoint).
+    `stages` map selects model/provider for the two chat stages; `TUNEX_{TRANSLATE,SOLVE}_PROVIDER` env
+    overrides apply only to them. The rule-gen path is hardcoded in `Tunex.Evolve.CredenceRuleGenerator`. Keys in
+    `secrets.exs`; git auth lives in the clone's SSH remote, not the app.
+
+11. **Git topology** = **single canonical repo** `Cinderella-Man/credence`, **cloned by the user** at
+    `/home/car/projects/credence` (current `origin` = `git@github.com:Cinderella-Man/credence.git`, **SSH
+    key**), **on a hand-created `evolution` branch** (clone currently has only `main` — user must create +
+    push `evolution` first), with a **commit identity** set. The app runs plain `git commit` +
+    `git push origin evolution` — **never handles credentials**. **`main` is branch-protected** (the hard
+    safety rail). Same clone is what the loop compiles against (path dep) and pushes from.
+
+12. **Budget (single concern)** = **Mimo is the only paid dependency** (Translate + CredenceRuleGenerator; local Qwen is
+    free) and runs **essentially uncapped** with a **runaway-safety ceiling** only (abort at absurd spend,
+    e.g. 50× expected — catches loops, not rationing; **size it for a Mimo CredenceRuleGenerator session on every row**).
+    Accumulate **Mimo `usage` tokens × configured price** from each Translate response **and from the
+    Claude Code JSON output** (`input_tokens`/`output_tokens` incl. cache fields). **Ignore CC's
+    `total_cost_usd`** — it is computed from Anthropic pricing and is wrong/zero for a custom Mimo model.
+    Fallback: request/session count if `usage` is absent. **Mimo exhaustion / runaway → graceful
+    `Tunex.shutdown(reason)`**: log raw body → flush/close RowLog → `File.sync`+close SFT/error handles →
+    **`System.halt(1)`** (clean exit, never a raise, so the supervisor can't restart into a fatal storm).
+
+13. **Runtime** = supervised **Orchestrator GenServer**, `mix run --no-halt`, **single stream** (no
+    parallel workers, one GPU, one clone). After an accepted rule: `mix deps.compile credence --force`.
+    **Per-row `try/rescue`:** a row that throws → log it, `git checkout -- . && git clean -fd` the clone,
+    skip the row, continue (don't crash the loop). Reserve process-crash + supervisor restart +
+    reconciliation for unexpected death (kill/OOM).
+
+14. **Boot preflight (fail fast, DX)** = before processing any row, verify preconditions and **halt
+    (`System.halt(1)`) with actionable fix instructions** on any miss (no crash-loop): clone exists + is a
+    git repo + **current branch == `evolution`** + tree clean (post-reconciliation); `claude` on `PATH`
+    (`--version`) **and a one-shot CC smoke test against Mimo** (`claude -p "reply OK" --output-format
+    json` — validates base URL + token + model end-to-end so a bad CredenceRuleGenerator-path auth doesn't masquerade as
+    "agent always gives up"); `secrets.exs` has both Mimo-chat + CC credentials; Mimo chat endpoint
+    reachable; credence compiles in the workspace.
+
+    **Boot reconciliation** = on start: **`git reset --hard HEAD && git clean -fd`** (reset to **HEAD**,
+    NOT `origin/evolution` — preserve un-pushed local commits; discard half-written WIP); log "evolution at
+    <sha>, origin at <sha>, N ahead"; **best-effort** `git push origin evolution` catch-up (non-fatal);
+    force-recompile credence; load `decisions.md`; load/derive the shuffle permutation from the persisted
+    seed; resume from the explicit `Progress` file.
+
+15. **Logging = plain `Logger` + a per-row file capture.** v1 already `Logger.debug/info`s everything
+    (every LLM call in/out, code before/after each `Credence.fix`, all validator output). Keep the default
+    `:logger` console handler (watch live) **and** add a native `:logger` file handler (OTP's
+    `:logger_std_h` — **not** the legacy `:logger_file_backend`). Per row, swap the file handler's path via
+    `:logger.update_handler_config(:row_file, :config, %{file: ~c"var/run/logs/<index>.log"})`; **the row's
+    raw log file is the literal input the CredenceRuleGenerator reads** (force a filesync before reading).
+    `applied_rules` lands in it for free: `run_credence_fix.exs` does `IO.puts(inspect(applied_rules))`
+    (entries = `{module, count | :reverted}` — full module names) and the Validator logs the captured
+    subprocess stdout. **Per-row lifecycle:** on completion **delete the log** — UNLESS the agent
+    **gave up** → **move** to **`escalated/<index>.log`** (manual queue), OR the row **committed a rule** →
+    **move** to **`committed/<index>.log`** (rule provenance; pair it with the agent's JSON transcript).
+    Invariant: the only logs surviving on disk are `escalated/` and `committed/`.
+
+16. **Storage layout = keep-vs-wipe split:**
     - **`var/cache/`** — survives re-init. `translations.jsonl` = Mimo's instruction+tests+reference
-      ("tasks"), **with the round-trip verdict baked in as a field** (`roundtrip: :pass | :fail`). So
-      **blacklist is not a separate file** — a row is blacklisted iff its cached translation has
-      `roundtrip: :fail`. (Saves re-paying Mimo when only the Solve LLM is swapped.)
-    - **`var/run/`** — everything Qwen-generated/regenerable: `gave_up`, `Progress`, the **shuffle seed**,
-      SFT output, `escalated/` + `committed/` (the only surviving logs — failures and rule-provenance),
-      the validation `workspace/`. (Per-row logs are deleted on completion, #16 — they don't accumulate;
-      only `escalated/`/`committed/` do.)
-    - **Re-init = `rm -rf var/run/`** (one command; cache untouched), exposed as `mix tunex.reset`.
+      ("tasks"), **with a `verdict: :ok | :blacklist` + `reason: :roundtrip_fail | :untranslatable`
+      field**. So **blacklist is not a separate file** — a row is blacklisted iff its cached record has
+      `verdict: :blacklist` (covers both unsatisfiable tests and untranslatable/truncated rows; the latter
+      is a payload-less negative-cache entry).
+    - **`var/run/`** — everything regenerable: `decisions.md`, the **`Progress`** file (explicit, one
+      index per line — `mark_done` is called on **every** finished row: success, hard error, **and**
+      blacklist-skip), the **shuffle seed**, SFT output, `escalated/` + `committed/` (the only surviving
+      logs), the validation `workspace/`.
+    - **Re-init = `rm -rf var/run/`** (cache untouched), exposed as `mix tunex.reset`.
     - **`.gitignore`** (tunex repo): `/var/`, `/config/secrets.exs`, `/_build/`, `/deps/`, `*.parquet`,
-      + generated artifacts under `v1/`. The credence **clone** (`/home/car/projects/credence`) is a
-      separate repo, unaffected.
+      + generated artifacts under `v1/`. The credence **clone** is a separate repo, unaffected.
 
 Research backing: translationese / source-language interference (arxiv 2503.04369, 2503.13620,
 2403.17214); learn-from-failure loops (AutoHarness 2603.03329, BitsAI-Fix 2508.03487). Principle =
 isolate target-language generation from source + gate self-generated artifacts behind their own passing
 tests.
 
-## Step 0 — Snapshot current project into `v1/`
-Move the whole runnable project into `v1/` (so `cd v1 && mix run scripts/convert.exs ...` works).
-Keep at repo root only `.git/` and this plan (→ new `docs/`). Everything else (`mix.exs`, `mix.lock`,
-`lib/`, `scripts/`, `config/`, `.formatter.exs`, existing `v1/*.jsonl`) lands under `v1/`.
+---
+
+## Verified integration facts (Mimo + Claude Code, researched 2026-05-30)
+- **Mimo chat API** (`https://api.xiaomimimo.com/v1/chat/completions`, or your `token-plan-sgp` host) is
+  OpenAI-compatible: supports `tools`/`tool_choice`/`tool_calls`, returns `usage`
+  (`prompt_tokens`/`completion_tokens`/`total_tokens`) and `finish_reason`. Token-limit param spelling is
+  **`max_completion_tokens`** (verify whether `max_tokens` is also honored).
+- **Claude Code ↔ Mimo (official):** point Claude Code at Mimo's **Anthropic-compatible** endpoint —
+  `ANTHROPIC_BASE_URL=https://api.xiaomimimo.com/anthropic` (or the `token-plan-*/anthropic` host),
+  `ANTHROPIC_AUTH_TOKEN=tp-…`, `ANTHROPIC_MODEL=mimo-v2.5-pro[1m]` (`[1m]` = 1M context). Requires
+  Node 18+.
+- **Credence module⇄path:** `Credence.Pattern.Foo` → `lib/pattern/foo.ex` (snake_case); phase dispatchers
+  live at `lib/{pattern,syntax,semantic}.ex` (lib root), shared helpers at `lib/rule_helpers.ex`,
+  `lib/credence.ex`, `lib/function_matcher.ex`, `lib/issue.ex`. (Rule edits sometimes legitimately touch
+  these — hence Gate scope = all of `lib/`, not just the three rule subdirs.)
+- **Credence API:** `Credence.analyze/2` → `%{valid, issues}`; `Credence.fix/2` →
+  `%{code, issues, applied_rules}` (`applied_rules` = `[{module, count | :reverted}]`). `Issue` =
+  `%{rule, message, meta: %{line}}`. Tests: one `_check_test`/`_fix_test` per rule, using
+  `Sourceror.parse_string!/1` + `RuleHelpers.apply_rule_fix/3`. Extend-prototype =
+  `Credence.Pattern.HallucinatedGuard` (`@hallucinated_guards` map).
+- **`LLM.call` latent bugs (v1):** drops `opts[:max_tokens]` (reads only active_provider/url/headers/
+  timeout); returns flattened `"HTTP <status>"`; and the `content != "" -> {:ok, content}` branch wins
+  before the `finish == "length"` check, so truncated-but-nonempty output is silently accepted (llm.ex
+  47–63). All fixed in T1.4.
+
+---
 
 ## Architecture
 ```
-Tunex.Application            supervision tree
-Tunex.Orchestrator (GenServer) single seeded-shuffle pass: pick row → translate → solve → refine → evolve; graceful shutdown on Mimo halt
-Tunex.RowLog                 swaps native :logger file-handler path per row; on done deletes / MOVES to escalated/ or committed/
-Tunex.Cache                  translate cache (var/cache/translations.jsonl + roundtrip verdict=blacklist)
-Tunex.Config                 stage→provider resolution + env overrides
-Tunex.Issues                 compute row issue-ids; persist gave-up set; dedup; blacklist (via cache)
+Tunex.Application            supervision tree; adds the native :logger row-file handler
+Tunex.Orchestrator (GenServer) single seeded-shuffle pass: pick row → translate → round-trip → solve →
+                             validate → rule-gen → gate → git → emit SFT; per-row try/rescue; graceful
+                             shutdown on Mimo halt
+Tunex.RowLog                 swaps the :logger file-handler path per row; on done deletes / MOVES to
+                             escalated/ or committed/
+Tunex.Cache                  translate cache (var/cache/translations.jsonl + roundtrip verdict = blacklist)
+Tunex.Config                 stage→provider resolution + env overrides + CC env/paths
+Tunex.ClaudeCode             thin subprocess wrapper: build argv/env, run `claude -p`, capture JSON,
+                             extract usage (→ Budget) + the DECISION line
 Pipeline:
   Tunex.Pipeline.Translate   Mimo: Python→Elixir instruction + tests + reference (ONLY Python stage); cached
-  Tunex.Pipeline.RoundTrip   fix-free runner (compile+test only) reference vs translated tests; pass → Solve; fail → re-translate/blacklist
+  Tunex.Pipeline.RoundTrip   fix-free runner (compile+test only) reference vs tests; pass → Solve; fail →
+                             re-translate/blacklist
   Tunex.Pipeline.Solve       local Qwen: Elixir instruction + tests → solution (Python-blind); retry
-  Tunex.Pipeline.Refine      review→improve→validate loop (from ConvertLoop.refine/do_refine)
+                             on validation failure (no separate Refine stage — dropped)
 Evolve:
-  Tunex.Evolve.CredenceRuleGenerator  Mimo loop (≤3): sees full rule set; 4-way (extend/create/bugfix/
-                             NO_RULE); writes rule + regression test, runs mix test, feeds back; fail →
-                             gave-up + move row log to escalated/
-  Tunex.Evolve.Gate          fresh `mix test` green + diff touches lib/+test/ + mutation check (changed test goes RED w/o rule); else discard
-  Tunex.Evolve.Git           commit → recompile → push origin evolution (non-fatal push, clone pre-auth'd via SSH)
+  Tunex.Evolve.CredenceRuleGenerator        builds the prompt (raw row log + decisions.md + task), invokes ClaudeCode in
+                             the clone (≤30 turns, sandboxed), parses DECISION; on gave_up → ledger +
+                             escalate. (Drives the Claude Code agent.)
+  Tunex.Evolve.Gate          git add -A → 5-part contract (full mix test green + diff touches lib/ + diff
+                             touches test/ + mutation check + scope check); else discard
+  Tunex.Evolve.Git           commit (tagged msg) → recompile → push origin evolution (non-fatal push)
+Tunex.Budget                 accumulate Mimo usage×price (Translate + CC JSON); runaway ceiling; fatal/
+                             transient classification; graceful System.halt
 ```
-**Copy & adapt from v1:** `LLM` (multi-provider), `Parser`, `Validator` (capture Credence before/after), `Workspace`
-(drop pool; path dep), `Dataset`, `Progress`, `JSONL`, `Report`, `NamingFixup`.
-**Dropped vs earlier draft:** `Evolve.Triage` (folded into CredenceRuleGenerator round 1), `Evolve.Escalate` +
-`Evolve.Revalidate` + `Evolve.Budget` (Claude/targeted-revalidation/Anthropic-pool all cut).
+**Copy & adapt from v1:** `LLM` (multi-provider), `Parser`, `Validator` (capture Credence before/after
+trace), `Workspace` (drop pool; path dep), `Dataset`, `Progress`, `JSONL`, `Report`, `NamingFixup`.
+**Dropped vs earlier draft:** `Tunex.Issues` + the whole issue-id/regex-bank/`gave_up` apparatus; the
+hand-rolled rule-generator tool loop (→ Claude Code); `Evolve.Triage`/`Escalate`/`Revalidate`; the
+Anthropic pool / Claude-the-model escalation; prompt-cache-prefix injection of the full rule set.
 
 ## Flow per row
-1. `Progress` → next unprocessed index; `RowLog.open`. (Blacklisted rows skipped.)
+1. `Progress` → next index in the shuffled permutation not in the completed set; `RowLog.open`.
+   (Blacklisted rows — `Cache` `verdict: :blacklist` — are skipped and `mark_done` immediately; on a
+   post-reset run they re-walk once, hit the cache, and re-mark.)
 2. **Translate** (Mimo, cached): instruction + tests + reference solution.
-3. **RoundTrip** (fix-free runner — compile+test only, no Credence-fix): reference must pass translated
-   tests; else re-translate once → else **blacklist** + skip. Verdict cached forever = pure fn of (ref, tests).
-4. **Solve** (Qwen, Python-blind, canonical names): solution; retry on validation failure.
-5. **Refine/validate**: `Validator.run` (credence fix→compile→format→credo→credence→test) + refine.
-   All before/after + `applied_rules` are `Logger`ed → land in the row's log file. Compute the row's
-   **issue-ids** (text-parse of `{stage, msg}` failures) on failure.
-6. **Evolve** (a *decoupled* learning track — does NOT change this row's emitted result): if the row has
-   ≥1 issue **not in `gave-up`**, **CredenceRuleGenerator** (Mimo ≤3) on those issues → 4-way decision
-   (extend/create/bugfix/NO_RULE), writes rule + **mandatory regression test**, **full `mix test`
-   feedback every round** (Mimo sees collateral breakage as it iterates). **Gate** 4-part contract (full
-   green + diff touches lib/+test/ + **mutation check**: changed test goes RED when the rule is stashed) →
-   **Git** `commit → recompile (deps.compile credence --force) → push origin evolution` (non-fatal push;
-   issue auto-dedups). Any miss after 3 rounds → mark `gave-up`, **move the log to `escalated/`**.
-7. Append the SFT success/error record (synced) **based on step 5's validation outcome** (independent of
-   step 6). **Delete the row log** — UNLESS it was moved to `escalated/` (gave-up) or `committed/` (a rule
-   was pushed) in step 6. Advance `Progress` (**LAST**, after the synced append); next row. Runs forward
-   through the shuffled permutation until killed (no re-pass, no wipe).
+3. **RoundTrip** (fix-free, compile+test only): reference must pass tests; else re-translate once → else
+   **blacklist** + skip. Verdict cached forever = pure fn of (ref, tests).
+4. **Solve** (Qwen, Python-blind, canonical names): plain generation + retry on validation failure.
+5. **Validate**: `Validator.run` (credence fix→compile→format→credo→credence→test); retry the solve on
+   failure (`max_retries`). All before/after + `applied_rules` are `Logger`ed → land in the row's log
+   file. (No Refine stage — dropped; raw solve output is both the emitted record and the rule feedstock.)
+6. **CredenceRuleGenerator** (decoupled learning track — does NOT change this row's emitted result): on **every** row,
+   `Tunex.Evolve.CredenceRuleGenerator` invokes the Claude Code agent (Mimo, ≤30 turns, sandboxed, `cwd`=clone) with the
+   raw row log + `decisions.md` + the open-ended task. Agent reads/greps rule files itself, edits, runs
+   `mix test`, emits `DECISION:`. If the tree is clean (no edits) the Gate is skipped. Else **Gate** runs
+   the 5-part contract; pass → **Git** `commit → recompile →
+   push origin evolution` (non-fatal push) + move log to `committed/`; fail/gave_up → discard, append a
+   dead-end entry to `decisions.md`, move log to `escalated/`.
+7. Append the SFT success/error record (synced) **based on step 5** (independent of step 6); a
+   hard-errored row emits an error record and is **done — not retried on resume**. Delete the row log
+   unless step 6 moved it. `Progress.mark_done` (**LAST**, after the synced append); next row. Runs
+   forward through the shuffled permutation until killed (no re-pass, no wipe).
 
 ## Credence dependency strategy
-`Workspace` deps → local **path dep** `{:credence, path: "/home/car/projects/credence"}`. Clone on
-`evolution`; `git push origin evolution` (clone pre-auth'd, `main` protected). Loop compiles against LOCAL
-checkout (push = backup/share). Single stream ⇒ no lock.
+`Workspace` deps → local **path dep** `{:credence, path: "/home/car/projects/credence", only: [:dev,:test],
+runtime: false}`. The loop compiles + validates against the LOCAL checkout (push = backup/share). During a
+row's steps 2–5 the clone sits at committed `evolution` HEAD (the agent edits it only in step 6), so
+validation always sees the **last-committed** ruleset. Single stream ⇒ no lock. The CredenceRuleGenerator runs its
+own `mix test` in the same clone; the Gate's mutation check and `Git.recompile` also operate there.
 
 ## Files
-- **Create:** `lib/tunex/{application,orchestrator,row_log,cache,config,issues}.ex`,
-  `lib/tunex/pipeline/{translate,round_trip,solve,refine}.ex`,
-  `lib/tunex/evolve/{credence_rule_generator,gate,git}.ex`, `docs/plan.md`,
-  `var/run/escalated/` (manual-review queue) + `var/run/committed/` (rule-provenance logs, Q1).
-  Add `:mimo` provider + `stages` map to `config/config.exs`; Mimo key in `secrets.exs` (git auth lives
-  in the clone's remote, not the app); `mod:` in
-  `mix.exs`.
-- **Modify:** `workspace.ex` (path dep, drop pool, recompile helper), `validator.ex` (Credence
-  before/after capture + issue-id extraction incl. compile-error regex bank), `llm.ex` (per-stage
-  provider). Move prompts into `Pipeline.*`.
+- **Create:** `lib/tunex/{application,orchestrator,row_log,cache,config,claude_code,budget}.ex`,
+  `lib/tunex/pipeline/{translate,round_trip,solve}.ex`,
+  `lib/tunex/evolve/{credence_rule_generator,gate,git}.ex`, `docs/plan.md`, `var/run/{escalated,committed}/`.
+  Add `:xiaomi_mimo_2_5_pro` provider + `stages` map + CC env/paths to `config/config.exs`; Mimo key +
+  CC auth token in `secrets.exs`; `mod:` in `mix.exs`.
+- **Modify:** `workspace.ex` (path dep, drop pool, `recompile_credence`), `validator.ex` (Credence
+  before/after trace capture), `llm.ex` (per-stage provider + T1.4 fixes). Move the Solve prompt into
+  `Pipeline.Solve` (rewritten Python-free).
 - **Copy & adapt:** `parser.ex`, `dataset.ex`, `progress.ex`, `jsonl.ex`, `report.ex`, `naming` helpers.
 - **Snapshot to `v1/`:** whole current project.
 
-## Verification
-1. `cd v1 && mix run scripts/convert.exs educational_instruct --start 0` → old path runs.
-2. Unit: Solve prompt contains NO Python; canonical module/function present in tests+solution.
-3. RoundTrip: feed a deliberately mistranslated test → reference fails compile/test → row
-   **blacklisted** + skipped; a stylistically-poor-but-passing reference is **not** blacklisted (fix-free
-   runner never runs credo/credence-fix, so the verdict = pure fn of (reference, tests)).
-4. Cache: row twice → 2nd is a hit; edit translate prompt → miss.
-5. GPU-less: `TUNEX_SOLVE_PROVIDER=mimo mix run --no-halt` runs end-to-end, no local model.
-6. Issue dedup: same issue id across two rows → 2nd row does not re-enter CredenceRuleGenerator. `test:generic` →
-   gave-up once → later logic-bug rows skip authoring (but Refine still runs).
-7. Issue-ids: hallucinated `Map.sort` → `compile:undef:Map.sort/1`; obscure error → `compile:other`.
-   (No `rule_regression` id exists.)
-8. CredenceRuleGenerator **extend**: with the rule set in context, a new hallucinated fn is **added to the existing
-   conversion-list rule**, not made into a new rule.
-9. CredenceRuleGenerator **create/bugfix**: novel idiom → new rule + regression test; over-firing rule → bugfixed +
-   regression test locking the case. **Gate rejects** (a) a change with no new regression test, AND (b) a
-   change whose new test **stays green when the rule is stashed** (mutation check — e.g. `assert true`).
-   Pass → `commit → recompile → git push origin evolution` (non-fatal push).
-10. CredenceRuleGenerator **fail**: force red 3 rounds → log dumped to `escalated/`, working tree clean, issue gave-up.
-11. Git safety: bot push to `main` is rejected (branch protection); push to `evolution` succeeds.
-12. Mimo exhaustion → **graceful `shutdown` halts cleanly** (handles flushed/synced, no torn lines).
-    Runaway ceiling trips on absurd spend. Truncated Translate/Author output (`{:truncated, _}`) is never
-    cached/committed; truncated Solve → retry.
-13. Single pass + resume: kill mid-run → restart → `Progress` skips done rows, blacklist (cache) +
-    `gave-up` reload, run continues forward. Dataset exhaustion (or kill) → clean exit. A rule committed
-    mid-run + recompiled → its issue stops recurring for later rows in the same run.
-14b. Log lifecycle: a pure convert success leaves **no** log; a gave-up row's log sits in `escalated/`; a
-    rule-committing row's log sits in `committed/`.
-14. Boot recovery: kill mid-author (dirty tree) **+ un-pushed commits** → restart → `reset --hard HEAD`
-    discards WIP but **keeps the un-pushed commits**, best-effort push catch-up, credence recompiled.
-15. `cd /home/car/projects/credence && mix test` green before/after.
-
-## Unresolved (values/setup, not design)
-- **Compile-error extractor bank:** initial regex shapes (undef function, unknown var, bad arity,
-  syntax). Grow as `compile:other` cases accumulate.
-- **Mimo values:** **verified** — context **1M tokens**, max output **131k** (32k/16k floors safe);
-  pricing **$1/M in, $3/M out** (≤256K tier; 2×/6× for 256K–1M), **cache hit $0.2–0.4/M in**. Still TODO:
-  runaway-ceiling **$ number** (size for prefix-cache busts, #5a); confirm responses include `usage` (else
-  request-count fallback); confirm Xiaomi's out-of-credit status code (refine classifier after first hit).
-- **Secrets / git setup (user-owned):** Mimo `Authorization` header + endpoint in `secrets.exs`. **User
-  clones `Cinderella-Man/credence`** to `/home/car/projects/credence`, **creates + checks out the
-  `evolution` branch** (clone currently has only `main`), with `origin` **pre-authenticated** (**SSH key**
-  — current origin is `git@github.com:…` — or credential helper) and a **commit identity** set; `main`
-  **branch-protected**. The app does plain `git commit`/`git push origin evolution`.
-- **`escalated/` review:** manual-only; no triage workflow.
-
-### Resolved this session
-- Round-trip kept but repurposed as a **blacklist filter** to skip broken-by-definition rows (not data
-  quality); gates on compile/test only; verdict cached with translation.
-- **Cut** targeted Revalidation + per-row signatures → run-scoped issue-id sets (single forward pass).
-- **Dropped Claude** entirely (escalation, Anthropic pool, budget module, max-turns) → `escalated/`
-  dead-letter dir on CredenceRuleGenerator failure.
-- **Mimo uncapped** (runaway ceiling only); exhaustion halts the program.
-- **Git simplified** to single repo + **SSH-key auth** + protected `main` (no fork / 2nd account / dual SSH).
-- **Triage folded** into CredenceRuleGenerator round 1; CredenceRuleGenerator **sees the full rule set** and does 4-way
-  extend/create/bugfix/NO_RULE.
-- Dedup unit = **individual issue id**; `test:generic` collapse suppresses logic-bug noise.
-- **Rule quality enforced at authoring time** (mandatory regression test + full suite green, Gate **4-part
-  contract** incl. **mutation check** that the new test goes red without the rule), **not** policed by the
-  main flow → dropped `rule_regression` issue-id; Evolve decoupled from row emission; `bugfix` triggered by
-  CredenceRuleGenerator reading the RowLog.
-- **No ephemeral-pass model** (superseded): single pass means nothing is wiped at runtime. All run state
-  (cache, blacklist, dedup sets, escalated, SFT output) just persists; cleared only on manual re-init.
-- **Single forward pass, no infinite loop** (118k × minutes ≈ years — never loops). Runs until killed;
-  exits like a normal script. No convergence, no wipe, no `PassState`. Everything persists for the run;
-  `Progress` gives crash-resume. Re-init is **manual** (swap LLM → reinitialize project; rules already
-  pushed on `evolution`, user PRs to `main`).
-
 ## Implementation tasks
 
-Decomposed from the design above into ordered, dependency-aware milestones. Build strategy: vertical
-slice first (M0–M3 = runnable convert loop, no evolve), then layer Issues (M4), Evolve (M5), and the
-supervised Orchestrator (M6). Each milestone is independently testable.
-
-**Principle: v1 is COPIED into v2 as raw material and freely rewritten — NOT imported or signature-
-preserved.** Where a task says "copy/adapt," take the v1 code as a starting point and reshape it into the
-most obvious/intuitive v2 form (clear names, purpose-built functions). Don't contort v2 to match a v1
-signature. v1 stays runnable under `v1/` only as a reference/fallback.
-
-**Grounding facts (from code exploration):**
-- Credence API: `Credence.analyze/2` → `%{valid, issues}`; `Credence.fix/2` → `%{code, issues,
-  applied_rules}`. `Issue` = `%{rule: atom, message, meta: %{line}}`. Rules auto-discovered by
-  `@behaviour` scan (`Credence.RuleHelpers.discover_rules/1`) — add file + recompile = registered.
-- Phases: **Syntax** (`analyze/1`,`fix/1`), **Semantic** (`match?/1`,`to_issue/1`,`fix/2`), **Pattern**
-  (`check/2`,`fix_patches/2`). Extend-prototype = `Credence.Pattern.HallucinatedGuard`
-  (`@hallucinated_guards` map). Tests: one-file-per-rule (`_check_test`/`_fix_test`), use
-  `Sourceror.parse_string!/1` + `RuleHelpers.apply_rule_fix/3`.
-- `Tunex.LLM.call/3` already takes `active_provider` in opts; the existing `:xiaomi` provider == Mimo
-  (`mimo-v2.5-pro`) is already configured (→ rename to `:xiaomi_mimo_2_5_pro`, T1.1) → per-stage
-  providers ≈ Config work.
-- Workspace scripts `run_credence.exs`/`run_credence_fix.exs` are Tunex's own (the "FIXED" string is
-  ours) → enhance to emit `applied_rules`. Workspace currently = Agent **pool** + **git** credence dep
-  → becomes **single** workspace + **path** dep. `Validator.run/3` → `{failures, final_mod, final_test}`.
+Build strategy: vertical slice first (M0–M3 = runnable convert loop, no evolve), then layer the
+Claude-Code CredenceRuleGenerator + Gate (M4) and the supervised Orchestrator + Budget (M5).
+**Principle:** v1 is COPIED into v2 as raw material and freely rewritten — NOT imported or signature-
+preserved. Reshape into the most obvious v2 form; don't contort v2 to match a v1 signature. v1 stays
+runnable under `v1/` only as reference.
 
 ### M0 — Snapshot to `v1/` + new app skeleton
-- **T0.1** Move entire current project into `v1/` (`mix.exs, mix.lock, lib/, scripts/, config/,
+- **T0.1** Move the entire current project into `v1/` (`mix.exs, mix.lock, lib/, scripts/, config/,
   .formatter.exs, test/, *.jsonl, *.parquet, tunex_workspace_0/, README.md, output_v1/`). Leave at root
   only `.git/` + `plan.md`. Verify `cd v1 && mix run scripts/convert.exs educational_instruct --start 0`.
 - **T0.2** `plan.md` → `docs/plan.md`.
 - **T0.3** New root `mix.exs`: `app: :tunex`, `mod: {Tunex.Application, []}`, deps `{:req,"~> 0.5"},
   {:explorer,"~> 0.10"},{:jason,"~> 1.4"}` (**no `:logger_file_backend`** — RowLog uses OTP's native
-  `:logger`/`:logger_std_h`, no dep). New `config/config.exs` (keep `config :logger, level: :debug`;
-  default console handler + add the row-file `:logger` handler in `Tunex.Application`), `.formatter.exs`.
-  (Main app does NOT dep on credence — it shells into the workspace.) **`.gitignore`**: `/var/`,
-  `/config/secrets.exs`, `/_build/`, `/deps/`, `*.parquet`, + generated artifacts under `v1/`.
-- **T0.4** Copy reused modules into new `lib/tunex/`: `parser, dataset, progress, jsonl, report, llm,
+  `:logger_std_h`). New `config/config.exs` (`config :logger, level: :debug`; default console handler +
+  the row-file handler added in `Tunex.Application`), `.formatter.exs`. (Main app does NOT dep on
+  credence — it shells into the workspace.) `.gitignore` per #16.
+- **T0.4** Copy reused modules into `lib/tunex/`: `parser, dataset, progress, jsonl, report, llm,
   workspace, validator` (last three modified later). Drop `cli`/`trajectory_logger` (→ RowLog).
-- **T0.5** `Mix.Tasks.Tunex.Reset` (`mix tunex.reset`) = `rm -rf var/run/` + recreate empty dirs;
-  **leaves `var/cache/` (tasks + blacklist) intact**. The "remove generated solutions" button.
+- **T0.5** `Mix.Tasks.Tunex.Reset` (`mix tunex.reset`) = `rm -rf var/run/` + recreate empty dirs; leaves
+  `var/cache/` intact.
 
-### M1 — Config + per-stage providers  *(dep: M0)*
-- **T1.1** `config.exs`: **rename the Mimo provider key `:xiaomi` → `:xiaomi_mimo_2_5_pro`** (bare atom;
-  `model: "mimo-v2.5-pro"` unchanged) and update `secrets.exs` to match. **Add a floor `max_tokens` to it**
-  (currently none → Mimo truncates). Keep `max_retries: 5` + `max_refine_retries: 5` (Solve/Refine —
-  unchanged from v1). Add `subset: "educational_instruct"` (single subset, one shuffled pass) + a
-  persisted **shuffle seed**. Add `stages` `%{translate: :xiaomi_mimo_2_5_pro, solve: :local_qwen_thinking,
-  author: :xiaomi_mimo_2_5_pro}`; add `credence_clone` + paths under the **`var/cache/`** (survives) vs
-  **`var/run/`** (wiped) split (#18).
-- **T1.2** `Tunex.Config`: `provider_for(stage)` = `TUNEX_<STAGE>_PROVIDER` env → `stages[stage]`; path
-  helpers.
-- **T1.3** `config/secrets.exs` (gitignored): `secret_providers: %{xiaomi_mimo_2_5_pro: %{headers:
-  %{"Authorization" => "Bearer …"}}}`. *(setup — user supplies; no git creds here — git auth lives in the
-  clone's remote, via SSH key.)*
-- **T1.4** **Fix `LLM.call`** (4 changes): (1) merge per-call `opts` overrides (`max_tokens`,
-  `temperature`) into `body_params` — currently silently dropped (llm.ex:14–28 reads only active_provider
-  /url/headers/timeout), so v1's `opts[:max_tokens]` was a no-op; (2) return **classified errors**
-  `{:error, {:http, status, body}}` / `{:error, {:network, reason}}` instead of the flattened
-  `"HTTP <status>"` (preserve status+body for T6.4); (3) read `usage` from the response body (for Budget);
-  (4) **surface truncation regardless of content** — reorder `handle_response` so `finish_reason ==
-  "length"` returns **`{:truncated, content}` even when content is non-empty** (the current `content != ""
-  -> {:ok, content}` branch wins first, so truncated-but-nonempty output is silently accepted as `:ok` —
-  llm.ex:53–57). Then `LLM.for_stage(stage, user, system, opts)` injects `active_provider` + the stage's
-  `max_tokens` (Translate 16k / CredenceRuleGenerator 32k / Solve default). **Translate/CredenceRuleGenerator:**
-  `{:truncated, _}` = **hard error** (never cache/commit; re-translate once / fail the round; log the
-  too-low floor). **Solve/Refine:** `{:truncated, _}` = normal failed attempt → retry (no halt).
+### M1 — Config + per-stage providers + CC integration  *(dep: M0)*
+- **T1.1** `config.exs`: **rename `:xiaomi` → `:xiaomi_mimo_2_5_pro`** (`model: "mimo-v2.5-pro"`), update
+  `secrets.exs` to match, **add a floor `max_tokens`/`max_completion_tokens`** (currently none → Mimo
+  truncates). Keep `max_retries: 5` (Refine dropped → no `max_refine_retries`). Add
+  `subset: "educational_instruct"` + a
+  persisted **shuffle seed**. Add `stages %{translate: :xiaomi_mimo_2_5_pro, solve: :local_qwen_thinking}`
+  (the rule-gen stage is hardcoded). Add **CC config**: `claude_code %{base_url, auth_token (secrets), model:
+  "mimo-v2.5-pro[1m]", max_turns: 30}`, `credence_clone` path, and the `var/cache/` vs `var/run/` paths.
+  Add **Budget config**: per-token price + runaway ceiling.
+- **T1.2** `Tunex.Config`: `provider_for(stage)` = `TUNEX_<STAGE>_PROVIDER` env → `stages[stage]` (chat
+  stages only); CC + path helpers.
+- **T1.3** `config/secrets.exs` (gitignored): Mimo chat `Authorization` header + CC `ANTHROPIC_AUTH_TOKEN`.
+  *(No git creds — SSH key lives in the clone's remote.)*
+- **T1.4** **Fix `LLM.call`** (Translate/Solve only): (1) merge per-call `opts` overrides
+  (`max_tokens`/`temperature`) into `body_params`; (2) return **classified errors** `{:error, {:http,
+  status, body}}` / `{:error, {:network, reason}}`; (3) read `usage`; (4) **reorder `handle_response`** so
+  `finish_reason == "length"` returns `{:truncated, content}` **even when content is non-empty**. Then
+  `LLM.for_stage(stage, …)` injects `active_provider` + the stage's token floor. **Translate:**
+  `{:truncated, _}` = hard error — retry once with a **raised ceiling** (up to 131k), never cache a
+  partial; still truncated → negative-cache blacklist (`reason: :untranslatable`). **Solve:**
+  `{:truncated, _}` = normal failed attempt → retry.
 
 ### M2 — Workspace: single + path dep + richer scripts  *(dep: M0)*
-- **T2.1** `workspace.ex`: delete pool fns; **single workspace at `var/run/workspace/`** (not the v1
-  pool path), `clean_workspace` between rows (existing helper). Deps block →
-  `{:credence, path: "/home/car/projects/credence", only: [:dev,:test], runtime: false}`. Replace
-  `update_credence/1` with `recompile_credence/1` (`mix deps.compile credence --force`, dev+test). Note:
-  during a row's steps 2–5 the clone sits at committed `evolution` HEAD (CredenceRuleGenerator edits it
-  only in step 6), so validation always sees the **last-committed** ruleset — correct by construction.
-- **T2.2** Enhance `@credence_fix_script`: in addition to `FIXED/NO_CHANGES`, `IO.puts(inspect(
-  result.applied_rules))` and print remaining issues (`#{rule}: …`) — plain stdout, captured by the
-  Validator into the row log (no JSON, no special format). `@credence_check`/check script: ensure each
-  remaining issue prints its `rule` atom (for `credence:<rule>` issue-id text-parsing).
-- **T2.3** Single-path workspace bootstrap; `deps.get` + `deps.compile` (dev+test) against path dep.
+- **T2.1** `workspace.ex`: delete pool fns; **single workspace at `var/run/workspace/`**, `clean_workspace`
+  between rows. Deps → `{:credence, path: "/home/car/projects/credence", only: [:dev,:test], runtime:
+  false}`. Replace `update_credence/1` with `recompile_credence/1` (`mix deps.compile credence --force`,
+  dev+test).
+- **T2.2** Enhance `@credence_fix_script`: in addition to `FIXED/NO_CHANGES`,
+  `IO.puts(inspect(result.applied_rules))` and print remaining issues (`#{rule}: …`) — plain stdout,
+  captured into the row log. (Feeds the CredenceRuleGenerator.s before/after fix trace.)
+- **T2.3** Single-path workspace bootstrap; `deps.get` + `deps.compile` (dev+test) against the path dep.
 
-### M3 — Pipeline: translate → round-trip → solve → refine  *(dep: M1,M2)*
-- **T3.1** `Tunex.Cache` (`var/cache/translations.jsonl`): `key=sha256(system+rendered+model)`,
-  `get/put`. Each record carries the **round-trip verdict** (`roundtrip: :pass | :fail`) — this **is**
-  the blacklist (no separate file). Survives `mix tunex.reset`.
-- **T3.2** `Pipeline.Translate` (Mimo, `max_tokens` 16k): instruction + tests + **reference**; canonical
+### M3 — Pipeline + RowLog: translate → round-trip → solve  *(dep: M1,M2)*
+- **T3.1** `Tunex.Cache` (`var/cache/translations.jsonl`): `key=sha256(system+rendered+model)`, `get/put`.
+  Each record carries `verdict: :ok | :blacklist` + `reason: :roundtrip_fail | :untranslatable`;
+  `blacklisted?/1` = `verdict == :blacklist`. A blacklist may be a payload-less negative-cache entry
+  (truncation). Survives `mix tunex.reset`.
+- **T3.2** `Pipeline.Translate` (Mimo, **token floor 32k**): instruction + tests + **reference**; canonical
   names injected; markers `---INSTRUCTION---/---TEST---/---REFERENCE---/---END---` →
-  `Parser.parse_translate/1`. **Never cache a truncated/`:empty` response** (T1.4); cache only complete
-  parses.
-- **T3.3** `Pipeline.RoundTrip`: reference vs translated tests via a **fix-free runner** (write
-  reference+tests, `mix compile --warnings-as-errors` + `mix test` ONLY — **no Credence-fix/credo/
-  credence-check**, so the verdict is a pure fn of `(reference, tests)`, immune to the evolving rule set,
-  #2). Fail → re-translate once (bypass cache) → else `Issues.blacklist/1` + skip. **Cache pass/fail
-  verdict with the translation** (T3.1) → runs once per translation, not per pass.
-- **T3.4** `Pipeline.Solve` (Qwen, **Python-blind**): reuse only the **loop skeleton** of
-  `ConvertLoop.attempt` (`v1` convert.exs:177) + `NamingFixup.fix_is_prefix`, `Validator.run/3`,
-  `Parser.parse_module_test`. **Rewrite ALL prompts Python-free** — the v1 system/initial/retry prompts
-  are converter prompts saturated with Python (convert.exs:13–45, 677–684, 261–281) and MUST NOT be
-  reused. New system prompt = "write idiomatic Elixir satisfying this Elixir spec + tests" (no mention
-  of Python/translation); new user prompt = Elixir instruction + Elixir tests + canonical fn name ONLY;
-  new retry prompt = previous **Elixir** attempt + `Validator` errors + canonical-name reminder (no
-  `## Original Python` block). **Guard:** unit test asserts assembled prompts (initial+retry) contain no
-  ```` ```python ```` and not the row's Python source.
-- **T3.5** `Pipeline.Refine`: port `ConvertLoop.refine`/`do_refine` (convert.exs:352–615); swap
-  `TrajectoryLogger` → `RowLog`.
+  `Parser.parse_translate/1`. **Never cache a truncated/`:empty` response;** cache only complete parses.
+  On `{:truncated,_}` retry once with a raised ceiling, then negative-cache blacklist (`:untranslatable`).
+- **T3.3** `Pipeline.RoundTrip`: reference vs tests via a **fix-free runner** (write reference+tests,
+  `mix compile --warnings-as-errors` + `mix test` ONLY). Fail → re-translate once (bypass cache) → else
+  `Cache` writes `verdict: :blacklist, reason: :roundtrip_fail` + skip. Cache the verdict with the
+  translation (run once, not per pass).
+- **T3.4** `Pipeline.Solve` (Qwen, **Python-blind**): reuse the loop skeleton of `ConvertLoop.attempt` +
+  `NamingFixup.fix_is_prefix`, `Validator.run/3`, `Parser.parse_module_test`. **Rewrite ALL prompts
+  Python-free** (v1 prompts at convert.exs:13–45,261–281,677–684 are saturated with Python — MUST NOT be
+  reused). New system = "write idiomatic Elixir satisfying this Elixir spec + tests" (no Python mention);
+  new user = Elixir instruction + tests + canonical fn name ONLY; new retry = previous Elixir attempt +
+  Validator errors + canonical-name reminder (no `## Original Python`). **Guard:** unit test asserts
+  assembled prompts contain no `` ```python `` and not the row's Python source.
+- **T3.5** `Tunex.RowLog` — thin manager of a native `:logger` file handler (`:logger_std_h`):
+  `open(index)` → swap path to `var/run/logs/<index>.log`; `path/0` (CredenceRuleGenerator reads after a forced
+  filesync); `close/0` deletes; `escalate(index)` moves to `escalated/`; `commit(index)` moves to
+  `committed/`. Handler added in `Tunex.Application`. `Validator` also returns the credence-fix **trace**
+  (before/after/`applied_rules`) → logged for the CredenceRuleGenerator.
 
-### M4 — Issues: issue-ids + dedup/blacklist  *(dep: M2)*
-- **T4.1** `Tunex.Issues`: compute issue-id list — `credence:<rule>`, `credo:<check>`,
-  `compile:<kind>:<token>`|`compile:other`, `test:generic`. **No `rule_regression`** — rule quality is
-  guaranteed at authoring time (#7), not detected by the main flow.
-- **T4.2** Compile-error regex extractor bank — **empirically verified against Elixir 1.19.5** (run via
-  `mix compile --warnings-as-errors`, so "undefined or private" warnings surface as `:compile` failures).
-  Apply these ordered regexes to the `:compile` failure msg; first match wins:
-  1. `undefined function (\w+[?!]?)/(\d+)` → `compile:undef_local:\1/\2`
-  2. `undefined variable "([^"]+)"` → `compile:undef_var:\1`
-  3. `([\w.]+\.\w+[?!]?)/(\d+) is undefined \(module` → `compile:undef_module:\1/\2` (unknown module)
-  4. `([\w.]+\.\w+[?!]?)/(\d+) is undefined or private` → `compile:undef_remote:\1/\2`
-     (covers **hallucinated remote fns** AND **wrong arity**, e.g. `String.isAlphanumeric?/1`, `String.length/2`)
-  5. `the range step operator \(//\)` → `compile:syntax:floor_div` (Python `//`)
-  6. `missing terminator: (\w+)` → `compile:syntax:missing_terminator` (unmatched `do`/`end`)
-  7. `SyntaxError`/`TokenMissingError` otherwise → `compile:syntax:other`
-  8. else → **`compile:other`** catch-all.
-  (Note: Credence's `FixPythonModulo`/`FixDivRem` syntax rules usually rewrite `%`/`//` *before* compile,
-  so those rarely reach this stage. Grow the bank from `compile:other` cases seen in logs.)
-- **T4.3** Run-scoped `gave_up.txt` in `var/run/` (loaded at boot, gone on `mix tunex.reset`); **no
-  `resolved` set** (committed rules auto-dedup). **`blacklisted?/1` reads the cache's `roundtrip` field**
-  (T3.1) — no separate blacklist file. API: `novel_issues/1` (= issues not in `gave_up`),
-  `mark_gave_up/1`, `blacklisted?/1`.
+### M4 — Evolve: CredenceRuleGenerator (Claude Code) → gate → git  *(dep: M2,M3)*
+- **T4.1** `Tunex.ClaudeCode`: build argv (`claude -p <prompt> --output-format json --add-dir <clone>
+  --allowedTools "Read Grep Glob Edit Write Bash(mix test:*)" --disallowedTools "Bash(git:*)" --max-turns
+  30`) + env (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`; **no git creds**), run via
+  `System.cmd` (cwd=clone), parse JSON → `{result_text, usage, num_turns}`; feed usage to Budget; extract
+  the `DECISION:` line; max-turns-without-finish → `gave_up`.
+- **T4.2** `Tunex.Evolve.CredenceRuleGenerator`: build the prompt = raw row log (`RowLog.path` contents) + current
+  `decisions.md` + open-ended task; call `ClaudeCode`; route on `DECISION`. On `gave_up` → append a
+  dead-end entry (pattern + snippet) to `decisions.md` → `Gate`/escalate.
+- **T4.3** `Tunex.Evolve.Gate`: `git add -A` → **5-part contract** (#6): full `mix test` green + diff
+  touches `lib/` + diff touches `test/` + **mutation check** (snapshot touched `lib/`, restore to HEAD —
+  `checkout HEAD` tracked, `rm` new — run changed *added/modified* test files, assert non-zero exit incl.
+  compile error, restore) + **scope check** (only `lib/` + `test/`). Any miss → `git checkout -- . &&
+  git clean -fd` + append to `decisions.md`.
+- **T4.4** `Tunex.Evolve.Git`: **`commit → recompile → push`**. `git -C clone add -A && commit -m
+  "cred-gen: <decision> <rule> [removes …] [row <idx>]"` → `recompile_credence` (auto-dedups) →
+  `git push origin evolution` **non-fatal** (warn + continue on failure; boot catch-up reconciles). On
+  success, `RowLog.commit(idx)` (+ save the CC JSON transcript beside it for provenance).
 
-### M5 — Evolve: author → gate → git  *(dep: M2,M4)*
-- **T5.1** `Evolve.CredenceRuleGenerator` (Mimo ≤3, `max_tokens` 32k — multi-file output, in clone):
-  **combined decide+implement, full bodies, no moduledoc split.** **Prompt structure for cache hits:**
-  **system prompt** = stable cacheable prefix (full source of all ~87 `lib/{pattern,syntax,semantic}/*.ex`
-  + `Issue`/`RuleHelpers` API + behaviour cheatsheet + example rule+test pairs incl. `HallucinatedGuard`);
-  **user message** = per-row (row log + novel issues), last. (Mimo 1M window; cache ~$0.2–0.4/M; each
-  accepted rule busts the prefix once.) Round-1 4-way (extend/create/bugfix/NO_RULE; bugfix judged by
-  reading RowLog `applied_rules` = `{module, count | :reverted}` tuples, not an issue-id). **Apply
-  mechanism = full-file overwrite, no patches:** CredenceRuleGenerator emits `{path, full_content}` blocks
-  (markers `---FILE <path>---` … `---END FILE---`) for rule file(s) + test file(s); has the current file in
-  context for extend/bugfix. Elixir **validates each path** (under `lib/{pattern,syntax,semantic}/` or
-  `test/`, module name matches `Credence.<Phase>.<Name>` ⇄ path, no unrelated-file clobber) then overwrites
-  wholesale → **full `mix test` (clone) every round** (so Mimo sees collateral breakage as it iterates) →
-  feed back ≤3. Edits only (no git creds).
-- **T5.2** `Evolve.Gate`: hard **4-part** contract — (a) fresh full `mix test` **green** + (b/c)
-  `git diff --name-only` touches **`lib/**`** (the rule) **AND `test/**`** (the regression test) +
-  (d) **mutation check**: `git stash push -- lib/` (revert only the rule, keep the new test) → `mix test`
-  the **changed test file(s)** → assert they go **RED** → `git stash pop`; if still green, the test
-  doesn't exercise the rule (e.g. `assert true`) → reject. Any miss → `git checkout -- .`.
-- **T5.3** `Evolve.Git`: **`commit → recompile → push`** (order matters — recompile is load-bearing for
-  dedup and purely local; push is best-effort backup). `git -C clone add -A && commit -m
-  "cred-gen: <decision> <rule> [row <idx>]"` → `recompile_credence` (committed rule auto-dedups — no
-  `resolved` set) → `git push origin evolution` **wrapped non-fatal** (on failure: warn "local evolution N
-  ahead of origin", continue; boot catch-up reconciles). Auth pre-configured in the clone (**SSH key**) —
-  app never handles credentials. On success, **move the row log to `committed/<idx>.log`** (rule provenance).
-- **T5.4** `Evolve.Escalated`: on fail → `Issues.mark_gave_up/1` + **move the row's log file** to
-  `var/run/escalated/<index>.md`; `git checkout -- .`.
+### M5 — Orchestrator + Application + Budget  *(dep: M3,M4)*
+- **T5.1** `Tunex.Budget` + **error classification**: accumulate Mimo `usage`×price (Translate responses +
+  CC JSON); **fatal** Mimo errors (`401/402/403`, or `429`×N consecutive) → halt immediately; **transient**
+  (`5xx`/network) → bounded retry+backoff → halt if it won't clear; always **log raw body**. **Runaway $
+  ceiling** sized for a CC CredenceRuleGenerator session every row; fallback to session-count if `usage` absent. **"Halt"
+  = graceful `Tunex.shutdown(reason)`** → flush/sync/close handles → `System.halt(1)`.
+- **T5.2** `Tunex.Orchestrator` GenServer — **single seeded-shuffle pass**: boot **preflight** (fail fast
+  w/ guidance, incl. CC smoke test) + reconciliation (#14);
+  per-row flow over the permutation (translate→roundtrip→solve→validate→rule-gen→gate→git→append SFT (synced)
+  →`RowLog.commit/escalate/close`→`Progress.mark_done` **LAST**); advance until killed/exhausted, then
+  exit. **Per-row `try/rescue`** (#13).
+- **T5.3** `Tunex.Application`: supervision tree (Orchestrator child; `:transient`/`:permanent` so an
+  unexpected crash restarts → reconciliation, but `System.halt` ends cleanly); add the row-file `:logger`
+  handler; `mix run --no-halt`.
 
-### M6 — Orchestrator + RowLog + Application + Budget  *(dep: M3,M4,M5)*
-- **T6.1** `Tunex.RowLog` — thin manager of a **native `:logger` file handler** (`:logger_std_h`, NOT a
-  structured logger, NOT `:logger_file_backend`): `open(index)` →
-  `:logger.update_handler_config(:row_file, :config, %{file: ~c"var/run/logs/<index>.log"})` (default
-  console handler + this file handler both at `:debug`); `path/0` returns it (CredenceRuleGenerator reads
-  after a forced filesync); `close/0` **deletes** the file; `escalate(index)` **moves** it to
-  `var/run/escalated/<index>.log`; **`commit(index)` moves it to `var/run/committed/<index>.log`** (rule
-  provenance, #16/Q1). Handler added in `Tunex.Application` (no extra dep). Replaces `TrajectoryLogger`.
-- **T6.2** `Validator` mod: also return the credence-fix **trace** (before / after / `applied_rules`).
-  `applied_rules` + before/after → RowLog (and CredenceRuleGenerator's `bugfix` judgment); the
-  `remaining` issues feed `credence:<rule>` issue-ids (T4.1).
-- **T6.3** `Tunex.Orchestrator` GenServer — **single seeded-shuffle pass**: boot reconciliation
-  (**`git reset --hard HEAD && clean -fd`** — preserve local commits, #15; best-effort push catch-up;
-  recompile; load `gave-up`; load/derive the **shuffle permutation** from the persisted seed; resume via
-  `Progress.load_completed_indices`); per-row flow over the permutation (translate→roundtrip→solve→refine
-  →issue-ids→evolve→append SFT (synced)→**RowLog.commit/escalate/close**→`Progress.mark_done` (**LAST**));
-  advance until killed or dataset exhausted, then exit. **Per-row `try/rescue`**: a row that throws → log
-  it, **`git checkout -- .`** the clone (clear any half-written WIP), skip the row, continue — do NOT crash
-  the loop. Reserve process-crash + supervisor restart + reconciliation for unexpected death (kill/OOM).
-  **No re-passes, no convergence, no wipe, no PassState** — `Progress` suffices for crash-resume.
-- **T6.4** `Tunex.Budget` + **error classification** (depends on T1.4 returning `{:error, {:http,
-  status, body}}`/`{:error, {:network, reason}}`): **fatal** Mimo errors (`401/402/403`, or `429`×N
-  consecutive = out of credits / bad key) → **halt immediately** with a clear message; **transient**
-  (`5xx`/network) → bounded retry+backoff → halt if it won't clear. Always **log raw body** (refine the
-  status→class mapping after first real exhaustion — Xiaomi codes unverified). **Runaway $ ceiling:**
-  accumulate `usage` tokens × configured price from each Mimo response → halt at ceiling (size for
-  prefix-cache busts, #5a/#13); **if Xiaomi omits `usage`, fall back** to a request-count ceiling. Price +
-  ceiling are config values. **"Halt" = a graceful `Tunex.shutdown(reason)`** — log raw body → flush/close
-  RowLog → `File.sync`+close SFT/error/gave-up handles → **`System.halt(1)`** (clean exit, NOT a raise, so
-  the supervisor can't restart into a fatal-error storm; and no torn append-only lines).
-- **T6.5** `Tunex.Application`: supervision tree (Orchestrator child, `:transient`/`:permanent` so an
-  unexpected crash restarts → reconciliation, but `System.halt` ends cleanly); `mix run --no-halt`.
-
-### M7 — Verification  *(dep: all)*
-Port the "## Verification" list into ExUnit + manual checks (v1 still runs; Solve Python-free; RoundTrip
-blacklist; cache hit/miss; GPU-less via `TUNEX_SOLVE_PROVIDER=xiaomi`; issue dedup + `test:generic`
-collapse; issue-id shapes; CredenceRuleGenerator extend/create/bugfix/fail; git `main`-protection; single-pass resume;
-boot recovery; credence `mix test` green).
+### M6 — Verification  *(dep: all)*
+1. `cd v1 && mix run scripts/convert.exs educational_instruct --start 0` → old path runs.
+2. **Solve Python-free:** assembled initial+retry prompts contain no `` ```python `` and not the row's
+   Python source; canonical module/function present in tests+solution.
+3. **RoundTrip:** mistranslated test → reference fails compile/test → row **blacklisted** + skipped; a
+   stylistically-poor-but-passing reference is **not** blacklisted (fix-free runner ignores credo/
+   credence).
+4. **Cache:** row twice → 2nd is a hit; edit translate prompt → miss; truncated translate never cached.
+5. **GPU-less:** `TUNEX_SOLVE_PROVIDER=xiaomi_mimo_2_5_pro mix run --no-halt` runs end-to-end, no local
+   model.
+6. **CredenceRuleGenerator runs every row:** a clean, passing, non-idiomatic row (zero issues) still invokes the agent.
+7. **CredenceRuleGenerator create/extend/bugfix:** novel idiom → new rule + regression test; hallucinated fn → added to
+   an existing conversion-list rule; over-firing rule → bugfixed + a test locking the case.
+8. **Gate:** rejects (a) no new regression test, (b) a test that stays green when the rule is
+   stashed (mutation), (c) a diff touching files outside `lib/`+`test/` (scope), and allows a
+   rename/supersession (delete+add). Pass → `commit → recompile → push origin evolution` (non-fatal push).
+9. **Dedup:** a committed rule's pattern stops recurring in later rows' output (emergent); a dead-end
+   logged to `decisions.md` is not re-attempted (it's inlined into the next prompt).
+10. **CredenceRuleGenerator gave_up / max-turns:** force it → log moved to `escalated/`, working tree clean, dead-end
+    appended to `decisions.md`.
+11. **Git safety:** bot push to `main` rejected (branch protection); push to `evolution` succeeds.
+12. **Mimo exhaustion / runaway:** graceful `shutdown` halts cleanly (handles flushed/synced, no torn
+    lines); ceiling trips on absurd spend; CC `total_cost_usd` ignored, Mimo `usage` accumulated.
+13. **Single pass + resume:** kill mid-run → restart → `Progress` skips done rows, blacklist (cache) +
+    `decisions.md` reload, run continues forward; dataset exhaustion/kill → clean exit.
+14. **Log lifecycle:** a pure convert success leaves **no** log; a gave-up row's log sits in `escalated/`;
+    a rule-committing row's log + CC transcript sit in `committed/`.
+15. **Boot recovery:** kill mid-rule-generation (dirty tree) **+ un-pushed commits** → restart → `reset --hard
+    HEAD` discards WIP but **keeps** un-pushed commits, best-effort push catch-up, credence recompiled.
+16. `cd /home/car/projects/credence && mix test` green before/after.
 
 ### Sequencing
-Critical path **M0 → M1/M2 (parallel) → M3 → M6**; M4 alongside M3; M5 after M2+M4. Earliest runnable
-slice = **M0+M1+M2+M3** (convert loop, no evolve).
+Critical path **M0 → M1/M2 (parallel) → M3 → M5**; M4 after M2+M3. Earliest runnable slice =
+**M0+M1+M2+M3** (convert loop, no evolve).
 
-### Setup prerequisites (user-supplied)
-- `secrets.exs`: Mimo `Authorization` header + endpoint (no git creds in the app — SSH key in the clone).
-- User-cloned `Cinderella-Man/credence` at `/home/car/projects/credence`, **`evolution` branch created**
-  + checked out (only `main` exists today), `origin` pre-authenticated (**SSH key** or credential helper)
-  + commit identity set; `main` branch-protected.
-- Mimo runaway-ceiling $ number (+ per-token price).
+## Unresolved (values/setup, not design)
+- **Mimo values:** context **1M**, max output **131k**; pricing **$1/M in, $3/M out** (≤256K tier; 2×/6×
+  for 256K–1M), cache hit **$0.2–0.4/M in**. TODO: runaway-ceiling **$ number** (size for a CC CredenceRuleGenerator
+  session every row); confirm `max_tokens` vs `max_completion_tokens`; confirm out-of-credit status code
+  (refine classifier after first hit).
+- **Setup (user-owned):** Mimo chat `Authorization` + CC `ANTHROPIC_AUTH_TOKEN` (+ `/anthropic` base URL)
+  in `secrets.exs`. **Claude Code installed** (Node 18+). User clones `Cinderella-Man/credence` at
+  `/home/car/projects/credence`, **creates + checks out `evolution`** (only `main` exists today),
+  `origin` pre-authenticated (SSH key) + commit identity set; `main` branch-protected.
+- **`escalated/` review:** manual-only; no triage workflow.
