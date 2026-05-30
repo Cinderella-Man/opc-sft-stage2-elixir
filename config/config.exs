@@ -70,11 +70,15 @@ config :tunex,
   claude_code: %{
     base_url: "https://token-plan-sgp.xiaomimimo.com/anthropic",
     model: "mimo-v2.5-pro[1m]",
-    max_turns: 30,
-    # Wall-clock safety cap for one rule-gen session (slow Mimo + many turns).
-    # A hung session is killed → treated as gave_up. Lower max_turns to speed
-    # rows up if sessions routinely run long.
-    timeout_ms: 1_200_000
+    # Generous — this runs 24/7 and an hour/rule is still superhuman. These are
+    # backstops, not budgets: a thorough rule-write session (read files → write
+    # rule + test → iterate `mix test`) needs turns, and Mimo is slow. The
+    # runaway-$ ceiling still guards true runaways. `max_turns` is Claude Code's
+    # own turn count (NOT the per-message "step N" in logs).
+    max_turns: 80,
+    # Wall-clock safety cap for one rule-gen session; a hung session is killed →
+    # treated as gave_up.
+    timeout_ms: 3_600_000
   },
 
   # ── Credence clone (path dep target + push origin) ──────────────────

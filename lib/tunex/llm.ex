@@ -65,8 +65,10 @@ defmodule Tunex.LLM do
 
     Logger.debug("""
     [LLM.call] provider=#{active} url=#{url} model=#{body_params[:model]} timeout=#{timeout}ms
-    [LLM.call] system: #{String.slice(system_prompt, 0..120)}…
-    [LLM.call] user: #{String.slice(user_prompt, 0..120)}…
+    [LLM.call] system:
+    #{system_prompt}
+    [LLM.call] user:
+    #{user_prompt}
     """)
 
     t0 = System.monotonic_time(:millisecond)
@@ -122,7 +124,8 @@ defmodule Tunex.LLM do
     usage = body["usage"]
 
     Logger.debug(
-      "[LLM.call] finish=#{finish} len=#{String.length(content)} usage=#{inspect(usage)}"
+      "[LLM.call] finish=#{finish} len=#{String.length(content)} usage=#{inspect(usage)}\n" <>
+        "[LLM.call] response:\n#{content}"
     )
 
     cond do

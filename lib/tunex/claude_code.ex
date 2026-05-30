@@ -8,10 +8,14 @@ defmodule Tunex.ClaudeCode do
   in the credence clone (`cwd`), may Read/Grep/Glob/Edit/Write and run
   `mix test`, but **cannot run git** (disallowed) and has no git creds.
 
-  Uses `--output-format stream-json` over a **Port** so the agent's turns/tool
-  uses are logged **live** (a 30-turn session against slow Mimo can run many
-  minutes with no other visible output), and a **wall-clock timeout** kills a
-  hung session → reported as `gave_up` rather than blocking the loop forever.
+  Uses `--output-format stream-json` over a **Port** so the agent's steps/tool
+  uses are logged **live** (a long session against slow Mimo can run many minutes
+  with no other visible output), and a **wall-clock timeout** kills a hung
+  session → reported as `gave_up` rather than blocking the loop forever.
+
+  NOTE: the logged `step N` counts streamed assistant messages — it is NOT Claude
+  Code's `num_turns` (which `--max-turns` caps). Mimo emits several messages per
+  turn, so `step` runs well ahead of the real turn count.
 
   The prompt is fed via **stdin** (a row's raw log can exceed the 128KB single-
   argument limit), through a temp file + `bash -c "exec claude … < file"`.
@@ -75,7 +79,7 @@ defmodule Tunex.ClaudeCode do
       ])
 
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    collect(port, %{buffer: "", result: nil, turns: 0}, deadline, max_turns)
+    collect(port, %{buffer: "", result: nil, steps: 0}, deadline, max_turns)
   end
 
   defp collect(port, acc, deadline, max_turns) do
@@ -84,7 +88,7 @@ defmodule Tunex.ClaudeCode do
     if remaining <= 0 do
       kill(port)
       Logger.warning("[ClaudeCode] TIMEOUT — killing agent (treated as gave_up)")
-      {:ok, timeout_result(acc.turns)}
+      {:ok, timeout_result(acc.steps)}
     else
       receive do
         {^port, {:data, chunk}} ->
@@ -97,7 +101,7 @@ defmodule Tunex.ClaudeCode do
         remaining ->
           kill(port)
           Logger.warning("[ClaudeCode] TIMEOUT — killing agent (treated as gave_up)")
-          {:ok, timeout_result(acc.turns)}
+          {:ok, timeout_result(acc.steps)}
       end
     end
   end
@@ -120,9 +124,12 @@ defmodule Tunex.ClaudeCode do
 
   defp handle_event(acc, %{"type" => "assistant", "message" => %{"content" => content}})
        when is_list(content) do
-    turns = acc.turns + 1
-    Enum.each(content, &log_block(&1, turns))
-    %{acc | turns: turns}
+    # `steps` counts streamed assistant MESSAGES (for progress logging only) —
+    # this is NOT Claude Code's `num_turns` that `--max-turns` caps (Mimo emits
+    # several messages per turn). The authoritative count is in the result event.
+    steps = acc.steps + 1
+    Enum.each(content, &log_block(&1, steps))
+    %{acc | steps: steps}
   end
 
   defp handle_event(acc, %{"type" => "system", "subtype" => "init"}) do
@@ -132,27 +139,33 @@ defmodule Tunex.ClaudeCode do
 
   defp handle_event(acc, _event), do: acc
 
-  defp log_block(%{"type" => "tool_use", "name" => name, "input" => input}, turn) do
-    Logger.info("[ClaudeCode] turn #{turn}: #{name} #{tool_brief(name, input)}")
+  # Full, untruncated logging — the whole point is to see exactly what the agent
+  # did (including the full rule code it Writes/Edits).
+  defp log_block(%{"type" => "tool_use", "name" => name, "input" => input}, step) do
+    Logger.info("[ClaudeCode] step #{step}: #{name}\n#{format_tool_input(input)}")
   end
 
-  defp log_block(%{"type" => "text", "text" => text}, turn) do
-    snippet = text |> String.trim() |> String.slice(0, 120)
-    if snippet != "", do: Logger.info("[ClaudeCode] turn #{turn} says: #{snippet}")
+  defp log_block(%{"type" => "text", "text" => text}, step) do
+    text = String.trim(text)
+    if text != "", do: Logger.info("[ClaudeCode] step #{step} says:\n#{text}")
   end
 
   defp log_block(_, _), do: :ok
 
-  defp tool_brief("Bash", %{"command" => cmd}), do: String.slice(cmd, 0, 100)
-  defp tool_brief(_name, %{"file_path" => path}), do: path
-  defp tool_brief(_name, %{"pattern" => p}), do: inspect(p)
-  defp tool_brief(_name, _input), do: ""
+  defp format_tool_input(input) when is_map(input) do
+    Enum.map_join(input, "\n", fn {k, v} -> "    #{k}: #{render(v)}" end)
+  end
+
+  defp format_tool_input(other), do: inspect(other, limit: :infinity, printable_limit: :infinity)
+
+  defp render(v) when is_binary(v), do: v
+  defp render(v), do: inspect(v, limit: :infinity, printable_limit: :infinity)
 
   # ── Finalize ────────────────────────────────────────────────────────
 
   defp finalize(%{result: nil} = acc, code, _max_turns) do
     Logger.error("[ClaudeCode] process exited #{code} with no result event")
-    {:error, {:no_result, code, acc.turns}}
+    {:error, {:no_result, code, acc.steps}}
   end
 
   defp finalize(%{result: event}, exit_code, max_turns) do
@@ -179,11 +192,11 @@ defmodule Tunex.ClaudeCode do
      }}
   end
 
-  defp timeout_result(turns) do
+  defp timeout_result(steps) do
     %{
       result_text: "",
       usage: nil,
-      num_turns: turns,
+      num_turns: steps,
       subtype: "error_timeout",
       is_error: true,
       exit_code: nil,

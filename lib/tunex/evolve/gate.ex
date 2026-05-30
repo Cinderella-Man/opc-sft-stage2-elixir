@@ -157,7 +157,7 @@ defmodule Tunex.Evolve.Gate do
         env: [{"MIX_ENV", "test"}]
       )
 
-    Logger.debug("[Gate] mix test #{inspect(files)} exit=#{code}\n#{String.slice(out, 0, 2000)}")
+    Logger.debug("[Gate] mix test #{inspect(files)} exit=#{code}\n#{out}")
     code
   end
 

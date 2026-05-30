@@ -93,7 +93,7 @@ defmodule Tunex.Preflight do
 
     case git(clone, ["push", "origin", @branch]) do
       {_o, 0} -> Logger.info("[Preflight] push catch-up OK")
-      {o, c} -> Logger.warning("[Preflight] push catch-up failed (exit #{c}, non-fatal): #{String.slice(o, 0, 200)}")
+      {o, c} -> Logger.warning("[Preflight] push catch-up failed (exit #{c}, non-fatal): #{o}")
     end
 
     # The Gate + the CC agent run `mix test` directly in the clone, so the
@@ -124,7 +124,7 @@ defmodule Tunex.Preflight do
   defp cc_smoke! do
     case Tunex.ClaudeCode.run("reply with exactly: OK", max_turns: 1) do
       {:ok, %{result_text: text}} ->
-        Logger.info("[Preflight] CC smoke OK: #{String.slice(text, 0, 60)}")
+        Logger.info("[Preflight] CC smoke OK: #{text}")
 
       other ->
         fail("""
@@ -155,7 +155,7 @@ defmodule Tunex.Preflight do
       System.cmd("mix", ["compile"], cd: clone, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
 
     unless code == 0 do
-      fail("Credence does not compile in #{clone}:\n#{String.slice(out, 0, 800)}")
+      fail("Credence does not compile in #{clone}:\n#{out}")
     end
   end
 

@@ -353,7 +353,7 @@ defmodule Tunex.Validator do
       code != 0 ->
         # Script crashed or credence not available
         Logger.warning(
-          "[run_credence_fix] script error (exit #{code}): #{String.slice(String.trim(output), 0, 200)}"
+          "[run_credence_fix] script error (exit #{code}): #{String.trim(output)}"
         )
 
         :error

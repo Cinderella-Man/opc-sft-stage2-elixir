@@ -26,30 +26,57 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
   alias Tunex.Evolve.{Gate, Git, Ledger}
 
   @task ~S"""
-  You are improving Credence — an Elixir AST linter — by writing, extending, or
-  fixing rules. You are running inside the credence repo (your cwd). Read/Grep
-  rule files under lib/{pattern,syntax,semantic} as needed; the phase
-  dispatchers are lib/{pattern,syntax,semantic}.ex and helpers are
-  lib/rule_helpers.ex / lib/function_matcher.ex.
+  You improve Credence — an Elixir AST linter — by writing/extending/fixing
+  deterministic rules. You run inside the credence repo (your cwd). You have a
+  LIMITED turn budget and the model is slow — be DECISIVE and EFFICIENT. Reading
+  many files wastes the whole budget; don't.
 
-  Below is the full raw log of ONE converted SFT row: the Elixir solution our
-  local model produced, plus Credence's before/after fix trace (the
-  APPLIED_RULES line). The most valuable signal is CLEAN, PASSING,
-  NON-IDIOMATIC code — code that compiles, passes its tests, and trips no
-  Credence issue, yet a human Elixir expert would deterministically rewrite.
+  Follow this order strictly:
 
-  Task: do you see ANY opportunity, even the smallest, to deterministically
-  improve this output code with a NEW or EXTENDED rule? Or any bug in an
-  existing rule visible in the fix trace?
+  1. STUDY THE GENERATED CODE in the "Row log" section below (the Elixir solution
+     our local model produced, plus Credence's before/after fix trace). The most
+     valuable signal is CLEAN, PASSING, NON-IDIOMATIC code — it compiles, passes
+     its tests, trips no Credence issue, yet a human expert would deterministically
+     rewrite it. Decide the SINGLE most promising deterministic rewrite, or that
+     there is none. Micro-rules ARE welcome — a genuine deterministic improvement
+     is worth a rule even if small (a Gate + mutation test validate it before it
+     lands, so err toward proposing). But do NOT invent a rule for code that is
+     already idiomatic and correct.
 
-  If yes: implement it (Edit/Write under lib/), add a regression test under
-  test/ that FAILS without your rule (ideally also a must-NOT-fire-on-good-code
-  case), iterate with `mix test test/<phase>/<rule>_test.exs`, and run the full
-  `mix test` once before finishing. Do NOT run git — you cannot commit.
+     Apply the idiomatic-Elixir lens hard: would an expert express this with
+     `Enum.sum/all?/any?/map/reduce/with_index`, a comprehension, the pipe,
+     pattern matching, or guards? This INCLUDES rewrites that change a function's
+     PARAMETER SHAPE — e.g. a fixed-size list destructured only to aggregate its
+     elements (`def f([a, b, c, d]), do: a + b + c + d`) can take the list
+     directly and use `Enum.sum`. Do NOT dismiss an improvement merely because the
+     bound variables are reused — consider restructuring the head. BUT a linter
+     PRESERVES the computation exactly: never propose an ALGORITHMIC/mathematical
+     optimization that relies on domain insight (e.g. "just check the largest
+     element" instead of all of them) — that changes behavior-by-reasoning, not
+     form, and is out of scope.
+
+  2. The "Existing rules" section below lists EVERY rule by name (they are named
+     for what they forbid). Scan it. If a rule already covers your idea → there is
+     no opportunity. Otherwise Read AT MOST 2-3 rule files — only the ones whose
+     names look related — to confirm novelty and learn the rule + test format
+     (the phase dispatchers are lib/{pattern,syntax,semantic}.ex; helpers are
+     lib/rule_helpers.ex / lib/function_matcher.ex). DO NOT browse all rules.
+
+  3. If your idea is novel, deterministic, and SAFE (must never rewrite already-
+     idiomatic correct code): implement the rule under lib/<phase>/, add a
+     regression test under test/<phase>/ that FAILS without the rule (ideally also
+     a must-NOT-fire-on-good-code case), run `mix test test/<phase>/<rule>_test.exs`
+     until green, then run the full `mix test` ONCE. You cannot run git.
+
+  4. Reserve `no_opportunity` for code that is genuinely ALREADY idiomatic. If you
+     SEE a real idiomatic/deterministic gap but cannot land a clean,
+     behavior-preserving rule for it, answer `gave_up: <pattern + snippet>` — it
+     is escalated for a human to review (valuable, not a failure). Don't keep
+     reading files just to be sure.
 
   End your FINAL message with EXACTLY ONE of these lines:
-    DECISION: no_opportunity
-    DECISION: gave_up: <pattern + minimal snippet>
+    DECISION: no_opportunity     (the code is genuinely already idiomatic)
+    DECISION: gave_up: <pattern + minimal snippet>   (real gap, no clean rule landed)
     DECISION: <one-line description of the rule you added/extended/fixed>
   """
 
@@ -60,7 +87,7 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
   def run(index, clone \\ Config.credence_clone()) do
     RowLog.filesync()
     log = File.read!(RowLog.path(index))
-    prompt = build_prompt(log, Ledger.read())
+    prompt = build_prompt(log, Ledger.read(), rule_index(clone))
 
     case ClaudeCode.run(prompt, cwd: clone) do
       {:ok, result} ->
@@ -75,12 +102,15 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
     end
   end
 
-  @doc "Build the rule-gen prompt: task + ledger + raw row log."
-  def build_prompt(row_log, ledger) do
+  @doc "Build the rule-gen prompt: task + rule index + ledger + raw row log."
+  def build_prompt(row_log, ledger, rule_index) do
     ledger_section = if String.trim(ledger) == "", do: "none", else: ledger
 
     """
     #{@task}
+
+    ## Existing rules (by name — scan this, do NOT read them all)
+    #{rule_index}
 
     ## Dead-ends already tried (do NOT retry these)
     #{ledger_section}
@@ -88,6 +118,16 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
     ## Row log
     #{row_log}
     """
+  end
+
+  @doc "Compact index of existing rules: `<phase>/<rule_name>` per line."
+  def rule_index(clone) do
+    for phase <- ~w(pattern syntax semantic),
+        file <- Path.wildcard(Path.join(clone, "lib/#{phase}/*.ex")) do
+      "#{phase}/#{Path.basename(file, ".ex")}"
+    end
+    |> Enum.sort()
+    |> Enum.join("\n")
   end
 
   # ── Routing ─────────────────────────────────────────────────────────

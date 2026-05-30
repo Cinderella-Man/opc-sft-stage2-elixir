@@ -37,7 +37,7 @@ defmodule Tunex.Evolve.Git do
         :ok
 
       {out, code} ->
-        Logger.error("[Git] commit failed (exit #{code}): #{String.slice(out, 0, 400)}")
+        Logger.error("[Git] commit failed (exit #{code}): #{out}")
         {:error, {:commit_failed, code}}
     end
   end
@@ -65,7 +65,7 @@ defmodule Tunex.Evolve.Git do
         :ok
 
       {out, code} ->
-        Logger.warning("[Git] push failed (exit #{code}, non-fatal): #{String.slice(out, 0, 300)}")
+        Logger.warning("[Git] push failed (exit #{code}, non-fatal): #{out}")
         :ok
     end
   end
