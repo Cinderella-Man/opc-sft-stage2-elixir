@@ -8,15 +8,17 @@ defmodule Tunex.ClaudeCode do
   in the credence clone (`cwd`), may Read/Grep/Glob/Edit/Write and run
   `mix test`, but **cannot run git** (disallowed) and has no git creds.
 
-  The prompt is fed via **stdin** (a row's raw log can exceed the 128KB single-
-  argument limit), through a temp file + `bash -c "claude … < file"` so each
-  variadic tool arg is shell-escaped exactly once.
+  Uses `--output-format stream-json` over a **Port** so the agent's turns/tool
+  uses are logged **live** (a 30-turn session against slow Mimo can run many
+  minutes with no other visible output), and a **wall-clock timeout** kills a
+  hung session → reported as `gave_up` rather than blocking the loop forever.
 
-  Returns `{:ok, result}` where result has `:result_text`, `:usage`,
-  `:num_turns`, `:subtype`, `:is_error`, `:decision`, and `:raw`; or
-  `{:error, reason}`. `:decision` is the parsed three-way verb (see
-  `parse_decision/3`); a max-turns-without-finish run is reported as
-  `{:gave_up, "max turns reached"}`.
+  The prompt is fed via **stdin** (a row's raw log can exceed the 128KB single-
+  argument limit), through a temp file + `bash -c "exec claude … < file"`.
+
+  Returns `{:ok, result}` (`:result_text`, `:usage`, `:num_turns`, `:subtype`,
+  `:is_error`, `:decision`, `:raw`) or `{:error, reason}`. A timeout or a
+  max-turns-without-finish run yields `decision: {:gave_up, …}`.
   """
 
   require Logger
@@ -26,10 +28,11 @@ defmodule Tunex.ClaudeCode do
   @allowed_tools ~w(Read Grep Glob Edit Write) ++ ["Bash(mix test:*)"]
   @disallowed_tools ["Bash(git:*)"]
 
-  @doc "Run the agent with `prompt`. `opts`: `:cwd`, `:max_turns`."
+  @doc "Run the agent with `prompt`. `opts`: `:cwd`, `:max_turns`, `:timeout_ms`."
   def run(prompt, opts \\ []) do
     clone = Keyword.get(opts, :cwd, Config.credence_clone())
     max_turns = Keyword.get(opts, :max_turns, Config.cc_max_turns())
+    timeout_ms = Keyword.get(opts, :timeout_ms, Config.cc_timeout_ms())
 
     prompt_file =
       Path.join(System.tmp_dir!(), "tunex_cc_prompt_#{System.unique_integer([:positive])}.txt")
@@ -37,25 +40,18 @@ defmodule Tunex.ClaudeCode do
     File.write!(prompt_file, prompt)
 
     args =
-      ["-p", "--output-format", "json", "--add-dir", clone] ++
+      ["-p", "--output-format", "stream-json", "--verbose", "--add-dir", clone] ++
         ["--allowedTools"] ++ @allowed_tools ++
         ["--disallowedTools"] ++ @disallowed_tools ++
         ["--max-turns", to_string(max_turns)]
 
-    script = "claude " <> Enum.map_join(args, " ", &shq/1) <> " < " <> shq(prompt_file)
+    script = "exec claude " <> Enum.map_join(args, " ", &shq/1) <> " < " <> shq(prompt_file)
 
-    env = [
-      {"ANTHROPIC_BASE_URL", Config.cc_base_url()},
-      {"ANTHROPIC_AUTH_TOKEN", Config.cc_auth_token()},
-      {"ANTHROPIC_MODEL", Config.cc_model()}
-    ]
-
-    Logger.info("[ClaudeCode] running agent (cwd=#{clone}, max_turns=#{max_turns})")
+    Logger.info("[ClaudeCode] running agent (cwd=#{clone}, max_turns=#{max_turns}, timeout=#{div(timeout_ms, 1000)}s)")
 
     result =
       try do
-        {out, code} = System.cmd("bash", ["-c", script], cd: clone, env: env)
-        parse(out, code, max_turns)
+        run_port(script, clone, timeout_ms, max_turns)
       after
         File.rm(prompt_file)
       end
@@ -63,36 +59,140 @@ defmodule Tunex.ClaudeCode do
     result
   end
 
-  # ── Parsing ─────────────────────────────────────────────────────────
+  # ── Port: spawn, stream, timeout ────────────────────────────────────
 
-  defp parse(out, exit_code, max_turns) do
-    case Jason.decode(out) do
-      {:ok, json} ->
-        result_text = json["result"] || ""
-        subtype = json["subtype"]
-        num_turns = json["num_turns"] || 0
-        is_error = json["is_error"] || false
+  defp run_port(script, clone, timeout_ms, max_turns) do
+    bash = System.find_executable("bash") || "/bin/bash"
 
-        # Feed CC usage to Budget (ignore CC's total_cost_usd — wrong for Mimo).
-        if is_map(json["usage"]), do: Tunex.Budget.record(json["usage"], :cc)
+    port =
+      Port.open({:spawn_executable, bash}, [
+        :binary,
+        :exit_status,
+        :hide,
+        args: ["-c", script],
+        cd: String.to_charlist(clone),
+        env: cc_env()
+      ])
 
-        {:ok,
-         %{
-           result_text: result_text,
-           usage: json["usage"],
-           num_turns: num_turns,
-           subtype: subtype,
-           is_error: is_error,
-           exit_code: exit_code,
-           decision: parse_decision(result_text, subtype, num_turns >= max_turns),
-           raw: json
-         }}
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    collect(port, %{buffer: "", result: nil, turns: 0}, deadline, max_turns)
+  end
 
-      {:error, reason} ->
-        Logger.error("[ClaudeCode] non-JSON output (exit #{exit_code}): #{String.slice(out, 0, 400)}")
-        {:error, {:bad_json, reason, out}}
+  defp collect(port, acc, deadline, max_turns) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      kill(port)
+      Logger.warning("[ClaudeCode] TIMEOUT — killing agent (treated as gave_up)")
+      {:ok, timeout_result(acc.turns)}
+    else
+      receive do
+        {^port, {:data, chunk}} ->
+          acc = handle_chunk(acc, chunk)
+          collect(port, acc, deadline, max_turns)
+
+        {^port, {:exit_status, code}} ->
+          finalize(acc, code, max_turns)
+      after
+        remaining ->
+          kill(port)
+          Logger.warning("[ClaudeCode] TIMEOUT — killing agent (treated as gave_up)")
+          {:ok, timeout_result(acc.turns)}
+      end
     end
   end
+
+  # Accumulate stdout, split complete NDJSON lines, log progress, capture the
+  # final `result` event.
+  defp handle_chunk(acc, chunk) do
+    {lines, rest} = split_lines(acc.buffer <> chunk)
+    acc = %{acc | buffer: rest}
+
+    Enum.reduce(lines, acc, fn line, acc ->
+      case Jason.decode(line) do
+        {:ok, event} -> handle_event(acc, event)
+        {:error, _} -> acc
+      end
+    end)
+  end
+
+  defp handle_event(acc, %{"type" => "result"} = event), do: %{acc | result: event}
+
+  defp handle_event(acc, %{"type" => "assistant", "message" => %{"content" => content}})
+       when is_list(content) do
+    turns = acc.turns + 1
+    Enum.each(content, &log_block(&1, turns))
+    %{acc | turns: turns}
+  end
+
+  defp handle_event(acc, %{"type" => "system", "subtype" => "init"}) do
+    Logger.info("[ClaudeCode] agent session started")
+    acc
+  end
+
+  defp handle_event(acc, _event), do: acc
+
+  defp log_block(%{"type" => "tool_use", "name" => name, "input" => input}, turn) do
+    Logger.info("[ClaudeCode] turn #{turn}: #{name} #{tool_brief(name, input)}")
+  end
+
+  defp log_block(%{"type" => "text", "text" => text}, turn) do
+    snippet = text |> String.trim() |> String.slice(0, 120)
+    if snippet != "", do: Logger.info("[ClaudeCode] turn #{turn} says: #{snippet}")
+  end
+
+  defp log_block(_, _), do: :ok
+
+  defp tool_brief("Bash", %{"command" => cmd}), do: String.slice(cmd, 0, 100)
+  defp tool_brief(_name, %{"file_path" => path}), do: path
+  defp tool_brief(_name, %{"pattern" => p}), do: inspect(p)
+  defp tool_brief(_name, _input), do: ""
+
+  # ── Finalize ────────────────────────────────────────────────────────
+
+  defp finalize(%{result: nil} = acc, code, _max_turns) do
+    Logger.error("[ClaudeCode] process exited #{code} with no result event")
+    {:error, {:no_result, code, acc.turns}}
+  end
+
+  defp finalize(%{result: event}, exit_code, max_turns) do
+    result_text = event["result"] || ""
+    subtype = event["subtype"]
+    num_turns = event["num_turns"] || 0
+    is_error = event["is_error"] || false
+
+    # Feed CC usage to Budget (ignore CC's total_cost_usd — wrong for Mimo).
+    if is_map(event["usage"]), do: Tunex.Budget.record(event["usage"], :cc)
+
+    Logger.info("[ClaudeCode] agent done — subtype=#{subtype} turns=#{num_turns}")
+
+    {:ok,
+     %{
+       result_text: result_text,
+       usage: event["usage"],
+       num_turns: num_turns,
+       subtype: subtype,
+       is_error: is_error,
+       exit_code: exit_code,
+       decision: parse_decision(result_text, subtype, num_turns >= max_turns),
+       raw: event
+     }}
+  end
+
+  defp timeout_result(turns) do
+    %{
+      result_text: "",
+      usage: nil,
+      num_turns: turns,
+      subtype: "error_timeout",
+      is_error: true,
+      exit_code: nil,
+      decision: {:gave_up, "timeout"},
+      raw: %{"subtype" => "error_timeout"}
+    }
+  end
+
+  # ── DECISION parsing ────────────────────────────────────────────────
 
   @doc """
   Parse the agent's three-way `DECISION:` verb.
@@ -110,12 +210,15 @@ defmodule Tunex.ClaudeCode do
     case Regex.run(~r/^\s*DECISION:\s*(.+)$/m, result_text) do
       [_, rest] ->
         rest = String.trim(rest)
+
         cond do
           String.starts_with?(rest, "no_opportunity") ->
             :no_opportunity
 
           String.starts_with?(rest, "gave_up") ->
-            detail = rest |> String.replace_prefix("gave_up", "") |> String.trim_leading(":") |> String.trim()
+            detail =
+              rest |> String.replace_prefix("gave_up", "") |> String.trim_leading(":") |> String.trim()
+
             {:gave_up, detail}
 
           true ->
@@ -124,6 +227,36 @@ defmodule Tunex.ClaudeCode do
 
       nil ->
         {:gave_up, "no DECISION line"}
+    end
+  end
+
+  # ── Helpers ─────────────────────────────────────────────────────────
+
+  defp cc_env do
+    [
+      {~c"ANTHROPIC_BASE_URL", String.to_charlist(Config.cc_base_url())},
+      {~c"ANTHROPIC_AUTH_TOKEN", String.to_charlist(Config.cc_auth_token())},
+      {~c"ANTHROPIC_MODEL", String.to_charlist(Config.cc_model())}
+    ]
+  end
+
+  defp split_lines(data) do
+    parts = String.split(data, "\n")
+    {complete, [rest]} = Enum.split(parts, -1)
+    {complete, rest}
+  end
+
+  defp kill(port) do
+    # Close the port (SIGKILLs the spawned bash/claude). `exec` in the script
+    # means the port's process IS claude, so this stops the agent directly.
+    try do
+      info = Port.info(port)
+      Port.close(port)
+      if info && info[:os_pid], do: System.cmd("kill", ["-9", to_string(info[:os_pid])], stderr_to_stdout: true)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
     end
   end
 

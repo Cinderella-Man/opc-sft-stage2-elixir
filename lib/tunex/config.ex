@@ -37,6 +37,7 @@ defmodule Tunex.Config do
   def cc_base_url, do: Map.fetch!(claude_code(), :base_url)
   def cc_model, do: Map.fetch!(claude_code(), :model)
   def cc_max_turns, do: Map.get(claude_code(), :max_turns, 30)
+  def cc_timeout_ms, do: Map.get(claude_code(), :timeout_ms, 1_200_000)
   def cc_auth_token, do: Application.fetch_env!(:tunex, :claude_code_auth_token)
 
   # ── Paths ───────────────────────────────────────────────────────────

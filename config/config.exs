@@ -70,7 +70,11 @@ config :tunex,
   claude_code: %{
     base_url: "https://token-plan-sgp.xiaomimimo.com/anthropic",
     model: "mimo-v2.5-pro[1m]",
-    max_turns: 30
+    max_turns: 30,
+    # Wall-clock safety cap for one rule-gen session (slow Mimo + many turns).
+    # A hung session is killed → treated as gave_up. Lower max_turns to speed
+    # rows up if sessions routinely run long.
+    timeout_ms: 1_200_000
   },
 
   # ── Credence clone (path dep target + push origin) ──────────────────
