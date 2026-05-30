@@ -135,23 +135,34 @@ defmodule Tunex.Workspace do
 
   # ── Internal ────────────────────────────────────────────────────────
 
+  # A COMPLETE `defp deps do … end` function (including the closing `end`). The
+  # leading 2-space indent is supplied by the surrounding mix.exs; the match
+  # consumes through `\n  end`, so this replacement ends with `  end`.
   defp deps_block do
     clone = Config.credence_clone()
 
-    ~s"""
-    defp deps do
-        [
-          {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-          {:credence, path: "#{clone}", only: [:dev, :test], runtime: false}
-        ]
-    """
+    ~s(defp deps do\n) <>
+      ~s(    [\n) <>
+      ~s(      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},\n) <>
+      ~s(      {:credence, path: "#{clone}", only: [:dev, :test], runtime: false}\n) <>
+      ~s(    ]\n  end)
   end
 
+  # Replace the ENTIRE deps function (`defp deps do` … first `\n  end`). Using a
+  # function replacement (not a pattern string) avoids `\`-escaping surprises and
+  # — critically — is idempotent: re-running on an already-injected mix.exs
+  # rematches the whole function instead of truncating at the first `]` (the
+  # `[:dev, :test]` in the credo line), which previously corrupted the file.
   defp inject_deps(path) do
     mix_exs = Path.join(path, "mix.exs")
-    content = File.read!(mix_exs)
-    fixed = Regex.replace(~r/defp deps do\n\s+\[.*?\]/s, content, deps_block())
-    File.write!(mix_exs, fixed)
+    File.write!(mix_exs, rewrite_deps(File.read!(mix_exs)))
+  end
+
+  @doc false
+  # Pure mix.exs rewrite (exposed for regression tests). Idempotent.
+  def rewrite_deps(content) do
+    block = deps_block()
+    Regex.replace(~r/defp deps do.*?\n  end/s, content, fn _ -> block end)
   end
 
   defp write_credo_config(path) do
