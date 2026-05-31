@@ -55,6 +55,18 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
      element" instead of all of them) — that changes behavior-by-reasoning, not
      form, and is out of scope.
 
+  1b. SECOND SIGNAL — the Credence FIX TRACE (the APPLIED_RULES line + every
+      before/after pair in the log). Scrutinize each fix Credence ALREADY applied:
+      did it actually IMPROVE the code, or did it make it MORE VERBOSE / WORSE /
+      WRONG, or fire on code that was already fine? A fix that worsens or
+      over-fires is a BUG in that EXISTING rule, and fixing it is JUST AS VALUABLE
+      as a new rule — do NOT dismiss it as "not a new rule." Example: a rule that
+      rewrites a clean `freq |> Map.keys() |> Enum.sort()` into a more verbose
+      `Enum.map(Enum.sort_by(freq, ...), ...)` is over-firing and should be
+      narrowed. To fix an existing rule: edit it under lib/<phase>/ to narrow its
+      match / repair its rewrite / guard the good case, and add or adjust its test
+      so the test FAILS without your fix (the Gate mutation check needs that).
+
   2. The "Existing rules" section below lists EVERY rule by name (they are named
      for what they forbid). Scan it. If a rule already covers your idea → there is
      no opportunity. Otherwise Read AT MOST 2-3 rule files — only the ones whose
