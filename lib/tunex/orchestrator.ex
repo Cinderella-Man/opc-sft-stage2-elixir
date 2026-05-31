@@ -47,6 +47,7 @@ defmodule Tunex.Orchestrator do
 
     out = open_synced(Config.run_path("elixir_sft_#{subset}.jsonl"))
     err = open_synced(Config.run_path("elixir_sft_#{subset}_errors.jsonl"))
+    rowstat = open_synced(Config.run_path("rows.jsonl"))
     :persistent_term.put({Tunex, :sft_out}, out)
     :persistent_term.put({Tunex, :sft_err}, err)
 
@@ -61,8 +62,11 @@ defmodule Tunex.Orchestrator do
       progress_path: progress_path,
       out: out,
       err: err,
+      rowstat: rowstat,
       transient_retries: Map.get(budget, :transient_retries, 5),
-      transient_backoff_ms: Map.get(budget, :transient_backoff_ms, 2_000)
+      transient_backoff_ms: Map.get(budget, :transient_backoff_ms, 2_000),
+      started_mono: System.monotonic_time(:millisecond),
+      done: 0
     }
 
     send(self(), :next)
@@ -80,8 +84,23 @@ defmodule Tunex.Orchestrator do
 
   def handle_info(:next, %{pending: [idx | rest]} = state) do
     run_row(idx, state)
+    state = %{state | pending: rest, done: state.done + 1}
+    log_progress(state)
     send(self(), :next)
-    {:noreply, %{state | pending: rest}}
+    {:noreply, state}
+  end
+
+  # Live trajectory line after every row: throughput + projected daily burn.
+  defp log_progress(state) do
+    hrs = max((System.monotonic_time(:millisecond) - state.started_mono) / 3_600_000, 1.0e-9)
+    spent = Budget.spent()
+    rate = state.done / hrs
+
+    Logger.info(
+      "[progress] session_rows=#{state.done} (#{length(state.pending)} pending) " <>
+        "elapsed=#{Float.round(hrs, 2)}h rate=#{Float.round(rate, 1)} rows/hr " <>
+        "est=$#{Float.round(spent, 4)} → ~$#{Float.round(spent / hrs * 24, 2)}/day"
+    )
   end
 
   # ── Per-row ─────────────────────────────────────────────────────────
@@ -94,32 +113,44 @@ defmodule Tunex.Orchestrator do
       discard_clone()
       safe_close_log(idx)
       append_error(state, %{index: idx, failure_reason: "exception: #{Exception.message(e)}"})
+      write_row_stat(state, %{index: idx, ts: System.os_time(:second), outcome: :exception})
       Progress.mark_done(state.progress_path, idx)
   end
 
   defp do_row(idx, state) do
     t0 = System.monotonic_time(:millisecond)
+    spent0 = Budget.spent()
+    Budget.set_row(idx)
     RowLog.open(idx)
     row = build_row(elem(state.rows, idx))
     Logger.info("[idx=#{idx}] entry_point=#{row.entry_point}")
 
-    case stage(fn -> RoundTrip.ensure(row, state.workspace) end, state) do
-      {:ok, payload, src} ->
-        Logger.info("[idx=#{idx}] translation #{src} — solving")
-        solve_and_finish(idx, row, payload, state)
+    stat =
+      case stage(fn -> RoundTrip.ensure(row, state.workspace) end, state) do
+        {:ok, payload, src} ->
+          Logger.info("[idx=#{idx}] translation #{src} — solving")
+          solve_and_finish(idx, row, payload, src, state)
 
-      {:blacklist, reason} ->
-        Logger.info("[idx=#{idx}] blacklisted (#{reason}) — skipping")
-        append_error(state, %{index: idx, original_entry_point: row.entry_point, failure_reason: "blacklist:#{reason}"})
-        RowLog.close(idx)
-        Progress.mark_done(state.progress_path, idx)
-    end
+        {:blacklist, reason} ->
+          Logger.info("[idx=#{idx}] blacklisted (#{reason}) — skipping")
+          append_error(state, %{index: idx, original_entry_point: row.entry_point, failure_reason: "blacklist:#{reason}"})
+          RowLog.close(idx)
+          Progress.mark_done(state.progress_path, idx)
+          %{translate: :blacklist, blacklist: reason}
+      end
 
     elapsed = Float.round((System.monotonic_time(:millisecond) - t0) / 1000, 1)
-    Logger.info("[idx=#{idx}] finished in #{elapsed}s")
+    cost_est = Float.round(Budget.spent() - spent0, 6)
+
+    write_row_stat(
+      state,
+      Map.merge(%{index: idx, ts: System.os_time(:second), elapsed_s: elapsed, cost_est: cost_est}, stat)
+    )
+
+    Logger.info("[idx=#{idx}] finished in #{elapsed}s (est $#{cost_est})")
   end
 
-  defp solve_and_finish(idx, row, payload, state) do
+  defp solve_and_finish(idx, row, payload, src, state) do
     solve =
       stage(
         fn -> Solve.run(payload.instruction, payload.test, row.entry_point, state.workspace) end,
@@ -137,7 +168,7 @@ defmodule Tunex.Orchestrator do
 
     # Rule-gen runs on EVERY row that reached Solve (success or failed); it reads
     # the row log and routes its fate (delete / escalate / commit) itself.
-    safe_rule_gen(idx)
+    rg = safe_rule_gen(idx)
 
     # SFT append is based on Solve (step 5), independent of rule-gen (step 6).
     case record do
@@ -146,6 +177,14 @@ defmodule Tunex.Orchestrator do
     end
 
     Progress.mark_done(state.progress_path, idx)
+
+    %{
+      translate: src,
+      solve: solve_tag(solve),
+      solve_attempts: solve_attempts(solve),
+      rulegen: rg_outcome(rg),
+      decision: rg_decision(rg)
+    }
   end
 
   defp safe_rule_gen(idx) do
@@ -155,7 +194,24 @@ defmodule Tunex.Orchestrator do
       Logger.error("[idx=#{idx}] rule-gen raised: #{Exception.message(e)} — discarding clone")
       discard_clone()
       safe_close_log(idx)
+      %{outcome: :raised, decision: nil}
   end
+
+  defp solve_tag({:ok, _}), do: :ok
+  defp solve_tag({:failed, _}), do: :failed
+  defp solve_tag(_), do: :unknown
+
+  defp solve_attempts({:ok, sr}), do: sr[:attempts]
+  defp solve_attempts({:failed, info}), do: info[:attempts]
+  defp solve_attempts(_), do: nil
+
+  defp rg_outcome(%{outcome: o}), do: o
+  defp rg_outcome(_), do: nil
+
+  defp rg_decision(%{decision: d}) when not is_nil(d), do: inspect(d)
+  defp rg_decision(_), do: nil
+
+  defp write_row_stat(state, map), do: append_synced(state.rowstat, map)
 
   # ── API-error retry / backoff / shutdown ────────────────────────────
 

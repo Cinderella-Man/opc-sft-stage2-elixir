@@ -175,7 +175,8 @@ defmodule Tunex.ClaudeCode do
     is_error = event["is_error"] || false
 
     # Feed CC usage to Budget (ignore CC's total_cost_usd — wrong for Mimo).
-    if is_map(event["usage"]), do: Tunex.Budget.record(event["usage"], :cc)
+    if is_map(event["usage"]),
+      do: Tunex.Budget.record(event["usage"], :cc, %{model: Config.cc_model()})
 
     Logger.info("[ClaudeCode] agent done — subtype=#{subtype} turns=#{num_turns}")
 

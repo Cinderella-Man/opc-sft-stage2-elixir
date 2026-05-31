@@ -24,6 +24,7 @@ defmodule Tunex.Budget do
 
   @name __MODULE__
   @default_max_consecutive_429 5
+  @default_price %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000}
 
   # ── Public API ──────────────────────────────────────────────────────
 
@@ -31,8 +32,16 @@ defmodule Tunex.Budget do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, @name))
   end
 
-  @doc "Record token usage. `kind` is `:chat` (Mimo) or `:cc` (Claude Code)."
-  def record(usage, kind, server \\ @name), do: GenServer.cast(server, {:record, usage, kind})
+  @doc """
+  Record token usage. `kind` is `:chat` (Mimo) or `:cc` (Claude Code). `meta`
+  may carry `:provider` (a stage provider atom, e.g. `:xiaomi_mimo_2_5_pro`)
+  and `:model`, used for per-provider pricing + the per-call usage ledger.
+  """
+  def record(usage, kind, meta \\ %{}, server \\ @name),
+    do: GenServer.cast(server, {:record, usage, kind, meta})
+
+  @doc "Tag subsequent `record/4` calls with the current row index (for the ledger)."
+  def set_row(index, server \\ @name), do: GenServer.cast(server, {:set_row, index})
 
   @doc "Cumulative spend in USD."
   def spent(server \\ @name), do: GenServer.call(server, :spent)
@@ -46,21 +55,33 @@ defmodule Tunex.Budget do
   @doc "Reset the consecutive-429 streak (call after any successful request)."
   def note_success(server \\ @name), do: GenServer.cast(server, :note_success)
 
+  @doc "Live snapshot: spent, token totals by category, record count, elapsed."
+  def stats(server \\ @name), do: GenServer.call(server, :stats)
+
+  @heartbeat_ms 300_000
+
   # ── GenServer ───────────────────────────────────────────────────────
 
   @impl true
   def init(opts) do
     budget = Config.budget()
 
+    if Keyword.get(opts, :heartbeat, true), do: :timer.send_interval(@heartbeat_ms, self(), :heartbeat)
+
     state = %{
       spent_usd: 0.0,
       sessions_without_usage: 0,
       consecutive_429: 0,
+      current_row: nil,
+      records: 0,
+      tokens: %{in: 0, cache_read: 0, cache_create: 0, out: 0},
+      started_mono: nil,
       ceiling: Map.get(budget, :runaway_ceiling_usd, 500.0),
       max_429: Map.get(budget, :max_consecutive_429, @default_max_consecutive_429),
-      price_in: Map.get(budget, :price_in_per_token, 1.0 / 1_000_000),
-      price_out: Map.get(budget, :price_out_per_token, 3.0 / 1_000_000),
-      price_cache_read: Map.get(budget, :price_cache_read_per_token, 0.3 / 1_000_000),
+      prices: Map.get(budget, :prices, %{}),
+      default_price: Map.get(budget, :default_price, @default_price),
+      usage_log: Config.run_path("usage.jsonl"),
+      heartbeat_log: Config.run_path("heartbeat.jsonl"),
       on_runaway: Keyword.get(opts, :on_runaway, &Tunex.shutdown/1)
     }
 
@@ -68,17 +89,30 @@ defmodule Tunex.Budget do
   end
 
   @impl true
-  def handle_cast({:record, usage, kind}, state) do
-    state =
-      case cost(usage, kind, state) do
-        nil ->
-          %{state | sessions_without_usage: state.sessions_without_usage + 1}
+  def handle_cast({:set_row, index}, state), do: {:noreply, %{state | current_row: index}}
 
-        c ->
-          %{state | spent_usd: state.spent_usd + c}
+  def handle_cast({:record, usage, kind, meta}, state) do
+    breakdown = breakdown(usage, kind)
+    provider = pricing_provider(kind, meta)
+    c = cost(breakdown, price_for(state, provider))
+
+    log_call(state, kind, provider, meta, breakdown, c)
+
+    state = %{state | started_mono: state.started_mono || System.monotonic_time(:millisecond)}
+
+    state =
+      if breakdown == nil or c == nil do
+        %{state | sessions_without_usage: state.sessions_without_usage + 1}
+      else
+        %{
+          state
+          | spent_usd: state.spent_usd + c,
+            records: state.records + 1,
+            tokens: accumulate(state.tokens, breakdown)
+        }
       end
 
-    Logger.debug("[Budget] spent so far: $#{Float.round(state.spent_usd, 4)}")
+    Logger.debug("[Budget] spent so far (est.): $#{Float.round(state.spent_usd, 4)}")
 
     if state.spent_usd > state.ceiling do
       Logger.error("[Budget] RUNAWAY: $#{Float.round(state.spent_usd, 2)} > ceiling $#{state.ceiling}")
@@ -93,42 +127,146 @@ defmodule Tunex.Budget do
   @impl true
   def handle_call(:spent, _from, state), do: {:reply, state.spent_usd, state}
 
+  def handle_call(:stats, _from, state), do: {:reply, snapshot(state), state}
+
   def handle_call({:classify, error}, _from, state) do
     {verdict, state} = do_classify(error, state)
     {:reply, verdict, state}
   end
 
+  @impl true
+  def handle_info(:heartbeat, state) do
+    if state.records > 0 do
+      s = snapshot(state)
+
+      Logger.info(
+        "[Budget] HEARTBEAT — #{s.records} paid calls, est $#{Float.round(s.spent_usd, 4)} over " <>
+          "#{s.elapsed_min}min → ~$#{Float.round(s.usd_per_hr, 4)}/hr, ~$#{Float.round(s.usd_per_day, 2)}/day " <>
+          "(tok in=#{s.tokens.in} cache_rd=#{s.tokens.cache_read} out=#{s.tokens.out})"
+      )
+
+      append_jsonl(state.heartbeat_log, Map.put(s, :ts, System.os_time(:second)))
+    end
+
+    {:noreply, state}
+  end
+
+  defp snapshot(state) do
+    elapsed_ms =
+      case state.started_mono do
+        nil -> 0
+        t -> System.monotonic_time(:millisecond) - t
+      end
+
+    hrs = max(elapsed_ms / 3_600_000, 1.0e-9)
+
+    %{
+      spent_usd: state.spent_usd,
+      records: state.records,
+      tokens: state.tokens,
+      sessions_without_usage: state.sessions_without_usage,
+      elapsed_min: Float.round(elapsed_ms / 60_000, 1),
+      usd_per_hr: state.spent_usd / hrs,
+      usd_per_day: state.spent_usd / hrs * 24
+    }
+  end
+
+  defp accumulate(t, b) do
+    %{
+      in: t.in + b.in,
+      cache_read: t.cache_read + b.cache_read,
+      cache_create: t.cache_create + b.cache_create,
+      out: t.out + b.out
+    }
+  end
+
+  defp append_jsonl(path, map) do
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, [Jason.encode!(map), "\n"], [:append])
+  rescue
+    e -> Logger.debug("[Budget] jsonl write failed: #{Exception.message(e)}")
+  end
+
   # ── Cost ────────────────────────────────────────────────────────────
 
-  # Mimo chat usage: prompt_tokens / completion_tokens.
-  defp cost(%{} = usage, :chat, state) do
-    p = num(usage, "prompt_tokens")
-    c = num(usage, "completion_tokens")
-    if p == 0 and c == 0, do: nil, else: p * state.price_in + c * state.price_out
+  # Normalize raw usage into `%{in, cache_read, cache_create, out}` token
+  # counts (the exact ground truth), independent of provider/price. Returns
+  # nil when there's nothing to record.
+  #
+  # Mimo chat: prompt_tokens / completion_tokens (no separate cache fields).
+  defp breakdown(%{} = usage, :chat) do
+    nz(%{
+      in: num(usage, "prompt_tokens"),
+      cache_read: 0,
+      cache_create: 0,
+      out: num(usage, "completion_tokens")
+    })
   end
 
-  # Claude Code usage: input_tokens / output_tokens + cache fields.
-  defp cost(%{} = usage, :cc, state) do
-    input = num(usage, "input_tokens")
-    output = num(usage, "output_tokens")
-    cache_create = num(usage, "cache_creation_input_tokens")
-    cache_read = num(usage, "cache_read_input_tokens")
-
-    if input == 0 and output == 0 and cache_create == 0 and cache_read == 0 do
-      nil
-    else
-      input * state.price_in + output * state.price_out +
-        cache_create * state.price_in + cache_read * state.price_cache_read
-    end
+  # Claude Code: input_tokens / output_tokens + cache_{read,creation}_input_tokens.
+  defp breakdown(%{} = usage, :cc) do
+    nz(%{
+      in: num(usage, "input_tokens"),
+      cache_read: num(usage, "cache_read_input_tokens"),
+      cache_create: num(usage, "cache_creation_input_tokens"),
+      out: num(usage, "output_tokens")
+    })
   end
 
-  defp cost(_nil_or_other, _kind, _state), do: nil
+  defp breakdown(_other, _kind), do: nil
+
+  defp nz(%{in: i, cache_read: r, cache_create: cc, out: o} = b) do
+    if i == 0 and r == 0 and cc == 0 and o == 0, do: nil, else: b
+  end
+
+  # cache_create is billed as fresh input (MiMo cache-write currently free, but
+  # price it as input to stay conservative if that changes).
+  defp cost(nil, _price), do: nil
+
+  defp cost(%{in: i, cache_read: r, cache_create: cc, out: o}, price) do
+    (i + cc) * price.in + r * price.cache_read + o * price.out
+  end
+
+  # Pricing key: chat uses the stage provider from meta; cc uses the :cc bucket.
+  defp pricing_provider(:cc, _meta), do: :cc
+  defp pricing_provider(:chat, meta), do: Map.get(meta, :provider)
+
+  defp price_for(state, provider) do
+    Map.get(state.prices, provider, state.default_price)
+  end
 
   defp num(map, key) do
     case Map.get(map, key) do
       n when is_number(n) -> n
       _ -> 0
     end
+  end
+
+  # ── Per-call usage ledger (var/run/usage.jsonl) ─────────────────────
+  # One line per Mimo/CC call: raw token counts (exact) + derived cost +
+  # row/provider/model tags. Best-effort — a write failure never crashes the
+  # loop (e.g. in tests with no run dir).
+  defp log_call(_state, _kind, _provider, _meta, nil, _cost), do: :ok
+
+  defp log_call(state, kind, provider, meta, breakdown, cost) do
+    line =
+      Jason.encode!(%{
+        ts: System.os_time(:second),
+        row: state.current_row,
+        kind: kind,
+        provider: provider,
+        model: Map.get(meta, :model),
+        in: breakdown.in,
+        cache_read: breakdown.cache_read,
+        cache_create: breakdown.cache_create,
+        out: breakdown.out,
+        cost_usd: cost && Float.round(cost, 6)
+      })
+
+    File.mkdir_p!(Path.dirname(state.usage_log))
+    File.write!(state.usage_log, [line, "\n"], [:append])
+  rescue
+    e -> Logger.debug("[Budget] usage-log write failed: #{Exception.message(e)}")
   end
 
   # ── Classification ──────────────────────────────────────────────────

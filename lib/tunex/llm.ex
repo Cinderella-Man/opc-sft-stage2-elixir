@@ -77,19 +77,22 @@ defmodule Tunex.LLM do
       Req.post(url, json: body, receive_timeout: timeout, headers: headers)
       |> handle_response()
 
-    maybe_record_usage(result)
+    maybe_record_usage(result, active, body_params[:model])
 
     elapsed = System.monotonic_time(:millisecond) - t0
     Logger.info("[LLM.call] #{active} completed in #{elapsed}ms — #{elem(result, 0)}")
     result
   end
 
-  # Feed Mimo chat `usage` to Budget. A cast to an unstarted Budget is a no-op,
-  # so this is safe in tests and on the free local-Qwen path (usage may be nil).
-  defp maybe_record_usage({tag, _content, usage}) when tag in [:ok, :truncated] and is_map(usage),
-    do: Tunex.Budget.record(usage, :chat)
+  # Feed Mimo chat `usage` to Budget, tagged with the stage provider + model
+  # (for per-provider pricing + the per-call usage ledger). A cast to an
+  # unstarted Budget is a no-op, so this is safe in tests and on the free
+  # local-Qwen path (usage may be nil).
+  defp maybe_record_usage({tag, _content, usage}, provider, model)
+       when tag in [:ok, :truncated] and is_map(usage),
+       do: Tunex.Budget.record(usage, :chat, %{provider: provider, model: model})
 
-  defp maybe_record_usage(_), do: :ok
+  defp maybe_record_usage(_, _provider, _model), do: :ok
 
   # ── Body assembly ───────────────────────────────────────────────────
 

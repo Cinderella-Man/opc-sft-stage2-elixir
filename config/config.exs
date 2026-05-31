@@ -63,7 +63,10 @@ config :tunex,
   # (e.g. set solve to :local_qwen_thinking once a GPU is available).
   stages: %{
     translate: :xiaomi_mimo_2_5_pro,
-    solve: :xiaomi_mimo_2_5
+    # Solve runs LOCAL Qwen on the 3090 — free, and its weaker/less-idiomatic
+    # output is the rule-discovery feedstock (the original design). The remote
+    # :xiaomi_mimo_2_5 path is the GPU-less dev fallback (TUNEX_SOLVE_PROVIDER).
+    solve: :local_qwen_thinking
   },
 
   # ── Per-stage output-token floors ───────────────────────────────────
@@ -116,9 +119,23 @@ config :tunex,
   # tune for a CC rule-gen session on every row. PLACEHOLDER — see plan
   # "Unresolved": confirm the real ceiling after first runs.
   budget: %{
-    price_in_per_token: 1.0 / 1_000_000,
-    price_out_per_token: 3.0 / 1_000_000,
-    price_cache_read_per_token: 0.3 / 1_000_000,
+    # ── Per-provider token prices (USD per token) ───────────────────────
+    # CORRECTED to the real May-27-2026 token-plan pay-as-you-go rates. The
+    # OLD flat 1/0.3/3 was ~83x too high on cache_read and wrong on in/out;
+    # it inflated spend tracking and mis-sized the runaway ceiling.
+    #   mimo-v2.5-pro : in $0.435/M  cache_read $0.0036/M  out $0.87/M
+    #   mimo-v2.5     : in $1.00/M   cache_read $0.20/M     out $3.00/M
+    #   :cc (rule-gen) = mimo-v2.5-pro[1m] → pro prices
+    # NOTE: these are pay-as-you-go USD. The actual $50/mo plan meters
+    # discounted "Credits", so derived $ is a RELATIVE estimate — the raw
+    # token COUNTS logged to var/run/usage.jsonl are the ground truth.
+    prices: %{
+      xiaomi_mimo_2_5_pro: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000},
+      xiaomi_mimo_2_5: %{in: 1.0 / 1_000_000, cache_read: 0.20 / 1_000_000, out: 3.0 / 1_000_000},
+      cc: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000}
+    },
+    # Fallback price for an unknown provider (uses pro rates).
+    default_price: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000},
     runaway_ceiling_usd: 500.0,
     # 429-streak → fatal; transient (5xx/network) retry/backoff before halt.
     max_consecutive_429: 5,

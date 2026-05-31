@@ -12,8 +12,10 @@ NOT the goal — it's a 24/7 human-free *workload* that surfaces where Credence 
 works?". Dataset quality is a secondary byproduct. The run never finishes (118k × minutes ≈ years) — run it
 for days, stop, PR the rules from `evolution` → `main`, then `mix tunex.reset` for a fresh run.
 
-Full design: **`docs/plan.md`**. Detailed build log + gotchas: the auto-memory `v2-build-status.md` /
-`v2-evolve-architecture.md`.
+Full design: **`docs/01_plan.md`**. Cost/observability analysis + the token-burn plan:
+**`docs/03_cost_and_observability.md`** (READ THIS before optimizing cost — it overturns `02_research.md`).
+Setup/run guide for forkers: **`README.md`**. Detailed build log + gotchas: the auto-memory
+`v2-build-status.md` / `v2-evolve-architecture.md`.
 
 ## Run it
 ```
@@ -24,12 +26,18 @@ TUNEX_RUN=1 mix run --no-halt
 - `mix tunex.reset` — wipe `var/run/` (keeps `var/cache/` = translations) for a fresh run.
 - Per-stage provider override: `TUNEX_SOLVE_PROVIDER=…` / `TUNEX_TRANSLATE_PROVIDER=…`.
 
-## Models (all Xiaomi Mimo via `token-plan-sgp.xiaomimimo.com`; one paid dep)
-- **translate** → `mimo-v2.5-pro` (strongest)
-- **solve** → `mimo-v2.5` (non-pro; weaker → less-idiomatic output = rule feedstock) — default `stages.solve`
+## Models (Mimo via `token-plan-sgp.xiaomimimo.com`; Mimo is the only PAID dep; local Qwen is free)
+- **translate** → `mimo-v2.5-pro` (strongest), cached forever in `var/cache/`
+- **solve** → **local Qwen** (`stages.solve: :local_qwen_thinking`, default since 2026-05-31) — FREE on a
+  3090; weaker → less-idiomatic output = rule feedstock (this is the ORIGINAL design). The remote
+  `mimo-v2.5` non-pro path is the **GPU-less fallback** via `TUNEX_SOLVE_PROVIDER=xiaomi_mimo_2_5` (note:
+  non-pro is the EXPENSIVE tier — $3/M out — and was ~46% of total cost when left on in prod).
 - **rule-gen** → Claude Code CLI with `ANTHROPIC_MODEL=mimo-v2.5-pro[1m]` (the harness ≠ the model; still Mimo)
 - `mimo-v2-pro/-omni` are DEPRECATED (gone 2026-06-30) — dropped. `mimo-v2-flash` is OpenRouter-only + a
   strong coder (idiomatic), so NOT useful for solve. Secrets in `config/secrets.exs` (gitignored).
+- **Real token-plan prices** (in `config.exs` `budget.prices`; the old flat 1/0.3/3 was ~83× wrong):
+  pro $0.435/$0.0036(cache)/$0.87 per M; non-pro $1/$0.20/$3 per M. Plan meters discounted *Credits*, so
+  logged `$` is a RELATIVE estimate — token COUNTS are exact; the MiMo console credit delta is authoritative.
 
 ## Architecture (lib/tunex/)
 - `application.ex` — supervises `Cache`, `Budget`, and (if `TUNEX_RUN=1`) `Orchestrator`.
@@ -44,8 +52,12 @@ TUNEX_RUN=1 mix run --no-halt
 ## Storage (var/, gitignored)
 - `var/cache/translations.jsonl` — translations + blacklist verdicts (survives `tunex.reset`).
 - `var/run/` — regenerable: `progress`, `seed`, `decisions.md` (dead-end ledger), SFT output, `escalated/`
-  (gave_up/reject/phantom logs), `committed/` (landed-rule logs + CC JSON transcript), `workspace/`, `logs/`.
+  (gave_up/reject/phantom logs), `committed/` (landed-rule logs + CC JSON transcript), `workspace/`, `logs/`,
+  + **observability ledgers**: `usage.jsonl` (per paid call: exact tokens + provider + row + est cost),
+  `rows.jsonl` (per row: outcome + timing + `cost_est`), `heartbeat.jsonl` (5-min spend time-series).
 - Committed rules are pushed to the **`evolution`** branch of `Cinderella-Man/credence`; PR to `main` manually.
+- **Observe cost:** `mix tunex.usage` (by-stage · by-outcome · triage estimate · 24/7 projection); live
+  `[progress]`/`[Budget] HEARTBEAT` log lines; `Tunex.Budget.stats/0`.
 
 ## Non-obvious facts / gotchas (don't re-litigate)
 - **Logs are intentionally FULL/untruncated** (the point is to see exactly what happened); only short-SHA +
@@ -61,8 +73,18 @@ TUNEX_RUN=1 mix run --no-halt
   **CHECK-ONLY rules** (`fix_patches/2 -> []`) when a clean auto-fix is too complex.
 - A `gave_up` pattern goes into `decisions.md` and is then NOT re-attempted in the same run (cleared by
   `tunex.reset`).
+- **Prompt caching WORKS against MiMo** (~58.7M cache-read tokens measured; `cache_read_input_tokens` is
+  returned). `02_research.md`'s "caching broken → switch to Aider/custom loop for 3–25×" is FALSE: cache is
+  ~free and ~9% of cost; ~62% of cost is model OUTPUT (harness-invariant). A harness switch is ~1.2×. Don't.
+- **Cost drivers** (measured): real $/rule ≈ $0.05 (NOT the $1.59 CC reports — that's Anthropic-priced
+  `total_cost_usd`, which we IGNORE). Post-Qwen the bill is rule-gen, dominated by cache-MISS input
+  (row log + per-turn `mix test` re-reads). Levers: solve→Qwen (~1.85×, done) > triage/build split (~1.3×,
+  planned) > input distillation (~1.1×, planned). See `docs/03_cost_and_observability.md`.
 
-## Status (2026-05-30)
-M0–M5 built; all unit tests + the credence suite green. Live run works end-to-end — **first rule landed +
-pushed**: `Credence.Pattern.NoListDuplicateFlatten`. ~7 min / ~$0.50 per committed rule on slow Mimo
-(acceptable). Runaway-$ ceiling = $500 (config). v1 still runs under `v1/` for reference.
+## Status (2026-05-31)
+M0–M5 built; all unit tests + the credence suite green. Live run works end-to-end; rules landing + pushing
+(e.g. `Credence.Pattern.NoListDuplicateFlatten`). **Cost instrumented** (per-call/per-row/heartbeat ledgers
++ `mix tunex.usage`); Budget prices corrected to real per-provider token-plan rates. **solve switched to
+local Qwen** (free; default). Next: run ~24h, read `mix tunex.usage` + MiMo console credit delta to confirm
+24/7 feasibility, then decide triage/distillation from data. Runaway-$ ceiling = $500 (config; now on real
+prices). v1 still runs under `v1/` for reference.
