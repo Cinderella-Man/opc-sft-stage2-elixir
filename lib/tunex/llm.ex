@@ -73,15 +73,41 @@ defmodule Tunex.LLM do
 
     t0 = System.monotonic_time(:millisecond)
 
-    result =
-      Req.post(url, json: body, receive_timeout: timeout, headers: headers)
-      |> handle_response()
+    raw = Req.post(url, json: body, receive_timeout: timeout, headers: headers)
+    elapsed = System.monotonic_time(:millisecond) - t0
+
+    record_chat_diag(raw, active, body_params[:model], elapsed)
+    result = handle_response(raw)
 
     maybe_record_usage(result, active, body_params[:model])
 
-    elapsed = System.monotonic_time(:millisecond) - t0
     Logger.info("[LLM.call] #{active} completed in #{elapsed}ms — #{elem(result, 0)}")
     result
+  end
+
+  # Hoard the FULL chat response signal for token reconciliation: every header
+  # (a quota/rate-limit gauge may live here, not in the body), the verbatim
+  # `usage` object (incl. reasoning_tokens / cached_tokens details a reasoning
+  # model emits and our normalized breakdown drops), and finish_reason/model.
+  defp record_chat_diag({:ok, %{status: status, headers: hdrs, body: body}}, provider, model, elapsed) do
+    usage = if is_map(body), do: body["usage"], else: nil
+    choice = if is_map(body), do: List.first(body["choices"] || []), else: nil
+
+    Tunex.Diag.record(%{
+      kind: "chat",
+      provider: provider,
+      model: model,
+      returned_model: is_map(body) && body["model"],
+      http_status: status,
+      elapsed_ms: elapsed,
+      finish_reason: choice && choice["finish_reason"],
+      usage: usage,
+      headers: Tunex.Diag.headers_to_map(hdrs)
+    })
+  end
+
+  defp record_chat_diag({:error, reason}, provider, model, elapsed) do
+    Tunex.Diag.record(%{kind: "chat", provider: provider, model: model, elapsed_ms: elapsed, error: inspect(reason)})
   end
 
   # Feed Mimo chat `usage` to Budget, tagged with the stage provider + model

@@ -65,6 +65,7 @@ defmodule Mix.Tasks.Tunex.Usage do
       if calls != [], do: print_group(s, calls)
     end)
     print_group("TOTAL", usage)
+    model_usage_recon(usage)
 
     # Per-row cost, then grouped by outcome.
     per_row =
@@ -93,6 +94,42 @@ defmodule Mix.Tasks.Tunex.Usage do
     triage_estimate(usage, outcome_by_row)
     headline(by_outcome)
   end
+
+  # Claude Code reports two cumulative token figures per session: `usage` (the
+  # standard field, recorded as in/cache_read/cache_create/out) and `modelUsage`
+  # (per-model, a few % higher). Show both totals so the ledger isn't blind to
+  # the latter — and so the console delta can be matched against whichever is
+  # closer to ground truth.
+  defp model_usage_recon(usage) do
+    cc = Enum.filter(usage, &(&1["kind"] == "cc"))
+
+    usage_tot = Enum.sum(Enum.map(cc, &call_total/1))
+
+    mu_calls = Enum.filter(cc, &is_map(&1["model_usage"]))
+    mu_tot = Enum.sum(Enum.map(mu_calls, fn c -> mu_total(c["model_usage"]) end))
+
+    header("MODELUSAGE RECON (rule-gen: result.usage vs modelUsage token totals)")
+
+    cond do
+      usage_tot == 0 ->
+        Mix.shell().info("no rule-gen calls with usage yet.")
+
+      mu_calls == [] ->
+        Mix.shell().info("result.usage total: #{usage_tot} tok — no modelUsage logged (older ledger).")
+
+      true ->
+        delta = Float.round(100 * (mu_tot - usage_tot) / usage_tot, 1)
+        Mix.shell().info("result.usage total: #{usage_tot} tok (#{length(cc)} calls)")
+        Mix.shell().info("modelUsage total:   #{mu_tot} tok (#{length(mu_calls)} calls)")
+        Mix.shell().info("Δ modelUsage vs result.usage: #{delta}%  (match your CONSOLE delta to whichever is closer)")
+    end
+  end
+
+  defp call_total(c),
+    do: (c["in"] || 0) + (c["cache_read"] || 0) + (c["cache_create"] || 0) + (c["out"] || 0)
+
+  defp mu_total(mu),
+    do: (mu["in"] || 0) + (mu["cache_read"] || 0) + (mu["cache_create"] || 0) + (mu["out"] || 0)
 
   # The triage/build question, answered from data: how much RULE-GEN spend is
   # burned on no_opportunity rows (the full Claude Code session that finds

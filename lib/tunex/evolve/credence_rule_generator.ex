@@ -110,7 +110,7 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
     log = File.read!(RowLog.path(index))
     prompt = build_prompt(log, Ledger.read(), rule_index(clone))
 
-    case ClaudeCode.run(prompt, cwd: clone) do
+    case ClaudeCode.run(prompt, cwd: clone, row: index) do
       {:ok, result} ->
         route(index, clone, result)
 

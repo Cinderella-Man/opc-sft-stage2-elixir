@@ -32,11 +32,12 @@ defmodule Tunex.ClaudeCode do
   @allowed_tools ~w(Read Grep Glob Edit Write) ++ ["Bash(mix test:*)"]
   @disallowed_tools ["Bash(git:*)"]
 
-  @doc "Run the agent with `prompt`. `opts`: `:cwd`, `:max_turns`, `:timeout_ms`."
+  @doc "Run the agent with `prompt`. `opts`: `:cwd`, `:max_turns`, `:timeout_ms`, `:row`."
   def run(prompt, opts \\ []) do
     clone = Keyword.get(opts, :cwd, Config.credence_clone())
     max_turns = Keyword.get(opts, :max_turns, Config.cc_max_turns())
     timeout_ms = Keyword.get(opts, :timeout_ms, Config.cc_timeout_ms())
+    row = Keyword.get(opts, :row)
 
     prompt_file =
       Path.join(System.tmp_dir!(), "tunex_cc_prompt_#{System.unique_integer([:positive])}.txt")
@@ -55,7 +56,7 @@ defmodule Tunex.ClaudeCode do
 
     result =
       try do
-        run_port(script, clone, timeout_ms, max_turns)
+        run_port(script, clone, timeout_ms, max_turns, row)
       after
         File.rm(prompt_file)
       end
@@ -65,7 +66,7 @@ defmodule Tunex.ClaudeCode do
 
   # ── Port: spawn, stream, timeout ────────────────────────────────────
 
-  defp run_port(script, clone, timeout_ms, max_turns) do
+  defp run_port(script, clone, timeout_ms, max_turns, row) do
     bash = System.find_executable("bash") || "/bin/bash"
 
     port =
@@ -79,7 +80,25 @@ defmodule Tunex.ClaudeCode do
       ])
 
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    collect(port, %{buffer: "", result: nil, steps: 0}, deadline, max_turns)
+    t0 = System.monotonic_time(:millisecond)
+    acc = %{buffer: "", result: nil, steps: 0, summed_usage: zero_usage(), roundtrips: 0, row: row, t0: t0}
+    collect(port, acc, deadline, max_turns)
+  end
+
+  # Every streamed assistant message carries the `usage` of the API round-trip
+  # that produced it. SUMMING these reconstructs what a TOKEN-BUCKET plan
+  # actually debits (each turn re-sends the full growing prefix), whereas the
+  # final `result` event's `usage` reflects only one turn — the ~25x undercount.
+  defp zero_usage,
+    do: %{
+      "input_tokens" => 0,
+      "output_tokens" => 0,
+      "cache_read_input_tokens" => 0,
+      "cache_creation_input_tokens" => 0
+    }
+
+  defp add_usage(acc, %{} = u) do
+    Map.new(acc, fn {k, v} -> {k, v + (is_number(u[k]) && u[k] || 0)} end)
   end
 
   defp collect(port, acc, deadline, max_turns) do
@@ -88,7 +107,7 @@ defmodule Tunex.ClaudeCode do
     if remaining <= 0 do
       kill(port)
       Logger.warning("[ClaudeCode] TIMEOUT — killing agent (treated as gave_up)")
-      {:ok, timeout_result(acc.steps)}
+      {:ok, timeout_result(acc)}
     else
       receive do
         {^port, {:data, chunk}} ->
@@ -101,7 +120,7 @@ defmodule Tunex.ClaudeCode do
         remaining ->
           kill(port)
           Logger.warning("[ClaudeCode] TIMEOUT — killing agent (treated as gave_up)")
-          {:ok, timeout_result(acc.steps)}
+          {:ok, timeout_result(acc)}
       end
     end
   end
@@ -122,14 +141,21 @@ defmodule Tunex.ClaudeCode do
 
   defp handle_event(acc, %{"type" => "result"} = event), do: %{acc | result: event}
 
-  defp handle_event(acc, %{"type" => "assistant", "message" => %{"content" => content}})
+  defp handle_event(acc, %{"type" => "assistant", "message" => %{"content" => content} = msg})
        when is_list(content) do
     # `steps` counts streamed assistant MESSAGES (for progress logging only) —
     # this is NOT Claude Code's `num_turns` that `--max-turns` caps (Mimo emits
     # several messages per turn). The authoritative count is in the result event.
     steps = acc.steps + 1
     Enum.each(content, &log_block(&1, steps))
-    %{acc | steps: steps}
+
+    {summed, roundtrips} =
+      case msg["usage"] do
+        %{} = u -> {add_usage(acc.summed_usage, u), acc.roundtrips + 1}
+        _ -> {acc.summed_usage, acc.roundtrips}
+      end
+
+    %{acc | steps: steps, summed_usage: summed, roundtrips: roundtrips}
   end
 
   defp handle_event(acc, %{"type" => "system", "subtype" => "init"}) do
@@ -168,22 +194,28 @@ defmodule Tunex.ClaudeCode do
     {:error, {:no_result, code, acc.steps}}
   end
 
-  defp finalize(%{result: event}, exit_code, max_turns) do
+  defp finalize(%{result: event} = acc, exit_code, max_turns) do
     result_text = event["result"] || ""
     subtype = event["subtype"]
     num_turns = event["num_turns"] || 0
     is_error = event["is_error"] || false
 
     # Feed CC usage to Budget (ignore CC's total_cost_usd — wrong for Mimo).
+    # Carry `modelUsage` too — it's the explicit per-model cumulative and runs a
+    # few % higher than `usage`; logged alongside so the ledger isn't blind to it.
     if is_map(event["usage"]),
-      do: Tunex.Budget.record(event["usage"], :cc, %{model: Config.cc_model()})
+      do: Tunex.Budget.record(event["usage"], :cc, %{model: Config.cc_model(), model_usage: event["modelUsage"]})
 
+    log_usage_reconciliation(event["usage"], acc.summed_usage, acc.roundtrips, num_turns)
+    record_session_diag(acc, event, subtype, num_turns)
     Logger.info("[ClaudeCode] agent done — subtype=#{subtype} turns=#{num_turns}")
 
     {:ok,
      %{
        result_text: result_text,
        usage: event["usage"],
+       summed_usage: acc.summed_usage,
+       roundtrips: acc.roundtrips,
        num_turns: num_turns,
        subtype: subtype,
        is_error: is_error,
@@ -193,10 +225,69 @@ defmodule Tunex.ClaudeCode do
      }}
   end
 
-  defp timeout_result(steps) do
+  # One verbatim diagnostics line per session (EVERY outcome, not just committed
+  # rows that get a saved transcript). Captures the full `usage` + `modelUsage`
+  # (per-model cumulative), timings, stop reason, and our summed-per-round-trip
+  # estimate — everything we can use to reconcile against the console bucket.
+  defp record_session_diag(acc, event, subtype, num_turns) do
+    Tunex.Diag.record(%{
+      kind: "cc_session",
+      row: acc.row,
+      subtype: subtype,
+      stop_reason: event["stop_reason"],
+      is_error: event["is_error"],
+      num_turns: num_turns,
+      roundtrips_with_usage: acc.roundtrips,
+      wall_ms: System.monotonic_time(:millisecond) - acc.t0,
+      duration_ms: event["duration_ms"],
+      duration_api_ms: event["duration_api_ms"],
+      ttft_ms: event["ttft_ms"],
+      total_cost_usd: event["total_cost_usd"],
+      service_tier: get_in(event, ["usage", "service_tier"]),
+      usage: event["usage"],
+      model_usage: event["modelUsage"],
+      summed_usage: acc.summed_usage
+    })
+  end
+
+  # Compare the single result-event usage (what Budget records) against the SUM
+  # of per-round-trip usages (closer to what a token-bucket plan debits). A large
+  # ratio means the ledger is undercounting the console — see docs/04.
+  defp log_usage_reconciliation(result_usage, summed, roundtrips, num_turns) do
+    tot = fn u -> (u["input_tokens"] || 0) + (u["output_tokens"] || 0) +
+                  (u["cache_read_input_tokens"] || 0) + (u["cache_creation_input_tokens"] || 0) end
+
+    r = if is_map(result_usage), do: tot.(result_usage), else: 0
+    s = tot.(summed)
+    ratio = if r > 0, do: Float.round(s / r, 1), else: 0.0
+
+    Logger.info(
+      "[ClaudeCode] USAGE RECON — num_turns=#{num_turns} roundtrips_with_usage=#{roundtrips}\n" <>
+        "  result-event total tokens (what Budget records) = #{r}\n" <>
+        "  summed per-round-trip total tokens (token-bucket basis) = #{s}\n" <>
+        "  summed/result ratio = #{ratio}x   (compare BOTH to your console delta)"
+    )
+  end
+
+  defp timeout_result(acc) do
+    steps = acc.steps
+
+    Tunex.Diag.record(%{
+      kind: "cc_session",
+      row: acc.row,
+      subtype: "error_timeout",
+      num_turns: steps,
+      roundtrips_with_usage: acc.roundtrips,
+      wall_ms: System.monotonic_time(:millisecond) - acc.t0,
+      usage: (is_map(acc.result) && acc.result["usage"]) || nil,
+      summed_usage: acc.summed_usage
+    })
+
     %{
       result_text: "",
       usage: nil,
+      summed_usage: acc.summed_usage,
+      roundtrips: acc.roundtrips,
       num_turns: steps,
       subtype: "error_timeout",
       is_error: true,

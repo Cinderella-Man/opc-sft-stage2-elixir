@@ -242,6 +242,22 @@ defmodule Tunex.Budget do
     end
   end
 
+  # Sum Claude Code's `modelUsage` (per-model, camelCase) into the same
+  # `%{in, cache_read, cache_create, out}` shape as `breakdown/2`. nil when
+  # absent (chat calls, or a CC result without modelUsage).
+  defp model_usage_totals(mu) when is_map(mu) and map_size(mu) > 0 do
+    Enum.reduce(mu, %{in: 0, cache_read: 0, cache_create: 0, out: 0}, fn {_model, m}, acc ->
+      %{
+        in: acc.in + num(m, "inputTokens"),
+        cache_read: acc.cache_read + num(m, "cacheReadInputTokens"),
+        cache_create: acc.cache_create + num(m, "cacheCreationInputTokens"),
+        out: acc.out + num(m, "outputTokens")
+      }
+    end)
+  end
+
+  defp model_usage_totals(_), do: nil
+
   # ── Per-call usage ledger (var/run/usage.jsonl) ─────────────────────
   # One line per Mimo/CC call: raw token counts (exact) + derived cost +
   # row/provider/model tags. Best-effort — a write failure never crashes the
@@ -260,7 +276,10 @@ defmodule Tunex.Budget do
         cache_read: breakdown.cache_read,
         cache_create: breakdown.cache_create,
         out: breakdown.out,
-        cost_usd: cost && Float.round(cost, 6)
+        cost_usd: cost && Float.round(cost, 6),
+        # Claude Code's per-model cumulative (camelCase), normalized + summed.
+        # nil for chat calls (no modelUsage). A cross-check on `usage` above.
+        model_usage: model_usage_totals(Map.get(meta, :model_usage))
       })
 
     File.mkdir_p!(Path.dirname(state.usage_log))
