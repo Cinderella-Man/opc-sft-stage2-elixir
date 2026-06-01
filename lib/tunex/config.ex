@@ -42,7 +42,19 @@ defmodule Tunex.Config do
 
   # ── Paths ───────────────────────────────────────────────────────────
 
-  def credence_clone, do: Application.fetch_env!(:tunex, :credence_clone)
+  @doc """
+  Path to the Credence clone (path-dep target + push origin).
+
+  Optional in config: when `:credence_clone` is unset (or nil), defaults to a
+  sibling `credence/` directory next to this project — i.e. `../credence`
+  relative to the project root — so a fresh deploy needs no path edit.
+  """
+  def credence_clone do
+    case Application.get_env(:tunex, :credence_clone) do
+      nil -> Path.expand(Path.join(File.cwd!(), "../credence"))
+      path -> path
+    end
+  end
   def git_identity, do: Application.get_env(:tunex, :git_identity, %{})
   def cache_dir, do: Application.get_env(:tunex, :cache_dir, "var/cache")
   def run_dir, do: Application.get_env(:tunex, :run_dir, "var/run")

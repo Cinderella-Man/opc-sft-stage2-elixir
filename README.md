@@ -89,10 +89,14 @@ git checkout -b evolution && git push -u origin evolution
 
 ### 3. Point the app at your Credence clone + a noreply git identity
 
+`credence_clone` is **optional**: when unset it defaults to a sibling `credence/`
+directory next to this project (`../credence`), so if you cloned both repos side
+by side (as in step 2) you can skip the path entirely. Set it only to override.
+
 In `config/config.exs`:
 
 ```elixir
-credence_clone: "/home/<you>/projects/credence",
+# credence_clone: "/home/<you>/projects/credence",   # optional — defaults to ../credence
 git_identity: %{
   name: "Your Name",
   # MUST be a GitHub noreply email — a real email triggers GH007

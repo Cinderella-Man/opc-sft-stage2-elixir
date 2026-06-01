@@ -34,24 +34,16 @@ config :tunex,
       stream: false
     },
     local_qwen_non_thinking: %{
-      url: "http://localhost:8000/v1/chat/completions",
+      url: "http://localhost:8080/v1/chat/completions",
       model: "Qwen/Qwen3.6-27B",
-      temperature: 0.7,
-      top_p: 0.8,
-      top_k: 20,
-      presence_penalty: 1.5,
       token_param: :max_tokens,
       max_tokens: 8_192,
       chat_template_kwargs: %{enable_thinking: false},
       stream: false
     },
     local_qwen_thinking: %{
-      url: "http://localhost:8000/v1/chat/completions",
+      url: "http://localhost:8080/v1/chat/completions",
       model: "Qwen/Qwen3.6-27B",
-      temperature: 0.7,
-      top_p: 0.8,
-      top_k: 20,
-      presence_penalty: 1.5,
       token_param: :max_tokens,
       max_tokens: 8_192,
       stream: false
@@ -97,7 +89,9 @@ config :tunex,
   },
 
   # ── Credence clone (path dep target + push origin) ──────────────────
-  credence_clone: "/home/car/projects/credence",
+  # OPTIONAL: when unset, defaults to a sibling `credence/` dir next to this
+  # project (`../credence`). Set an absolute path only to override that.
+  # credence_clone: "/home/car/projects/credence",
 
   # Commit identity the app sets on the clone (Preflight). MUST use a GitHub
   # *noreply* email — a real email triggers GH007 "push would publish a private

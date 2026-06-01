@@ -4,9 +4,11 @@ defmodule Tunex.Preflight do
   actionable guidance** on any miss — never crash-loop.
 
   Order: static checks (clone/branch/CLI/secrets) → reconciliation → runtime
-  checks (clean tree, CC smoke test against Mimo, Mimo chat reachable, credence
-  compiles). The CC smoke test validates base URL + token + model end-to-end so
-  a bad rule-gen auth doesn't masquerade as "agent always gives up".
+  checks (clean tree, CC smoke test against Mimo, Mimo chat reachable, local
+  solve endpoint reachable, credence compiles). The CC smoke test validates base
+  URL + token + model end-to-end so a bad rule-gen auth doesn't masquerade as
+  "agent always gives up". The solve-endpoint check catches a down local Qwen
+  server before the first paid row reaches the Solve stage.
   """
 
   require Logger
@@ -119,6 +121,7 @@ defmodule Tunex.Preflight do
 
     cc_smoke!()
     mimo_chat_reachable!()
+    solve_endpoint_reachable!()
     credence_compiles!(clone)
   end
 
@@ -150,6 +153,35 @@ defmodule Tunex.Preflight do
         Logger.warning("[Preflight] Mimo chat returned #{inspect(other)} (continuing)")
     end
   end
+
+  # The Mimo paths are covered by cc_smoke!/mimo_chat_reachable!, but a LOCAL
+  # solve endpoint (vLLM Qwen on the 3090) is a separate server that can be down
+  # while Mimo is fine — and it only fails once the first row hits Solve, deep
+  # into a paid run. Smoke-test it here, but ONLY for a local (localhost) URL so
+  # we never burn a paid call: a remote solve provider shares Mimo's host, which
+  # mimo_chat_reachable! already proved.
+  defp solve_endpoint_reachable! do
+    provider = Config.provider_for(:solve)
+    url = Application.get_env(:tunex, :providers, %{}) |> get_in([provider, :url]) || ""
+
+    if local_url?(url) do
+      case LLM.for_stage(:solve, "reply with exactly: OK", "", max_tokens: 16) do
+        {tag, _content, _usage} when tag in [:ok, :truncated] ->
+          Logger.info("[Preflight] solve endpoint reachable (#{provider} @ #{url})")
+
+        other ->
+          fail("""
+          Solve endpoint unreachable: provider #{provider} @ #{url} → #{inspect(other)}
+          The configured solve stage uses a LOCAL model, but nothing answered there.
+          Fix: start the vLLM/OpenAI-compatible Qwen server at #{url}, or point solve
+          at the remote fallback: TUNEX_SOLVE_PROVIDER=xiaomi_mimo_2_5
+          """)
+      end
+    end
+  end
+
+  defp local_url?(url),
+    do: String.contains?(url, "localhost") or String.contains?(url, "127.0.0.1")
 
   defp credence_compiles!(clone) do
     {out, code} =
@@ -190,6 +222,7 @@ defmodule Tunex.Preflight do
 
   defp git(clone, args), do: System.cmd("git", args, cd: clone, stderr_to_stdout: true)
 
+  @spec fail(String.t()) :: no_return()
   defp fail(guidance) do
     Logger.error("[Preflight] FAILED:\n#{guidance}")
     IO.puts(:stderr, "\n=== Tunex preflight failed ===\n#{guidance}")

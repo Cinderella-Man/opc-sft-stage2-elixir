@@ -42,7 +42,10 @@ TUNEX_RUN=1 mix run --no-halt
 ## Architecture (lib/tunex/)
 - `application.ex` — supervises `Cache`, `Budget`, and (if `TUNEX_RUN=1`) `Orchestrator`.
 - `orchestrator.ex` — the seeded-shuffle pass; per-row try/rescue; API-error backoff; SFT append; `Progress`.
-- `preflight.ex` — boot checks + reconciliation (git reset, identity, deps, recompile, CC/Mimo smoke).
+- `preflight.ex` — boot checks + reconciliation (git reset, identity, deps, recompile, CC/Mimo smoke,
+  + a LOCAL-solve-endpoint smoke test: if `solve` resolves to a localhost provider, it pings it so a down
+  Qwen server fails preflight instead of mid-run; remote solve providers are skipped — Mimo's host is
+  already proven and a paid smoke call is avoided).
 - `pipeline/{translate,round_trip,solve}.ex` — the three model stages. RoundTrip writes the single `Cache.put`.
 - `evolve/{credence_rule_generator,gate,git,ledger}.ex` — drive the agent, the 5-part Gate, commit→push, ledger.
 - `claude_code.ex` — Claude Code subprocess: **stream-json over a Port** (live `step N` logs + wall-clock
@@ -56,6 +59,8 @@ TUNEX_RUN=1 mix run --no-halt
   + **observability ledgers**: `usage.jsonl` (per paid call: exact tokens + provider + row + est cost),
   `rows.jsonl` (per row: outcome + timing + `cost_est`), `heartbeat.jsonl` (5-min spend time-series).
 - Committed rules are pushed to the **`evolution`** branch of `Cinderella-Man/credence`; PR to `main` manually.
+- `credence_clone` is **optional** in `config.exs`: when unset/nil, `Config.credence_clone/0` defaults to a
+  sibling `../credence` dir (resolved from the project root via `File.cwd!`), so a fresh deploy needs no edit.
 - **Observe cost:** `mix tunex.usage` (by-stage · by-outcome · triage estimate · 24/7 projection); live
   `[progress]`/`[Budget] HEARTBEAT` log lines; `Tunex.Budget.stats/0`.
 
