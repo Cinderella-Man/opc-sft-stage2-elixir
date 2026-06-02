@@ -46,7 +46,7 @@ killing the ~20× multiplier on it. The harness is deleted.
 row that reached solve  (success OR failed — §3.3; failed rows feed new-syntax rules)
    │
    ▼
-[parse APPLIED_RULES]  any {rule, :reverted}?   (Pattern-only; a rule turned COMPILING code → non-compiling — §3.7)
+[parse APPLIED_RULES]  any {rule, :reverted}?   (Pattern-only; a rule turned COMPILING code → non-compiling — §3.9)
    │
    ├── yes ──► [IMPLEMENTER: bugfix mode · broke-compile shape]   (NO classifier — deterministic, pre-attributed)
    │
@@ -63,7 +63,7 @@ row that reached solve  (success OR failed — §3.3; failed rows feed new-synta
    ├── BUGFIX_RULE ───────────► [IMPLEMENTER: bugfix mode]
    │      (rule_name ∈ APPLIED_RULES)        edit existing rule + its tests in place
    │
-   └── POTENTIAL_NEW_RULE ────► [NOVELTY PRE-CHECK]  run `before` through Credence.fix in the clone (§3.9)
+   └── POTENTIAL_NEW_RULE ────► [NOVELTY PRE-CHECK]  run `before` through Credence.fix in the clone (§3.7)
                                       │   already flagged/fixed? → duplicate → log no_action/duplicate/ (no model work)
                                       ▼ genuinely uncovered
                                   [IMPLEMENTER: new mode]
@@ -94,10 +94,40 @@ target paths.
     `for_stage → Budget.record` for the per-stage cost split (§11.0 / Q8).
   - **"Thinking on" = reuse `xiaomi_mimo_2_5_pro` as-is; it's the model's *default* reasoning, not a flag.**
     Thinking is an explicit knob only for *local Qwen* (`enable_thinking`); Mimo-pro is a reasoning model by
-    default (config.exs: "reasoning tokens count against the cap"). No new provider, no toggle.
-- **Model: `mimo-v2.5-pro` with thinking on.** This call carries the single hardest judgment in the system —
-  recognising *clean, passing, zero-issue but non-idiomatic* code. This is the one place we deliberately **pay
-  for brains**. (Free local Qwen stays for solve only.)
+    default (config.exs: "reasoning tokens count against the cap"). No toggle.
+- **Model: configurable per-stage, default `mimo-v2.5-pro` with thinking on.** This call carries the single
+  hardest judgment in the system — recognising *clean, passing, zero-issue but non-idiomatic* code. This is the
+  one place we deliberately **pay for brains** (free local Qwen stays for solve only) — so the *which-brain*
+  choice must be a **config knob, not a hardcode**:
+  - The classifier provider resolves through the **same `stages.classify` + `TUNEX_CLASSIFY_PROVIDER`
+    machinery** as translate/solve (`Config.provider_for/1`; `env_provider/1` is already generic). Switching
+    models = repoint `stages.classify` at a different **provider atom** (or set the env override for a run); no
+    code change.
+  - **Default = `:xiaomi_mimo_2_5_pro`** (the in-bucket, no-extra-dep choice). **Alternative = a new
+    `:anthropic_opus` provider** (Claude Opus 4.8 / `claude-opus-4-8` via the Anthropic API, its own
+    `base_url`/`model`/secret auth header in the `providers` map + `secret_providers`). Add it to `budget.prices` too so per-stage cost
+    metering (T0.2) stays honest.
+  - **Why configurable, not just Mimo-pro:** the only evidence the one-shot judgment is tractable comes from
+    pasting a real row log into **Claude Opus** (web chat, no tools) — it returned clean candidates + existing-
+    rule examples. That validates the *task*, not **Mimo-pro one-shot**, which is the actual load-bearing
+    unknown (`08` "one load-bearing unknown"). A false `NO_ACTION` is a permanently lost rule and a false
+    `POTENTIAL_NEW_RULE` is a permanent pollutant (§3.1), so the classifier *is* the quality bar — and it is a
+    **single cheap call per row** (not the implementer loop), making it the rational place to spend on a
+    stronger model if Mimo-pro underperforms. Time + the saved `no_action/` logs (§8, §12) settle which.
+  - **🔴 Wire-protocol constraint — the Opus provider MUST be an OpenAI-compatible endpoint.** `Tunex.LLM`
+    speaks **OpenAI Chat Completions only**: it sends `messages:[{role:"system"},{role:"user"}]` (`llm.ex:60-64`)
+    and parses `body["choices"][0]["message"]["content"]` + `usage.prompt_tokens` (`llm.ex:150-163`). Anthropic's
+    **native `/v1/messages`** is a different shape (top-level `system`, `content[]` blocks, `input_tokens`,
+    `anthropic-version` header) and **would not parse** — and the one Anthropic-protocol client we have (the CC
+    harness) is **deleted** in this rebuild. So "same path, no adapter" (the design intent) holds **only** if
+    `:anthropic_opus` points at an **OpenAI-compatible** endpoint: Anthropic's own `/v1/chat/completions`
+    compat layer, or a gateway (OpenRouter / LiteLLM). Then `LLM`, `maybe_record_usage`, and `Budget` work
+    untouched. (Native-Anthropic instead ⇒ a small adapter in `LLM` — reintroducing the very protocol we're
+    deleting; avoid.)
+  - **⚠️ Dep caveat:** pointing the classifier at Opus makes Anthropic (or the gateway) a **second paid dep**
+    (CLAUDE.md's "Mimo is the only PAID dep" no longer holds for that config). It stays cheap — one few-K-token
+    call/row, no harness — but it is a distinct vendor + a distinct auth that can expire, so **Preflight must
+    smoke it** (§11 step 2 / `08` T0.4).
 - **Accuracy, NOT bias — the classifier IS the quality bar.** Both errors are permanent, symmetrically:
   - a false `NO_ACTION` is a permanently lost rule;
   - a false `POTENTIAL_NEW_RULE` that lands is a **permanent pollutant** — the Gate validates *mechanics*
@@ -110,7 +140,7 @@ target paths.
     `NO_ACTION`.** The downstream gates (pre-check, implementer, Gate) are correctness backstops, *not* a
     license to speculate — they don't catch a dubious-but-valid-looking rule.
 - Runs on **100% of rows that reached solve — success AND failed** (preserving today's
-  `orchestrator.ex:169` behavior; **not** solved-only), minus the `:reverted` deterministic lane (§3.7).
+  `orchestrator.ex:169` behavior; **not** solved-only), minus the `:reverted` deterministic lane (§3.9).
   Failed rows are the richest source of new-**syntax** rules (an unfixed Python-ism no rule caught); the task
   framing forks by outcome (§3.3). This is the new cost floor — still cheap: a `no_opportunity` row drops from
   a ~1M+ `cache_read` × ~20× multi-turn session to one ~few-K-token call. (Failed rows are a minority — most
@@ -165,7 +195,7 @@ across both; only the prompt framing forks.
     invisible (not in `APPLIED_RULES`) and indistinguishable from "no rule exists yet." It is handled as
     `POTENTIAL_NEW_RULE`.
 - **`POTENTIAL_NEW_RULE` = clean, passing, non-idiomatic code no existing rule caught.** **Always becomes a
-  new rule.** We never auto-extend an existing rule (see §3.6).
+  new rule.** We never auto-extend an existing rule (see §3.8).
 
 ### 3.5 Why no rule-name index (residual = uncovered by construction)
 
@@ -178,7 +208,7 @@ rule has *already fired*. Consequences:
 - Residual non-idiomatic code is, by definition, **not caught by any existing rule** → a new-rule proposal is
   *always* genuinely novel.
 - BUGFIX needs only the `APPLIED_RULES` closed set, not the full catalog.
-- Duplicate *names* are handled deterministically by a suffix (§3.6).
+- Duplicate *names* are handled deterministically by a suffix (§3.8).
 
 Self-suppression of duplicates was never the index's job — it is `credence-fix-runs-all-rules` +
 recompile-on-land. The index only added prompt weight and a coupling point. **Dropped.**
@@ -189,11 +219,11 @@ recompile-on-land. The index only added prompt weight and a coupling point. **Dr
 > snippet carrying an *unrelated* syntax error was never run against the existing rules, and looks "uncovered"
 > when a rule already covers it → a **duplicate rule**. (The Gate can't catch this: rule tests are
 > module-direct and assert a specific rule name, so the mutation check goes RED via a *compile error* when the
-> new rule is reverted — see §3.9 Finding.) The real guarantee is the **deterministic novelty pre-check
-> (§3.9)**, which re-runs Credence on the isolated `before` snippet *now* and asks it directly. The
+> new rule is reverted — see §3.7 Finding.) The real guarantee is the **deterministic novelty pre-check
+> (§3.7)**, which re-runs Credence on the isolated `before` snippet *now* and asks it directly. The
 > construction argument explains why residuals are *usually* novel; the pre-check is what *makes it true*.
 
-### 3.8 Phase asymmetry — phase-conditional seed + gates (read before §4–6)
+### 3.6 Phase asymmetry — phase-conditional seed + gates (read before §4–6)
 
 Credence has **three rule phases, and they are not interchangeable.** Almost every "parse / compile / AST"
 assumption in this doc is implicitly **Pattern-phase**; the other two break it. Ground truth:
@@ -206,7 +236,7 @@ assumption in this doc is implicitly **Pattern-phase**; the other two break it. 
 
 Consequences threaded through the rest of the doc:
 
-- **`:reverted` (§3.7) is Pattern-ONLY** — only Pattern has the `apply_or_revert` gate; Syntax/Semantic keep
+- **`:reverted` (§3.9) is Pattern-ONLY** — only Pattern has the `apply_or_revert` gate; Syntax/Semantic keep
   every change and compose. Pattern's **entry gate** (`pattern.ex:52`) skips non-compiling input, so every
   `:reverted` is **already** a genuine compiling→non-compiling broken rule (no Credence fix needed).
 - **New-rule opportunities skew Pattern — but Syntax/Semantic are first-class, NOT rare.** The *final* solved
@@ -225,7 +255,7 @@ Consequences threaded through the rest of the doc:
   - **Syntax** target → **no AST dump** (`before` doesn't parse — the AST helper would *raise*); seed = the raw
     before/after strings + the `Credence.Syntax.Rule` (string-level `fix/1`) exemplar; **no parse/compile gate.**
 
-### 3.9 The deterministic novelty pre-check (the real duplicate guard)
+### 3.7 The deterministic novelty pre-check (the real duplicate guard)
 
 > Runs for `POTENTIAL_NEW_RULE` only, *between* classifier and implementer. BUGFIX needs no pre-check — its
 > target provably fired (it's in `APPLIED_RULES`).
@@ -242,14 +272,27 @@ So we replace LLM-read-the-rules novelty confirmation with a **deterministic beh
 
 1. Take the classifier's `before` snippet (a self-contained `defmodule`, matching how rule tests wrap snippets).
 2. Run it through **current Credence in the clone** (freshest landed ruleset): `Credence.fix(before)` + `analyze`.
-3. **Purely behavioral — never a rule name:** if `result.code != before` (auto-fixed) **or** `result.issues
-   != []` (flagged) → **already covered → duplicate → do NOT build.** Skip the implementer (zero LLM cost), log
-   to `duplicate/` (§8). Else (untouched & unflagged) → genuinely novel → proceed to implementer new-mode.
+3. **Purely behavioral — never a rule name:** if `result.code != before` (an existing rule auto-fixed it),
+   **or** `result.applied_rules != []` (a rule fired), **or** `result.issues` contains a **non-parse-error**
+   issue (a check-only rule flagged it) → **already covered → duplicate → do NOT build.** Skip the implementer
+   (zero LLM cost), log to `duplicate/` (§8). Else (untouched, no rule fired, only-parse-error-or-no issues) →
+   genuinely novel → proceed to implementer new-mode.
+
+> **🔴 Why NOT the naive `result.issues != []`.** `Credence.analyze` (`credence.ex:16-28`) short-circuits on
+> syntax issues, but only when a syntax **rule matched** (`syntax.ex:18-19` returns `[]` for an *unmatched*
+> parse failure). So a genuinely **novel non-parsing** snippet falls through to `Pattern.analyze`, which on
+> unparseable input returns a synthetic **`parse_error_issue`** (`pattern.ex` `{:error, …}` branch) — non-empty
+> **purely because it doesn't parse**, not because any rule covers it. A naive `issues != []` would therefore
+> read **COVERED** on *every* novel syntax snippet → **no new syntax rule could ever be built** (the doc's
+> "richest source of new-syntax rules", §3.3, silently dead). The coverage signal must be **"did a real rule
+> engage"** — `code` changed, `applied_rules` non-empty, or a *non-parse-error* issue — never the bare
+> parse-error pseudo-issue. `mix credence.covers` filters it out by issue type.
 
 Properties:
 - **Phase-agnostic & needs no compilable input** — `Credence.fix` runs the Syntax pipeline *when parsing
-  fails*, so coverage is detected even for non-parsing snippets. This is precisely why §3.8 forbids a global
-  "before must compile" gate: it would break this check for Syntax.
+  fails*, so coverage is detected even for non-parsing snippets **(via `code != before` / `applied_rules`, NOT
+  the parse-error issue — see the 🔴 note above)**. This is precisely why §3.6 forbids a global "before must
+  compile" gate: it would break this check for Syntax.
 - **Doesn't matter *why* the existing rule didn't fire during solve** (syntax error, non-parsing attempt,
   recompile lag) — we re-run Credence on the clean isolated snippet and ask directly. Deterministic ground
   truth replaces the fragile construction proof, and it closes the Q3 same-window-duplicate gap (the clone has
@@ -257,11 +300,11 @@ Properties:
 - **Decouples dedup from the test convention** — unit tests stay conventional (module-direct); dedup is the
   pre-check's job. (Your "can't assert exact rule name" caveat is satisfied automatically — the pre-check is
   whole-pipeline behavioral and names no rule.)
-- **Home:** a `mix credence.covers?` task in the clone (sibling to `mix credence.ast`, §6) — reads a snippet,
-  prints `COVERED`/`NOVEL` (code changed or issues non-empty ⇒ COVERED). Dogfoolable, reusable, accepts
-  non-parsing input.
+- **Home:** a `mix credence.covers` task in the clone (sibling to `mix credence.ast`, §6) — reads a snippet,
+  prints `COVERED`/`NOVEL` (a real rule engaged — `code` changed, `applied_rules` non-empty, or a non-parse-error
+  issue ⇒ COVERED; bare parse-error ⇒ still NOVEL). Dogfoodable, reusable, accepts non-parsing input.
 
-### 3.6 Always-create-new + name collision
+### 3.8 Always-create-new + name collision
 
 We **never auto-extend** an existing rule from `POTENTIAL_NEW_RULE`. Rationale:
 
@@ -284,14 +327,14 @@ human dedup later — no dropping, no special routing.
   `avoid_*` (5). Inject just those **three prefixes** (~5 tokens) into the classifier prompt so `proposed_name`
   stays on-brand — far cheaper than re-introducing the dropped index (§3.5), and it's a convention hint, not a
   catalog.
-- **Explicit order for a NEW rule:** `classify → novelty pre-check (§3.9: pattern uncovered?) → resolve
+- **Explicit order for a NEW rule:** `classify → novelty pre-check (§3.7: pattern uncovered?) → resolve
   name + suffix → implementer`. The pre-check (pattern novelty) and the suffix-decollide (name clash) are
   independent — a genuinely novel pattern can still collide on a name a sibling took — and the pre-check runs
   **first** so a duplicate dies before any naming or implementer work.
 
 ---
 
-### 3.7 Deterministic BUGFIX lane — `:reverted` rules (no classifier)
+### 3.9 Deterministic BUGFIX lane — `:reverted` rules (no classifier)
 
 A Pattern rule whose `fix/2` turns **compiling code into non-compiling code** is *provably* broken (a linter
 fix must preserve compilability). Credence already detects, reverts, and **attributes** this exactly in the
@@ -336,9 +379,9 @@ log afterward, so the spec must carry everything downstream needs.
 ```
 decision      : NO_ACTION | BUGFIX_RULE | POTENTIAL_NEW_RULE   (must be in the offered set)
 rule_name     : present iff BUGFIX_RULE; must be ∈ APPLIED_RULES (a module name, §Q1)
-proposed_name : present iff POTENTIAL_NEW_RULE; semantic snake_case, prefixed no_/prefer_/avoid_ (§3.6)
-phase         : pattern | syntax | semantic                    (present iff a rule is proposed; plurality pattern, but syntax/semantic first-class from failed rows, §3.8/§3.3)
-before        : the offending / non-idiomatic snippet          (parse/compile gate is phase-conditional, §3.8/§4.3)
+proposed_name : present iff POTENTIAL_NEW_RULE; semantic snake_case, prefixed no_/prefer_/avoid_ (§3.8)
+phase         : pattern | syntax | semantic                    (present iff a rule is proposed; plurality pattern, but syntax/semantic first-class from failed rows, §3.6/§3.3)
+before        : the offending / non-idiomatic snippet          (parse/compile gate is phase-conditional, §3.6/§4.3)
 fixable       : { after : <idiomatic rewrite> }  |  check_only
 rationale     : one line — why this is non-idiomatic / how the existing rule over-fires
 ```
@@ -348,14 +391,14 @@ rationale     : one line — why this is non-idiomatic / how the existing rule o
   []`).
 - **Always a full, self-contained `defmodule` — ALL phases.** Pattern/semantic snippets are full modules
   already; a **syntax** snippet is wrapped in a **module template** (it still won't *parse* — that's the issue —
-  but it's a full-module-shaped string). One canonical form read identically by the novelty pre-check (§3.9),
+  but it's a full-module-shaped string). One canonical form read identically by the novelty pre-check (§3.7),
   the test scaffold (matching Credence's own `defmodule Bad do … end` convention, Q4), and the AST helper. The
   **only** phase-conditional bit is the AST *dump* (Sourceror raises on the non-parsing syntax template → §5.3
   string seed), never the *form*.
 - **🔑 `before` MUST isolate exactly ONE issue (hard contract, not a nicety).** Credence fixes **compose** —
   N syntax rules together turn garbage into compiling code, **none sufficient alone** for the full snippet. If
   `before` carries more than one issue:
-  - the **novelty pre-check** (§3.9) sees a *sibling* rule fix a *co-located* issue → `result.code != before`
+  - the **novelty pre-check** (§3.7) sees a *sibling* rule fix a *co-located* issue → `result.code != before`
     → **false `COVERED`** for a genuinely novel pattern; and
   - the **Gate mutation check** reverts the target rule but a sibling still fixes its part → RED/GREEN is **not
     attributable** to the target rule.
@@ -393,7 +436,7 @@ pattern
 ```
 
 For `POTENTIAL_NEW_RULE`, swap `===RULE_NAME===` for `===PROPOSED_NAME===` (semantic snake_case, e.g.
-`prefer_map_put_new`); the orchestrator owns final naming + suffix de-collision (§3.6).
+`prefer_map_put_new`); the orchestrator owns final naming + suffix de-collision (§3.8).
 
 ### 4.3 Deterministic validation gates
 
@@ -404,12 +447,12 @@ Parse + validate; on failure → **one re-ask**; if still invalid → log to `va
   A name that didn't fire is *structurally impossible* → reject. (The LLM cannot send us chasing a phantom
   rule.)
 - `POTENTIAL_NEW_RULE` ⇒ `phase` valid; `before` non-empty and a **full `defmodule`** (template-wrapped for
-  `syntax`, §4.1). **Parse/compile checks are phase-conditional (§3.8):** `pattern` → must parse **and**
+  `syntax`, §4.1). **Parse/compile checks are phase-conditional (§3.6):** `pattern` → must parse **and**
   compile; `semantic` → must parse; `syntax` → **no** parse/compile gate (targets non-parsing code; AST helper
   would raise). **Single-issue isolation (§4.1):** there is no cheap deterministic test that `before` carries
   exactly one issue (that's the classifier's job + prompt discipline), but the pre-check **operationally
   enforces** it — a multi-issue `before` tends to read `COVERED` (a sibling rule fires) and is dropped to
-  `duplicate/` rather than mis-built. Then run the novelty pre-check (§3.9) — `COVERED` ⇒ `duplicate/`, no
+  `duplicate/` rather than mis-built. Then run the novelty pre-check (§3.7) — `COVERED` ⇒ `duplicate/`, no
   implementer.
 - `after` parses (when fixable, and the phase isn't `syntax`); over the cap → auto-downgrade to `check_only`.
 
@@ -439,7 +482,7 @@ mutation check, and the full suite all see identical files — no drift. The sol
 (`var/run/workspace`, a path-dep to the clone) is **not** touched by the implementer.
 
 **Serial single-writer discipline (write it down).** The clone working tree is a **serial, single-writer**
-resource shared, *per row, strictly in sequence*, by: the novelty pre-check / `covers?` / AST helper
+resource shared, *per row, strictly in sequence*, by: the novelty pre-check / `covers` / AST helper
 (read-only `mix run`), then the implementer (writes `lib/` + `test/`), then the Gate (writes during the
 mutation snapshot, then `git reset --hard` on reject). v2 is one stream (one GPU, one clone), so there are no
 races — but nothing may run the clone concurrently, and every row must leave the tree clean (commit or Gate
@@ -448,7 +491,7 @@ races — but nothing may run the clone concurrently, and every row must leave t
 **Recompile-after-commit (load-bearing, keep it).** On a successful Gate commit the new commit path **must**
 call `Workspace.recompile_credence/1` (as the deleted orchestration did) so the *solve* workspace's credence
 path-dep picks up the landed rule. Now *solve-quality* (fewer residuals reach the classifier), no longer
-dedup-critical — the §3.9 pre-check reads the clone directly, which is fresh on commit — but dropping it
+dedup-critical — the §3.7 pre-check reads the clone directly, which is fresh on commit — but dropping it
 silently degrades solve coverage over a long run.
 
 ### 5.1 One engine, two modes
@@ -467,7 +510,7 @@ failures back → retry (≤ `rule_gen_max_retries`) → Gate**. Do **not** fork
 - **over-fire** (from the classifier) — the rule fired and produced *worse/more-verbose/wrong but compiling*
   code. Seed = the over-firing before/after; the narrowed `_check` test goes RED on the HEAD rule (issue
   present → must-not-fire fails).
-- **broke-compile** (from the deterministic `:reverted` lane, §3.7) — the rule's `fix/2` turned *compiling*
+- **broke-compile** (from the deterministic `:reverted` lane, §3.9) — the rule's `fix/2` turned *compiling*
   input into *non-compiling* output. Seed = "`<rule>.fix/2` produced non-compiling code on this `before`;
   narrow the match so it doesn't fire here, **or** repair the patch." Regression test asserts the rule no
   longer breaks this input (`fix(before)` compiles, or the rule no longer fires on `before`); the mutation gate
@@ -485,7 +528,7 @@ large-rule bugfixes fail in practice.)
 MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a generic `===KEY===` →
 `%{key => content}` splitter (whole-file emit ⇒ each block is a complete file):
 
-- **New mode — fixed-role markers**, orchestrator maps roles → the suffix-decollided paths it assigned (§3.6);
+- **New mode — fixed-role markers**, orchestrator maps roles → the suffix-decollided paths it assigned (§3.8);
   the model never picks paths:
   ```
   ===RULE===          <rule.ex>
@@ -512,7 +555,7 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
 
 - **Both before + after AST dumps**, precomputed by the AST helper (§6) and passed as **arguments** to the
   loop. The loop never invokes the helper itself (keeps it non-agentic; no `mix run -e`, ever).
-  **Phase-conditional (§3.8):** AST dumps apply to `pattern` (and `semantic`, which parses); for a **`syntax`**
+  **Phase-conditional (§3.6):** AST dumps apply to `pattern` (and `semantic`, which parses); for a **`syntax`**
   target the module-template doesn't parse, so the seed is the **templated before/after module strings + the
   `Credence.Syntax.Rule` string-level `fix/1` exemplar** instead of AST dumps. (The *form* is still a full
   module — §4.1 — only the dump is skipped.)
@@ -567,7 +610,7 @@ Credence has **no AST-inspection tool today** (rules use `Macro.prewalk/postwalk
 no `ast_walk`, no mix task). The old agent explored — `mix run -e` experiments — precisely to *guess* the
 Sourceror tuple shape. Hand it the shape and the exploration disappears.
 
-- **Phase scope (§3.8): the AST helper is for `pattern`/`semantic` only.** A `syntax`-phase `before` does not
+- **Phase scope (§3.6): the AST helper is for `pattern`/`semantic` only.** A `syntax`-phase `before` does not
   parse, so `Sourceror.parse_string!` *raises* — never run the helper on a syntax snippet; its implementer
   seed is raw strings (§5.3). The orchestrator gates on phase before invoking the helper.
 - **Home: a new `mix credence.ast` task in the Credence repo** (reads code from stdin/file, prints the AST).
@@ -677,7 +720,7 @@ that's not a debugging artifact.)
 - **A bad rewrite can't land** — the Gate's mutation test (RED without the rule) + full-suite-green reject any
   over-aggressive narrowing or any rule that breaks the suite.
 - **A bad spec can't burn an implementer** — `before`/`after` are full `defmodule`s with phase-conditional
-  parse/compile gates (§3.8); the **novelty pre-check** kills duplicates/multi-issue leakage *before* the
+  parse/compile gates (§3.6); the **novelty pre-check** kills duplicates/multi-issue leakage *before* the
   implementer; over-cap `after` → check-only; malformed → one re-ask → `classifier_errors/`.
 - **A false `NO_ACTION` is bounded** — human-sampled audit of retained `no_action/` logs (§12), zero token cost.
 - **The `:reverted` lane can't fix a healthy rule** — Pattern's entry gate (`pattern.ex:52`) skips
@@ -705,16 +748,23 @@ that's not a debugging artifact.)
      breakdown can separate classifier from implementer — the thing that makes step 6's "did we hit 4–8×, and
      what's left?" legible. *Prereq for trusting every later number; ~free.*
 1. **AST helper** — `mix credence.ast` in Credence + dogfood against a known rule's snippet. Unblocks the
-   implementer. **Same Credence pass (ship together — all Credence-side):** (i) `mix credence.covers?`
-   behavioral novelty task (§3.9); (ii) *optional* — `log_diff` in the Pattern revert branch for seed
-   visibility (§3.7). **No revert-gate fix — `:reverted` is already a clean signal (Pattern entry gate,
+   implementer. **Same Credence pass (ship together — all Credence-side):** (i) `mix credence.covers`
+   behavioral novelty task (§3.7); (ii) *optional* — `log_diff` in the Pattern revert branch for seed
+   visibility (§3.9). **No revert-gate fix — `:reverted` is already a clean signal (Pattern entry gate,
    `pattern.ex:52`).**
-2. **Classifier** — raw `Tunex.LLM` / Mimo-pro, marker output, validation gates, option-shaping, coarse
-   Python-cut distillation (`===SOLVE_BOUNDARY===` sentinel, §7), `APPLIED_RULES` + ledger inputs.
+2. **Classifier** — raw `Tunex.LLM`, **configurable provider** (default Mimo-pro, `:anthropic_opus`
+   alternative — §3.1), marker output, validation gates, option-shaping, coarse Python-cut distillation
+   (`===SOLVE_BOUNDARY===` sentinel, §7), `APPLIED_RULES` + ledger inputs.
    **Config delta:** add `:classify` (+ `:implement`) to `stages` + `stage_max_tokens`; relax the
-   `Config.provider_for/1` + `stage_max_tokens/1` `when stage in […]` guards; reuse `xiaomi_mimo_2_5_pro`
-   (default reasoning); thread the stage atom into `Budget.record` (§3.1).
-3. **Solver-loop implementer** — both modes (phase-conditional seed, §3.8) + AST-dump injection + the new
+   `Config.provider_for/1` + `stage_max_tokens/1` `when stage in […]` guards; default `stages.classify =
+   :xiaomi_mimo_2_5_pro`; add the optional `:anthropic_opus` provider (+ `secret_providers` header +
+   `budget.prices` entry); thread the stage atom into `Budget.record` (§3.1).
+   **Preflight delta:** smoke-test whichever provider `stages.classify` resolves to via a one-token
+   `LLM.for_stage(:classify, …)` call (mirrors `cc_smoke!`/`mimo_chat_reachable!`) so a wrong/expired Anthropic
+   key (or a mis-set override) fails *boot*, not mid-run. Unlike the remote-solve skip (which shares Mimo's
+   already-proven host), the classifier provider may be a **distinct vendor/auth**, so it is always smoked —
+   the one-token cost is trivial insurance against losing a whole run on a stale key.
+3. **Solver-loop implementer** — both modes (phase-conditional seed, §3.6) + AST-dump injection + the new
    outcome directories (`no_action/`, `duplicate/`, `classifier_errors/`). Runs in the **clone** (§5); the
    commit path calls `Workspace.recompile_credence/1`. **Wired classifier → implementer end-to-end
    immediately** (no measure-only sub-phase).
@@ -738,6 +788,15 @@ So:
   through a *differently-prompted* classifier ("find the rule a lazy reviewer missed"). Spending tokens to
   second-guess the smart judge inverts the design; build only if human sampling ever shows an unacceptable
   miss rate (a problem that probably never happens).
+- **Documented-not-built — model-divergence sampling (A/B, not second-guessing).** Distinct from the
+  second-opinion above: every *N*th row, run the **same** distilled input through **both** configured
+  classifier models (e.g. Mimo-pro *and* Opus) and log **both** specs side-by-side. Purpose is **calibration
+  data**, not quality arbitration — quantify *how differently the two models judge the same input* so the
+  Mimo-vs-Opus choice (§3.1) rests on numbers, not the single Opus anecdote. Cheap (1-in-*N* × one extra
+  few-K call) and self-terminating once enough data is gathered. **Mostly free already:** because nothing is
+  deleted (§8), every classifier input+output is on disk, so the *same* comparison can be run **offline** by
+  re-feeding saved `no_action/`/`committed/` inputs through the other model — build the online A/B sampler only
+  if offline replay proves too coarse. Sampling rate `classifier_ab_sample_every` (0 = off, default).
 
 ---
 
@@ -746,14 +805,14 @@ So:
 | # | Decision |
 |---|---|
 | Replacement | Full rebuild of rule-creation; ClaudeCode harness + agentic generator **deleted**, no fallback |
-| Classifier | One raw `Tunex.LLM` call, `mimo-v2.5-pro` + thinking, no tools, ~200-tok system prompt, on 100% of rows (minus §3.7 lane). **Accuracy not bias — it IS the quality bar** (Gate checks mechanics, not idiomatic merit; a bad landing rule pollutes all future code). Tiny-but-real welcome; uncertain → NO_ACTION; never speculate (§3.1) |
-| Classifier input | distilled log + `APPLIED_RULES` + ledger; **no rule-name index** — dedup is the §3.9 pre-check, not a construction proof |
-| Phase asymmetry | Syntax (non-parsing, string-level) / Semantic (warnings) / Pattern (compiling, AST). Seed + `before` gates are **phase-conditional** (§3.8); new rules are *plurality* pattern but syntax/semantic are first-class (from failed rows, §3.3); BUGFIX is phase-polymorphic |
-| Novelty pre-check | `POTENTIAL_NEW_RULE` only: run `before` through `Credence.fix` in the clone (`mix credence.covers?`); `COVERED` ⇒ duplicate ⇒ `duplicate/`, skip implementer. Behavioral, names no rule, phase-agnostic, no compile gate (§3.9) |
+| Classifier | One raw `Tunex.LLM` call, **configurable provider** (default `mimo-v2.5-pro`+thinking; `:anthropic_opus` alternative — switch via `stages.classify`/`TUNEX_CLASSIFY_PROVIDER`; Opus = a 2nd paid dep, Preflight-smoked), no tools, ~200-tok system prompt, on 100% of rows (minus §3.9 lane). **Accuracy not bias — it IS the quality bar** (Gate checks mechanics, not idiomatic merit; a bad landing rule pollutes all future code). Tiny-but-real welcome; uncertain → NO_ACTION; never speculate (§3.1) |
+| Classifier input | distilled log + `APPLIED_RULES` + ledger; **no rule-name index** — dedup is the §3.7 pre-check, not a construction proof |
+| Phase asymmetry | Syntax (non-parsing, string-level) / Semantic (warnings) / Pattern (compiling, AST). Seed + `before` gates are **phase-conditional** (§3.6); new rules are *plurality* pattern but syntax/semantic are first-class (from failed rows, §3.3); BUGFIX is phase-polymorphic |
+| Novelty pre-check | `POTENTIAL_NEW_RULE` only: run `before` through `Credence.fix` in the clone (`mix credence.covers`); `COVERED` (a **real rule engaged** — `code` changed / `applied_rules` non-empty / non-parse-error issue; **🔴 NOT** the bare `parse_error_issue`, else every novel syntax rule dies — §3.7) ⇒ duplicate ⇒ `duplicate/`, skip implementer. Behavioral, names no rule, phase-agnostic, no compile gate (§3.6) |
 | Output | marker-fenced thick spec `{decision, rule_name?|proposed_name?, phase, before, fixable:{after}|check_only, rationale}`; `before`/`after` are **full `defmodule`s, all phases** (syntax = module template), each **isolating exactly ONE issue** (composition: N rules rescue garbage, none alone — isolation makes pre-check + mutation gate attributable, §4.1) |
 | Option-shaping | empty `APPLIED_RULES` → BUGFIX not offered. **Runs on every row that reached solve (success AND failed)**; solve outcome forks the task lens — solved → idiomatic residual; failed → unfixed syntax/semantic issue (new-syntax source) (§3.3) |
 | BUGFIX | constrained to `APPLIED_RULES` (over-firing only); under-firing → NEW |
-| `:reverted` lane | `:reverted` (Pattern-only) is **already** a genuine compiling→non-compiling broken rule — Pattern's entry gate (`pattern.ex:52`) skips non-compiling input, so `compiles?(source)` is invariant. → **deterministic** bugfix, **skips classifier**, **no Credence change** (§3.7) |
+| `:reverted` lane | `:reverted` (Pattern-only) is **already** a genuine compiling→non-compiling broken rule — Pattern's entry gate (`pattern.ex:52`) skips non-compiling input, so `compiles?(source)` is invariant. → **deterministic** bugfix, **skips classifier**, **no Credence change** (§3.9) |
 | NEW | **always create new**, never extend; classifier emits `proposed_name` (on-convention `no_/prefer_/avoid_`); order = classify → pre-check → resolve name+suffix → implement; orchestrator owns final naming |
 | `after` complexity | capped; over-cap → auto check-only; **CHECK-ONLY is the universal fallback** |
 | Validation | deterministic gates; one re-ask → `classifier_errors/` |
@@ -767,7 +826,7 @@ So:
 | Ledger | kept, feeds classifier whole/uncapped (stays near-empty by design); writes on implementer-failed + gate_reject only; phantom retired; duplicate/classifier_errors don't ledger |
 | No deletion | move-to-outcome-dir; new `no_action/`, `classifier_errors/`; `tunex.reset` still clears |
 | Measurement | **no `summed_usage` port** — the undercount was a CC-harness artifact deleted with it; per-call `Budget.record` IS the bucket basis (expect ledger ≈ console ~1×). Add **per-stage tagging** (`:classify`/`:implement`/`:solve`). Trust console for absolutes (§11.0) |
-| Shadow | human-sampled `no_action/` audit; automated second-opinion = footnote only |
+| Shadow | human-sampled `no_action/` audit; automated second-opinion = footnote only; **model-divergence A/B sampling** (run both classifier models on 1-in-N rows for calibration data) = documented-not-built, mostly replayable offline from saved logs (§12) |
 | Escalation archive | `credence_failed` branch kept as-is |
 | Sequencing | summed_usage → AST helper → classifier → implementer → escalation → delete old → measure |
 
@@ -795,6 +854,8 @@ So:
 - **Full marker-fencing distillation** (§7) — coarse cut suffices for one smart call; build if the classifier
   mis-judges from log noise.
 - **Automated second-opinion shadow** (§12) — footnote; human sampling first.
+- **Model-divergence A/B sampling** (§12) — run both classifier models on 1-in-N rows to quantify how
+  differently they judge; build the online sampler only if offline replay of saved logs proves too coarse.
 - **Focused-agentic escalation for long-tail complex rules** — the solver loop is the *sole* implementer this
   round; if it can't land a genuinely complex rule it `gave_up`s. Measure yield before reintroducing any
   agentic lane.

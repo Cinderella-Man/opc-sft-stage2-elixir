@@ -15,7 +15,7 @@ ordered, dependency-aware, atomic tasks with acceptance criteria. Section refs (
 
 ```
 Phase 0  config + measurement basis        ─┐
-Phase 1  [C] Credence PR (ast/covers?/revert-fix) ─┤→ both unblock everything downstream
+Phase 1  [C] Credence PR (ast/covers/revert-fix) ─┤→ both unblock everything downstream
 Phase 2  log plumbing (sentinel/distill/APPLIED_RULES parse + grep→path)
 Phase 3  classifier (prompt/parse/validate/option-shape/outcome-fork)
 Phase 4  deterministic lanes (:reverted lane · novelty pre-check)
@@ -33,13 +33,15 @@ integration. **Do not delete anything (Phase 7) until 2–3 rules land end-to-en
 
 | # | Files | Task | Acceptance |
 |---|---|---|---|
-| **T0.1** | `lib/tunex/config.ex`, `config/config.exs` | Add `:classify` + `:implement` to `stages` + `stage_max_tokens` (both → `:xiaomi_mimo_2_5_pro`; floors TBD-tuning, start classify 16k / implement 16k). **Relax** the `when stage in [:translate, :solve]` guards in `provider_for/1` + `stage_max_tokens/1` to include the two new stages. | `LLM.for_stage(:classify, …)` / `(:implement, …)` resolve a provider + floor without raising; `TUNEX_CLASSIFY_PROVIDER` override works. |
+| **T0.1** | `lib/tunex/config.ex`, `config/config.exs` | Add `:classify` + `:implement` to `stages` + `stage_max_tokens` (default both → `:xiaomi_mimo_2_5_pro`; floors TBD-tuning, start classify 16k / implement 16k). **Relax** the `when stage in [:translate, :solve]` guards in `provider_for/1` + `stage_max_tokens/1` to include the two new stages. | `LLM.for_stage(:classify, …)` / `(:implement, …)` resolve a provider + floor without raising; `TUNEX_CLASSIFY_PROVIDER` override works. |
+| **T0.1b** | `config/config.exs`, `config/secrets.exs`, `budget.prices` | **Configurable classifier model (`07` §3.1).** Add an **`:anthropic_opus` provider** (`model: "claude-opus-4-8"`, secret `Authorization` header in `secret_providers`) + a `budget.prices` entry so per-stage metering (T0.2) is honest. **🔴 `base_url` MUST be an OpenAI-compatible endpoint** — `Tunex.LLM` only speaks OpenAI Chat Completions (`messages` w/ system role, `choices[].message.content`, `usage.prompt_tokens` — `llm.ex:60-64,150-163`); native Anthropic `/v1/messages` won't parse and the only Anthropic client (CC harness) is deleted. Use Anthropic's `/v1/chat/completions` compat layer or a gateway (OpenRouter/LiteLLM), **no adapter**. Default `stages.classify` stays `:xiaomi_mimo_2_5_pro`; switching to Opus = repoint `stages.classify` or set `TUNEX_CLASSIFY_PROVIDER=anthropic_opus`. | With `stages.classify = :anthropic_opus` (or the env override), `LLM.for_stage(:classify, …)` hits Opus through the **unmodified** chat path and records cost under `classify`; default config still uses Mimo-pro. |
 | **T0.2** | `lib/tunex/llm.ex`, `lib/tunex/budget.ex` | Thread the **stage atom** `for_stage → call → Budget.record` (replace hardcoded `kind: :chat` in `maybe_record_usage`). | `mix tunex.usage` by-stage split shows `classify` / `implement` / `solve` separately. |
 | **T0.3** | — (measurement) | Run one row, compare `mix tunex.usage` vs console Δ (`mix tunex.diag`). **Expect ≈1×** (not 20–50× — that undercount dies with the harness). | Documented ratio ≈1×; if not, investigate provider cache billing before proceeding. **No `summed_usage` port.** |
+| **T0.4** | `lib/tunex/preflight.ex` | **Smoke the classifier provider.** Add a `classify_endpoint_reachable!` check (mirror `cc_smoke!`/`mimo_chat_reachable!`): one-token `LLM.for_stage(:classify, "reply OK", "", max_tokens: 16)` against whatever `stages.classify` resolves to. **Always** smoke it (unlike the remote-solve skip) — the classifier may be a distinct vendor (Anthropic) with a separate, expirable key; a stale key must fail *boot*, not mid-run. Also assert the secret header is present (parallel to the existing `has_cc`/`has_chat` checks). | A wrong/missing classifier key fails `mix tunex.preflight`; a good key logs `[Preflight] classify endpoint reachable (<provider>)`. |
 
 ---
 
-## Phase 1 — [C] Credence PR (`07` §3.7, §3.9, §6)
+## Phase 1 — [C] Credence PR (`07` §3.9, §3.7, §6)
 
 > One PR to `../credence`. **No revert-gate fix** — an earlier draft proposed one but it was based on a wrong
 > premise: `Pattern.fix_with_trace` (`pattern.ex:52`) skips the whole pipeline unless the source compiles, so
@@ -49,7 +51,7 @@ integration. **Do not delete anything (Phase 7) until 2–3 rules land end-to-en
 | # | Files (credence) | Task | Acceptance |
 |---|---|---|---|
 | **T1.1** | `lib/mix/tasks/credence.ast.ex` (new) | `mix credence.ast` — reads code (stdin/file), prints **two views**: raw `inspect(Sourceror.parse_string!(code), pretty, limit: :infinity)` (incl. `{:__block__,_,[lit]}` wrappers) + layout-stripped. **Never** emit `normalize_sourceror_ast`/unwrapped form. | **Dogfood:** run on a snippet a known rule matches; dump matches what that rule's `check/2` pattern-matches. |
-| **T1.2** | `lib/mix/tasks/credence.covers.ex` (new) | `mix credence.covers?` — reads a snippet, runs `Credence.fix` + `analyze`; prints `COVERED` iff `result.code != input` **or** `result.issues != []`, else `NOVEL`. Accepts **non-parsing** input (Credence.fix handles it). Names no rule. | A snippet an existing rule fixes → `COVERED`; a genuinely novel snippet → `NOVEL`. |
+| **T1.2** | `lib/mix/tasks/credence.covers.ex` (new) | `mix credence.covers` — reads a snippet, runs `Credence.fix` + `analyze`; prints `COVERED` iff a **real rule engaged**: `result.code != input` **or** `result.applied_rules != []` **or** `result.issues` has a **non-parse-error** issue; else `NOVEL`. **🔴 Must filter the synthetic `parse_error_issue`** — `Pattern.analyze` (`pattern.ex` `{:error,…}` branch) emits it for *any* non-parsing input, so a naive `issues != []` falsely reads COVERED on every novel **syntax** snippet and kills all new-syntax-rule creation (`07` §3.7 🔴 note). Accepts **non-parsing** input. Names no rule. | A snippet an existing rule fixes/flags → `COVERED`; a genuinely novel snippet (incl. a **non-parsing** one no syntax rule matches) → `NOVEL`. |
 | **T1.3** *(optional)* | `lib/pattern.ex` (`apply_or_revert` revert branch) | **Visibility only:** call `RuleHelpers.log_diff(name, source, fixed)` in the revert branch (today only the keep-branch logs the diff) so a reverted fix's before/after lands in the row log for the implementer seed. **Do NOT touch the revert *logic*** — `:reverted` is already correct. | Reverted fixes show a before/after diff in the log; full credence suite green. Skippable — the seed can be reconstructed from solve-attempt code + `APPLIED_RULES`. |
 
 ---
@@ -71,16 +73,16 @@ integration. **Do not delete anything (Phase 7) until 2–3 rules land end-to-en
 |---|---|---|---|
 | **T3.1** | `lib/tunex/classify/prompt.ex` (new) | Build prompt: distilled log + `APPLIED_RULES` (path-resolved closed set) + whole ledger + convention prefixes (`no_/prefer_/avoid_`). **Outcome-forked lens** (solved → idiomatic residual; failed → unfixed-issue) sharing one output-contract core. ~200-tok system prompt. | Prompt contains the closed set, ledger, prefixes; lens matches solve outcome; no rule-name index. |
 | **T3.2** | `lib/tunex/classify/parser.ex` (new) | Parse marker output (`===DECISION===`/`===RULE_NAME===`\|`===PROPOSED_NAME===`/`===PHASE===`/`===BEFORE===`/`===AFTER===`\|`===CHECK_ONLY===`/`===RATIONALE===`/`===END===`) → struct. | Round-trips a valid spec; tolerant of stray whitespace. |
-| **T3.3** | `lib/tunex/classify.ex` (new) | Orchestrate: option-shaping (empty closed set → no BUGFIX); `LLM.for_stage(:classify)`; validation gates (decision ∈ offered; `rule_name` ∈ closed set **and** grep-resolves; `proposed_name` snake_case; **phase-conditional** `before` parse/compile per §3.8; `before`/`after` full `defmodule`; `after` over-cap → check-only). **One re-ask** (full re-send + specific error) → else `classifier_errors/`. | Valid spec → struct; each invalid-spec class → one re-ask → `classifier_errors/` on second failure. |
+| **T3.3** | `lib/tunex/classify.ex` (new) | Orchestrate: option-shaping (empty closed set → no BUGFIX); `LLM.for_stage(:classify)`; validation gates (decision ∈ offered; `rule_name` ∈ closed set **and** grep-resolves; `proposed_name` snake_case; **phase-conditional** `before` parse/compile per §3.6; `before`/`after` full `defmodule`; `after` over-cap → check-only). **One re-ask** (full re-send + specific error) → else `classifier_errors/`. | Valid spec → struct; each invalid-spec class → one re-ask → `classifier_errors/` on second failure. |
 
 ---
 
-## Phase 4 — Deterministic lanes (`07` §3.7, §3.9)  · *depends: T1.2, T1.3, T2.3, T2.4*
+## Phase 4 — Deterministic lanes (`07` §3.9, §3.7)  · *depends: T1.2, T1.3, T2.3, T2.4*
 
 | # | Files | Task | Acceptance |
 |---|---|---|---|
 | **T4.1** | router (see T6.1) | **`:reverted` lane** — BEFORE the classifier: if `APPLIED_RULES` has any `{Mod, :reverted}` → route to implementer **bugfix mode** (culprit `Mod`, broke-compile sub-shape), **skip classifier**. First culprit only. Works against current Credence (no gate fix). | A row with a `:reverted` culprit never calls the classifier; goes straight to bugfix. |
-| **T4.2** | `lib/tunex/novelty.ex` (new) | **Novelty pre-check** — for `POTENTIAL_NEW_RULE` only: shell `mix credence.covers?` in clone on `before`. `COVERED` → `duplicate/`, skip implementer. `NOVEL` → proceed. (Runs after the classifier, before naming/implementer.) | A `before` an existing rule covers → `duplicate/`, no implementer run; novel → proceeds. |
+| **T4.2** | `lib/tunex/novelty.ex` (new) | **Novelty pre-check** — for `POTENTIAL_NEW_RULE` only: shell `mix credence.covers` in clone on `before`. `COVERED` → `duplicate/`, skip implementer. `NOVEL` → proceed. (Runs after the classifier, before naming/implementer.) | A `before` an existing rule covers → `duplicate/`, no implementer run; novel → proceeds. |
 
 ---
 
@@ -134,6 +136,10 @@ integration. **Do not delete anything (Phase 7) until 2–3 rules land end-to-en
   the input/output ceilings; `no_action/` retention.
 - **§15 "not this round"** — full marker-fencing distillation; automated second-opinion shadow;
   focused-agentic escalation; Sourceror cheatsheet; migrating existing rules to split tests.
+- **Model-divergence A/B sampling (`07` §12)** — every N-th row, run the distilled input through **both**
+  classifier models (Mimo-pro + Opus) and log both specs for calibration data (`classifier_ab_sample_every`,
+  default 0=off). Mostly replayable offline from the saved `no_action/`/`committed/` logs (no-deletion, §8), so
+  build the online sampler only if offline replay is too coarse. Not on the critical path.
 
 ---
 
