@@ -55,6 +55,36 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
      element" instead of all of them) — that changes behavior-by-reasoning, not
      form, and is out of scope.
 
+  1a. HARD SAFETY RULE — never change the value's TYPE.
+  NEVER generate a rule whose fix changes the TYPE of the value the code produces.
+  A rewrite must return the same kind of value (integer, string, list, etc.) for
+  every input. If the "before" and "after" can ever be different types, the rule is
+  wrong even if it looks tidier — discard it, do not emit it.
+
+  The most common trap is codepoint↔grapheme on strings. These are NOT
+  interchangeable:
+
+    - String.to_charlist/1, String.codepoints/1, ?c literals  -> work on CODEPOINTS
+      (small pieces; produce INTEGERS / lists of integers)
+    - String.at/1, String.length/1, String.reverse/1, String.graphemes/1,
+      String.count/2                                            -> work on GRAPHEMES
+      (whole characters; produce STRINGS)
+
+  Specifically BANNED — never generate these or any variant of them:
+
+    - Enum.at(String.to_charlist(s), i)  ->  String.at(s, i)
+        WRONG: left returns a codepoint INTEGER, right returns a one-character
+        STRING. This is a type change, true for every input including plain ASCII.
+        There is no safe fix for indexed character access off a charlist — leave
+        it alone. (Do not work around the exact wording with hd(tl(...)),
+        |> Enum.fetch(i), |> Enum.at(i), list comprehensions, etc. — same trap.)
+
+  Rule of thumb: if a rewrite swaps a codepoint operation for a grapheme operation
+  (or the reverse), and the result types differ, NEVER emit it. (A same-type
+  codepoint↔grapheme rewrite — e.g. a count or a reverse where both sides are
+  strings — is a separate, switch-gated case and is handled elsewhere; that is not
+  your call to make here.)
+
   1b. SECOND SIGNAL — the Credence FIX TRACE (the APPLIED_RULES line + every
       before/after pair in the log). Scrutinize each fix Credence ALREADY applied:
       did it actually IMPROVE the code, or did it make it MORE VERBOSE / WORSE /

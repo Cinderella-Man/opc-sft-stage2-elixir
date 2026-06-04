@@ -139,6 +139,16 @@ target paths.
     *thousands* of precise rules aggregating — a real but small improvement is still a rule); **uncertain is
     `NO_ACTION`.** The downstream gates (pre-check, implementer, Gate) are correctness backstops, *not* a
     license to speculate — they don't catch a dubious-but-valid-looking rule.
+  - **Behaviour preservation is absolute *relative to Credence's declared assumptions* (§3.10; Credence ≥0.7.0
+    "safety switches").** A proposed `after` must be output-identical to `before` for **every input the active
+    `assumptions:` admit**. Tunex runs Credence in its **default (helpful)** mode (one promise on,
+    `single_codepoint_graphemes`), so "every input" here means "every single-piece-character input." Two
+    sub-classes still route to `NO_ACTION`: **type-changing** rewrites (charlist↔grapheme, integer vs string —
+    forbidden *forever*, no switch can rescue) and **rare-text-divergent** rewrites (grapheme/codepoint
+    count·reverse·palindrome — legal in Credence only as *switch-gated* rules with a property test, which the
+    non-agentic implementer can't author this round → deferred, §15). For pattern rules, §3.11's deterministic
+    `credence.equiv` check now *executes* this (catching the type-change class on any exercised input); the
+    classifier quality-bar duty remains the backstop for non-battery inputs, eval-order, and non-pattern phases.
 - Runs on **100% of rows that reached solve — success AND failed** (preserving today's
   `orchestrator.ex:169` behavior; **not** solved-only), minus the `:reverted` deterministic lane (§3.9).
   Failed rows are the richest source of new-**syntax** rules (an unfixed Python-ism no rule caught); the task
@@ -201,7 +211,9 @@ across both; only the prompt framing forks.
 
 Credence-fix runs **all** existing rules during solve's `Validator` step 1/6, and a landed rule **recompiles**
 into subsequent rows. Therefore, by the time the classifier sees the final code, every applicable existing
-rule has *already fired*. Consequences:
+rule has *already fired* — where, on Credence ≥0.7.0, "all rules" means all rules **active under the current
+`assumptions:` mode**. Tunex always runs the **default (helpful)** mode, never `:strict`, so switch-gated rules
+(§3.10) count among "all rules" and self-suppress as residuals here too. Consequences:
 
 - If a rule covered this pattern, the code is already fixed → idiomatic → the classifier says `NO_ACTION`
   **on the code's own merits**, with no index needed.
@@ -254,6 +266,8 @@ Consequences threaded through the rest of the doc:
     *diagnostic* the rule keys on, not pure AST shape.
   - **Syntax** target → **no AST dump** (`before` doesn't parse — the AST helper would *raise*); seed = the raw
     before/after strings + the `Credence.Syntax.Rule` (string-level `fix/1`) exemplar; **no parse/compile gate.**
+    (The raw-string-seed choice is an **unverified assumption** — Sourceror's fault-tolerant parser *might*
+    yield a usable error locus for a targeted seed; validate via the §6 spike before building it. `09` §3.)
 
 ### 3.7 The deterministic novelty pre-check (the real duplicate guard)
 
@@ -300,6 +314,13 @@ Properties:
 - **Decouples dedup from the test convention** — unit tests stay conventional (module-direct); dedup is the
   pre-check's job. (Your "can't assert exact rule name" caveat is satisfied automatically — the pre-check is
   whole-pipeline behavioral and names no rule.)
+- **Binary unique-TP, deliberately.** The check is "does *any* existing rule engage?" (drop if so) — i.e. a
+  unique-TP = 0 reject. [`09`](09_external_research_self_evolving_rule_systems.md) **F4** (ADE `arXiv:2509.16749`,
+  3-0: score rules by `½(precision + unique-TP)`) backs *rejecting redundant rules* — but a **continuous**
+  unique-TP *threshold* is deliberately NOT applied at the autonomous gate: it would fight §3.8's "micro-rules
+  welcome" (a tiny-but-real unique catch is still a rule). The continuous ADE score belongs at **human
+  `evolution → main` review** (the `candidates.md` acceptance bar — "does this add a unique true positive?"),
+  not here.
 - **Home:** a `mix credence.covers` task in the clone (sibling to `mix credence.ast`, §6) — reads a snippet,
   prints `COVERED`/`NOVEL` (a real rule engaged — `code` changed, `applied_rules` non-empty, or a non-parse-error
   issue ⇒ COVERED; bare parse-error ⇒ still NOVEL). Dogfoodable, reusable, accepts non-parsing input.
@@ -369,6 +390,207 @@ reconstructed from the solve-attempt code + `APPLIED_RULES`.
 This is strictly **additive** to the classifier flow: the 100%-classifier floor (§3.1) becomes "100% of rows
 *without* a `:reverted` culprit."
 
+### 3.10 Behaviour preservation — absolute *relative to declared assumptions* (the master correctness invariant — overrides idiom)
+
+> **Reframed by Credence 0.7.0 "safety switches" (`assumptions:`).** This invariant used to read "the `after`
+> must be output-identical to `before` for *every* input, no exceptions." Credence now states
+> behaviour-preservation **relative to a declared domain**: *"Credence never changes behaviour on any input the
+> stated promises (`assumptions:`) admit."* In **`:strict`** mode zero promises are made ⇒ the admitted domain
+> is *every possible input* ⇒ bit-identical output, the old iron-clad guarantee, reachable by one word. In the
+> **default (helpful)** mode one checkable promise — `single_codepoint_graphemes` (every character is a single
+> codepoint: no decomposed/NFD accents, ZWJ emoji, flags) — is **on**, so a rule may also fire when its rewrite
+> is output-identical *for every promise-satisfying input*, declared via `def assumptions, do:
+> [:single_codepoint_graphemes]` and **proved by a mandatory StreamData property test**.
+>
+> **Tunex runs Credence in the default (helpful) mode everywhere** (solve Validator, the `covers` novelty
+> pre-check §3.7, the Gate suite) — never `:strict` — so switch-gated rules fire and self-suppress as residuals
+> exactly as for real users (§3.5).
+
+> Binds **every** stage that emits a *behaviour-equivalence claim* — a code→code rewrite asserted to be the
+> same: the **classifier** (proposes `before`/`after`, §4.1), the **implementer** (writes `fix/2`, §5), and the
+> **`:reverted`/bugfix** lanes. The 5-part Gate validates *mechanics* (touches `lib/`+`test/`, mutation RED,
+> suite green) — **not** behaviour identity. **§3.11 closes most of this gap for pattern rules:** a
+> deterministic `mix credence.equiv` check executes `before` vs `fix(before)` across an adversarial battery, at
+> classify-time **and** as a 6th Gate check, catching value / type / exception / order divergence (incl. the
+> type-change class on any *exercised* input). What remains on **prompt discipline** (`08` T3.1 / T5.1) is the
+> narrow residual §3.11 can't execute: a divergence only on a non-battery input, **evaluation-order / side-effect
+> divergence**, and the **semantic/syntax** phases (no compilable `before`). *(One more tooth from 0.7.0: the
+> clone's full suite — which the Gate runs — meta-tests that every `assumptions`-tagged rule has a property test
+> and names only real switches, §10.)*
+>
+> **Out of scope: solve / translate.** Same as before — both author code rather than refactor it, so neither
+> makes an equivalence claim. The invariant is a property of **rule fixes**, which is exactly the
+> classifier/implementer surface above.
+
+- **A fix that can change output *within the admitted domain* is not a fix.** "Correct for the common input"
+  is still not good enough: a fixable rule's `after` must be output-identical for *every input the active
+  promises admit* (`fix(before) == after` *and* a no-op wherever its rewrite would diverge on such input). The
+  only thing 0.7.0 changes is *which* inputs count — `:strict` = all of them, helpful = the single-codepoint
+  ones.
+- **No check-only path at all (2026-06-04 policy, §4.1).** Earlier drafts allowed a CHECK-ONLY
+  (`fix_patches/2 -> []`) fallback for fix *complexity*. **Removed.** Behaviour-*unsafety* and
+  fix-*complexity* now route to the **same** place: a pattern whose only idiomatic form changes behaviour on
+  admitted input → **`NO_ACTION`**; a behaviour-safe pattern that is merely hard to auto-fix → **narrow to the
+  fixable core, or `NO_ACTION`**. Never a check-only stub.
+
+**The old "FORBIDDEN: codepoint↔grapheme" class splits in two under 0.7.0 — read the split, don't blanket-ban.**
+`String.to_charlist/1`·`?c`·`String.codepoints/1` work in **codepoint** space; `String.at`·`String.reverse`·
+`String.length`·`String.graphemes` work in **grapheme** space. The two index spaces still diverge whenever a
+character spans multiple codepoints — NFD accents (`"b́"` = `b` + U+0301, no precomposed form), ZWJ emoji
+(`"👨‍👩‍👧"` = 1 grapheme / 5 codepoints), flags (`"🇵🇱"` = 1 / 2). But the *consequence* now depends on
+whether the divergence is a **type change** or a **rare-text-only** difference:
+
+- **(a) Type-changing rewrites — `NO_ACTION` *forever*, no switch can rescue.** A switch is a promise about
+  *data*; no promise makes a number and a string interchangeable (Credence safety-switch decision 15).
+  `Enum.at(String.to_charlist(s), i)` → `String.at(s, i)` returns an **integer** vs a **string** — it diverges
+  on *every* input, incl. plain ASCII. That is not rare-text; it is a type change. Stays `NO_ACTION`, not
+  check-only, not switch-gated, ever.
+- **(b) Rare-text-divergent rewrites — legal in Credence behind `single_codepoint_graphemes`, but DEFERRED for
+  Tunex this round ⇒ still `NO_ACTION`.** Same return type, diverge *only* on multi-piece characters:
+  grapheme/codepoint **count·reverse·palindrome**, e.g. `length(String.to_charlist(s))` → `String.length(s)`
+  (codepoint vs grapheme count, both integers) and `String.to_charlist(s) == Enum.reverse(String.to_charlist(s))`
+  → `s == String.reverse(s)` (codepoint vs grapheme palindrome; flips on NFD). Credence 0.7.0 keeps exactly
+  these as **switch-gated rules** (`assumptions: [:single_codepoint_graphemes]` + a property test — the shipped
+  `no_codepoint_string_reverse` example *is* this). **Tunex's non-agentic implementer this round emits no
+  `assumptions/0` and no StreamData property test (§15), so it cannot author one** — and the clone's 0.7.0
+  meta-test would reject an `assumptions`-tagged rule lacking a `<Rule>PropertyTest` at the Gate anyway. So the
+  classifier routes this sub-class to **`NO_ACTION`** as a *scoped deferral* (machinery not built), **not** a
+  *correctness prohibition* (Credence proved them safe behind the switch).
+- **Same-space rewrites are unaffected** — `String.graphemes(s) == Enum.reverse(String.graphemes(s))` →
+  `s == String.reverse(s)` is grapheme→grapheme, needs no promise, and is a normal Pattern rule (it is the
+  always-safe half of the now-split `no_manual_string_reverse`).
+
+#### Canonical prompt block (inject verbatim — classifier T3.1 & implementer T5.1)
+
+This is the **exact** type-preservation text the new-rule prompt(s) must carry. It is already live in the
+soon-to-be-deleted `credence_rule_generator.ex` `@task`; the rebuild's `classify/prompt.ex` (`08` T3.1) and
+`implement/seed.ex` (`08` T5.1) must inject this same block verbatim. It encodes sub-class **(a)** above (the
+type-change ban) and explicitly hands sub-class **(b)** off to the switch-gated path ("handled elsewhere /
+not your call here").
+
+```text
+NEVER generate a rule whose fix changes the TYPE of the value the code produces.
+A rewrite must return the same kind of value (integer, string, list, etc.) for
+every input. If the "before" and "after" can ever be different types, the rule is
+wrong even if it looks tidier — discard it, do not emit it.
+
+The most common trap is codepoint↔grapheme on strings. These are NOT
+interchangeable:
+
+  - String.to_charlist/1, String.codepoints/1, ?c literals  -> work on CODEPOINTS
+    (small pieces; produce INTEGERS / lists of integers)
+  - String.at/1, String.length/1, String.reverse/1, String.graphemes/1,
+    String.count/2                                            -> work on GRAPHEMES
+    (whole characters; produce STRINGS)
+
+Specifically BANNED — never generate these or any variant of them:
+
+  - Enum.at(String.to_charlist(s), i)  ->  String.at(s, i)
+      WRONG: left returns a codepoint INTEGER, right returns a one-character
+      STRING. This is a type change, true for every input including plain ASCII.
+      There is no safe fix for indexed character access off a charlist — leave
+      it alone. (Do not work around the exact wording with hd(tl(...)),
+      |> Enum.fetch(i), |> Enum.at(i), list comprehensions, etc. — same trap.)
+
+Rule of thumb: if a rewrite swaps a codepoint operation for a grapheme operation
+(or the reverse), and the result types differ, NEVER emit it. (A same-type
+codepoint↔grapheme rewrite — e.g. a count or a reverse where both sides are
+strings — is a separate, switch-gated case and is handled elsewhere; that is not
+your call to make here.)
+```
+
+#### Canonical adversarial-input checklist (inject verbatim — classifier T3.1 & implementer T5.1)
+
+This is the **second** verbatim block both new-rule prompts carry (alongside the type-change block above). It
+hands the classifier/implementer the **exact nasty-input set the `evolution → main` reviewer uses** — so a
+generated rule survives the reviewer's "prove correctness with nasty inputs" step on the first read, instead of
+being narrowed (or bounced) there at Claude-token cost.
+
+```text
+A green test suite proves a rule DOES something, not that it is SAFE. Before you
+propose an `after` (or write fix/2), run `before` and `after` against every input
+below. If the rewrite gives a different answer on ANY of them, the rule is NOT
+fixable as-is: narrow the match so it no-ops on that input, or emit NO_ACTION.
+
+  - Unicode:
+      * plain ASCII
+      * a PRECOMPOSED accent  "é" (1 codepoint)
+      * a COMBINING accent    "é" = "e" + U+0301 (2 codepoints, 1 grapheme)
+      * a multi-codepoint emoji "👨‍👩‍👧" (5 codepoints, 1 grapheme)
+      * a flag "🇵🇱" (2 codepoints, 1 grapheme)
+  - Edge cases: empty, single element, nil, a negative index.
+  - Value-KIND traps: number 7 vs char "7"; codepoints vs graphemes vs bytes.
+    The result must be the SAME KIND of value — integer stays integer, string
+    stays string, list stays list. A kind change is wrong even on plain ASCII
+    (this is the type-change ban above, restated as an input test).
+  - A variable the moved/removed code also uses elsewhere; side effects in moved
+    code (IO, send, raise) that re-ordering would observably change.
+
+Same-answer on every one of these, or it is not a fixable rule.
+```
+
+### 3.11 The deterministic behavioural-equivalence check (turns §3.10 from discipline into a gate)
+
+> Runs for **pattern**-phase fixable rules — the plurality, and where **~every** behaviour-divergence in the
+> live `followup.md` lives. The companion to §3.7: novelty asks *"does a rule already cover this?"*; equivalence
+> asks *"is the proposed fix actually a no-op on behaviour?"* Both are **deterministic, execute the snippet, and
+> invoke no model judgment.**
+
+**Why it's needed (the evidence, not a hypothetical).** The live agentic generator *already* carries a
+behaviour-preservation instruction in its `@task` — and still shipped ~25 behaviour-diverging rules
+(`followup.md`), **each with a green test suite**, because the model that misjudges safety also writes the
+tests that encode the misjudgment. §3.10 enforced as *discipline* (model reasoning) demonstrably leaks. The fix
+is to stop trusting reasoning and **execute** `before` vs `fix(before)`.
+
+**The duality that makes it work.** The exact property that makes these rules unsafe — operands are **bare,
+runtime-bound variables** (`followup.md` repeats "list & index are always variables", "map arg is always a
+bare variable") — is precisely what makes them **differentially testable**: substitute an adversarial battery
+into those variables and run both sides.
+
+**Mechanism — `mix credence.equiv` (new Credence task, sibling to `credence.ast` / `credence.covers`).** Given
+a `before` snippet + the rule:
+1. Compile `before` as a module; compute `after = Rule.fix(before)`; **compile `after`** (a non-compiling
+   `after` — an unbound var from a dropped binding, e.g. `no_destructure_reconstruct` / `no_manual_frequencies`
+   / `no_manual_enum_uniq` — fails here immediately).
+2. Call each public function with a **fixed adversarial battery** (the §3.10 checklist made concrete, matched
+   to arity): `[]`, `[x]`, `[x, y, z]`, a `Range`, a **>32-key map**, a **present-key map**, `nil`, `-1`, `0`,
+   `7`, `"7"`, `"10"`, ASCII / combining-accent / multi-codepoint-emoji / flag strings, a side-effecting closure.
+3. Require `before(input) ≡ after(input)` — **same value, or the same exception class** — for **every** battery
+   input. Any divergence ⇒ **NOT equivalent**.
+4. Print `EQUIVALENT` / `DIVERGES <input> <before_result> <after_result>` — deterministic, dogfoodable, names
+   no rule. **Fixed battery, NOT StreamData** — for determinism (resume-safe, reproducible logs); §15's "no
+   property test this round" governs *shipped* rule tests, not this internal gate.
+
+**Two run-points (reuse it, exactly like `covers`):**
+- **Classify-time pre-check** — on the classifier's proposed `before`/`after`, *before* building. `DIVERGES`
+  ⇒ the spec is behaviour-changing ⇒ **`NO_ACTION`** (log → `behaviour_diverged/`), **zero implementer spend**.
+  Kills the bad *idea* cheaply (most `followup.md` greenfield rejections).
+- **6th Gate check** — on the **actual** `fix(before)` the implementer produced (not just the proposed
+  `after`). Catches an implementer that **broadened the match** onto a diverging input — most of the *delta*
+  rejections (`no_explicit_sum_reduce`, `no_doc_false_on_private`, `no_grapheme_palindrome_check`, …).
+  `DIVERGES` ⇒ Gate reject → `escalated/`.
+
+**Coverage (measured against the live `followup.md`):** catches **~22 of ~27** — every value / exception / type
+(codepoint↔grapheme) / order (>32-key map) / compile divergence in that file. It is what converts §3.10 from
+*discipline* into a real gate **for pattern rules.**
+
+**Honest limits (these stay on §3.10 prompt discipline + human `evolution → main` review):**
+- **Evaluation-order / side-effect-count** divergence (`no_cond_two_clauses` — cond double-evaluates its guard
+  operands; `no_doc_false_on_private` — `@doc` arg side effects). A *value* battery doesn't construct
+  side-effecting operands. **Phase-2 enhancement:** instrument operands with an evaluation tracer and compare
+  call counts (§14). Until then, discipline-only.
+- **Semantic / syntax phases** — `before` doesn't compile, so it can't execute; the check is **pattern-only**
+  (which is where ~all `followup.md` failures are).
+- **Battery-completeness** — a divergence *only* on an input not in the battery slips through. The battery is a
+  tuning item (§14); **seed it from the `followup.md` triggers** so every known failure class is represented.
+
+**Self-check reinforcement (the seatbelt — cheap, upstream of the gate).** Make the classifier prompt (`08`
+T3.1) *require* enumerating the battery and computing `{input, before, after, before == after}` for each as an
+explicit reasoning step before proposing, and the implementer (`08` T5.1) likewise before emitting `fix`. This
+kills many bad proposals before the deterministic gate runs (saving the build) — **but it is reasoning, so it
+is NOT the safety net** (it is the same mechanism that produced `followup.md`). `credence.equiv` is the net.
+Belt **and** airbag.
+
 ## 4. The classifier output contract (the "thick spec")
 
 We extract **maximum value from the one call** — it does heavy thinking over the whole log, and we discard the
@@ -382,13 +604,25 @@ rule_name     : present iff BUGFIX_RULE; must be ∈ APPLIED_RULES (a module nam
 proposed_name : present iff POTENTIAL_NEW_RULE; semantic snake_case, prefixed no_/prefer_/avoid_ (§3.8)
 phase         : pattern | syntax | semantic                    (present iff a rule is proposed; plurality pattern, but syntax/semantic first-class from failed rows, §3.6/§3.3)
 before        : the offending / non-idiomatic snippet          (parse/compile gate is phase-conditional, §3.6/§4.3)
-fixable       : { after : <idiomatic rewrite> }  |  check_only
+after         : <idiomatic rewrite>   (REQUIRED whenever a rule is proposed — there is NO check-only path; narrow `before` to a fixable core or emit NO_ACTION, §4.1)
 rationale     : one line — why this is non-idiomatic / how the existing rule over-fires
 ```
 
-- **`before` is the rule's first test case** (must-fire). For fixable rules `after` is the must-not-fire +
-  `fix(before) == after` assertion. For `check_only` there is no `after` (the rule will be `fix_patches/2 ->
-  []`).
+- **`before` is the rule's first test case** (must-fire); **`after` is always present** — the must-not-fire
+  case + the `fix(before) == after` assertion. **There is NO check-only path (2026-06-04 policy):** every
+  proposed rule has a real `fix_patches/2`. A pattern with no safe auto-fix even on a narrow core is
+  **`NO_ACTION`**, never a `fix_patches/2 -> []` stub.
+- **🔑 `after` MUST be behaviour-identical to `before` for EVERY input the active assumptions admit (hard
+  contract — §3.10, Credence ≥0.7.0).** Not "correct for the shown snippet" — a true refactor whose rewrite
+  produces the same output on *all admitted* inputs (Tunex's default helpful mode = every single-codepoint
+  input). If the only idiomatic form would change behaviour on *some admitted* input, the case is **not
+  fixable** and is **`NO_ACTION`** (there is no check-only fallback — §4.1). The codepoint↔grapheme class (§3.10) is the canonical
+  trap, now read in two parts: **type-change** rewrites (e.g. `Enum.at(String.to_charlist …)` → `String.at`)
+  are `NO_ACTION` *forever*; **rare-text-divergent** rewrites (count·reverse·palindrome) are `NO_ACTION` *this
+  round only* (legal in Credence as switch-gated rules, but the implementer can't author one — §15). This is
+  **not** deterministically checkable (no oracle for "same on every admitted input"); like single-issue
+  isolation below, it is the **classifier's** judgment + prompt discipline (`08` T3.1), re-stated to the
+  **implementer** (§5.3).
 - **Always a full, self-contained `defmodule` — ALL phases.** Pattern/semantic snippets are full modules
   already; a **syntax** snippet is wrapped in a **module template** (it still won't *parse* — that's the issue —
   but it's a full-module-shaped string). One canonical form read identically by the novelty pre-check (§3.7),
@@ -408,11 +642,21 @@ rationale     : one line — why this is non-idiomatic / how the existing rule o
 - **The implementer's must-fire test is built from the *exact* `before` bytes the pre-check validated** — so
   "pre-check said NOVEL" and "this test goes RED on HEAD" concern the identical input. That byte-identity is
   the thread that makes the pre-check's verdict trustworthy at Gate time.
-- **Complexity cap on `after`:** thick output is good, but a sprawling `after` is untrustworthy. If the
-  proposed `after` blows a deterministic ceiling (e.g. > N lines / multi-statement — threshold is a tuning
-  item, §10), **auto-downgrade to `check_only`** rather than trusting it. The implementer can also *choose*
-  check-only when the fix needs coordinated edits. **CHECK-ONLY (`fix_patches/2 -> []`) is the universal
-  fallback** — "the auto-fix is too hard" is never a reason to give up.
+- **🔑 No check-only — narrow to a fixable core, or `NO_ACTION` (2026-06-04 policy; overrides every earlier
+  "CHECK-ONLY is the universal fallback" line).** We **no longer emit non-fixable rules at all.** Every proposed
+  rule MUST carry a real `after` / `fix_patches`. The discipline mirrors the `evolution → main` reviewer's bar
+  verbatim, so a generated rule passes its read on the first pass: **either** *make* the rule fixable by
+  **narrowing `before` to its safe core** — fire only on the cases that have a same-answer fix, write the fix
+  for exactly those, and keep the dropped cases as explicit "no issue" `_check` tests so the safety choice is
+  locked in — **or**, if **no** input is safe to fix even for a narrow core (or the only fix changes a value's
+  **type**), **don't propose it: `NO_ACTION`.** This deletes the `unfixable.md` lane *at the source*: the review
+  loop used to auto-file constant-`[]` stubs to `unfixable.md` and drop them; the generator now never produces
+  one, so the downstream reviewer never spends Claude tokens re-judging a stub.
+- **Complexity cap on `after` (routes to `NO_ACTION`, never check-only).** A sprawling `after` is
+  untrustworthy. If the proposed `after` blows a deterministic ceiling (> N lines / multi-statement — threshold
+  a tuning item, §10), the classifier must **narrow to a simpler fixable core**; if it can't, the row is
+  **`NO_ACTION`** (an un-narrowable sprawling fix is not a rule). The cap is a backstop against an over-broad
+  `after` — it no longer downgrades to a check-only rule, because that path is gone.
 
 ### 4.2 Format
 
@@ -429,7 +673,7 @@ Credence.Pattern.PreferEnumReverseTwo
 pattern
 ===BEFORE===
 <snippet>
-===AFTER===           (or:  ===CHECK_ONLY===)
+===AFTER===           (REQUIRED — every proposed rule is fixable; there is no ===CHECK_ONLY=== marker)
 <snippet>
 ===RATIONALE===
 <one line>
@@ -454,7 +698,9 @@ Parse + validate; on failure → **one re-ask**; if still invalid → log to `va
   enforces** it — a multi-issue `before` tends to read `COVERED` (a sibling rule fires) and is dropped to
   `duplicate/` rather than mis-built. Then run the novelty pre-check (§3.7) — `COVERED` ⇒ `duplicate/`, no
   implementer.
-- `after` parses (when fixable, and the phase isn't `syntax`); over the cap → auto-downgrade to `check_only`.
+- `after` is **present and parses** (the phase isn't `syntax`); a **missing `after` is an invalid spec** →
+  re-ask. Over the cap → the classifier should have narrowed; an un-narrowed over-cap `after` ⇒ **`NO_ACTION`**
+  (no check-only downgrade — that path is gone, §4.1).
 
 On a malformed/invalid spec we do **one** re-ask, then stop (a row we can't get a clean spec for is not worth
 an implementer). The failed spec + log land in `classifier_errors/` for debugging.
@@ -500,7 +746,7 @@ silently degrades solve coverage over a long run.
 |---|---|---|
 | Target paths | new `lib/<phase>/<name>.ex` + new split tests (orchestrator-assigned, suffix-decollided) | the **existing** `lib/<phase>/<name>.ex` + its test(s), from `rule_name` |
 | Seed context | rule+test exemplar + before/after AST dumps | **full source of the offending rule** + **all** `test/<phase>/<name>*_test.exs` (glob) + before AST dump |
-| Test files written | **split**: `_check_test.exs` always; `_fix_test.exs` when fixable | **edit in place** — no test-split migration (see §5.4) |
+| Test files written | **split**: a check test always (pattern/semantic → `_check_test.exs`; syntax → `_analyze_test.exs`, §5.4) **+ `_fix_test.exs` always** (every rule is fixable, §4.1) — both to §5.6's exact shape | **edit in place** — no test-split migration (see §5.4) |
 | Mutation gate | new test RED without new rule | narrowed `_check` test RED with HEAD rule (over-fires → issue present → must-not-fire fails) |
 
 The mechanics are identical: **LLM emits whole files → orchestrator writes → focused `mix test` → feed
@@ -529,11 +775,12 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
 `%{key => content}` splitter (whole-file emit ⇒ each block is a complete file):
 
 - **New mode — fixed-role markers**, orchestrator maps roles → the suffix-decollided paths it assigned (§3.8);
-  the model never picks paths:
+  the model never picks paths. The `CHECK_TEST` role → a **phase-conditional** filename (pattern/semantic →
+  `_check_test.exs`, syntax → `_analyze_test.exs`; §5.4):
   ```
   ===RULE===          <rule.ex>
-  ===CHECK_TEST===    <_check_test.exs>
-  ===FIX_TEST===      <_fix_test.exs>   (omit iff check_only)
+  ===CHECK_TEST===    <_check_test.exs / syntax: _analyze_test.exs>
+  ===FIX_TEST===      <_fix_test.exs>   (ALWAYS — every rule is fixable, §4.1; no check-only)
   ===END===
   ```
 - **Bugfix mode — path-keyed markers** (the `test/<phase>/<name>*_test.exs` glob can be 1..N); the prompt
@@ -547,7 +794,8 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
   <content>
   ===END===
   ```
-- **Validation:** new → `RULE` + `CHECK_TEST` required, `FIX_TEST` iff fixable. bugfix → `RULE` = the known
+- **Validation:** new → `RULE` + `CHECK_TEST` + `FIX_TEST` **all required** (every rule is fixable — §4.1; a
+  missing `FIX_TEST` is an invalid emit, not a check-only rule). bugfix → `RULE` = the known
   rule path; every `TEST:<path>` **⊆ the known glob set** (≥1 changed); **no new/renamed files** — this is
   exactly what *enforces* §5.4's modify-only invariant and keeps the Gate's pure-deletion/scope checks trivial.
 
@@ -564,13 +812,36 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
 - **For bugfix**: the offending rule's full source + all its test files, injected by deterministic path.
 - A path-convention line (rules `lib/<phase>/<name>.ex`, tests `test/<phase>/…`, dispatchers, helpers) —
   ~30 tokens, replaces any `ls`/`tree`.
+- **The behaviour-preservation invariant (§3.10), re-stated.** The classifier already screened for it, but the
+  implementer *writes* `fix/2`/`fix_patches/2` and could regress it (e.g. broaden the match so the rewrite now
+  fires on a behaviour-diverging input). Inject the invariant (output-identical for **every input the active
+  assumptions admit**) + the codepoint↔grapheme split (type-change = forbidden forever; rare-text-divergent =
+  deferred this round). **The implementer also has NO check-only escape (§4.1):** it must write a real
+  `fix_patches/2`; if it cannot keep the fix safe even on the narrow core the classifier handed it, it does
+  **not** ship a `-> []` stub — it `gave_up`s (and the row is logged), because we no longer accept non-fixable
+  rules. **The §3.11 `credence.equiv` gate WILL execute its `fix` across the adversarial battery** (classify-time
+  + 6th Gate check) and a `DIVERGES` is a hard reject — so the seed instructs the model to **self-run that
+  battery** (`{input, before, after}` per input) before emitting and to **narrow the match until every battery
+  input is a no-op**, not discover the divergence at the gate. **Also instruct it to emit NO `def assumptions`
+  and NO StreamData property test this round** — every rule it writes must be no-promise / always-safe; a
+  switch-gated rule it can't pair with a property test would fail the clone's 0.7.0 meta-test at the Gate (§10).
+  The Gate won't catch a *type-change* behaviour regression (§10), so this prompt line is the backstop on the
+  implementer side.
 
 ### 5.4 The split-test rule
 
 > **The loop writes split tests for files it *creates*; it never restructures files that already exist.**
 
-- **New rule** → greenfield: emit `_check_test.exs` (+ `_fix_test.exs` when fixable). The before/after spec
-  hands the model exactly the material for each file.
+- **New rule** → greenfield: emit the check test **and** the `_fix_test.exs` — **always both** (every rule is
+  fixable now, §4.1; no check-only half-set). The before/after spec hands the model exactly the material for
+  each file; both files follow §5.6's exact shape. **The check-test *filename* is phase-conditional** —
+  the orchestrator (not the model) maps the `CHECK_TEST` role marker to the per-phase convention the
+  `evolution → main` review loop's gate enforces: **pattern/semantic → `<name>_check_test.exs`; syntax →
+  `<name>_analyze_test.exs`** (syntax rules implement `analyze/1`, not `check/2`, and the live repo names
+  their tests `*_analyze_test.exs` + `*_fix_test.exs` — e.g. `fix_scientific_notation_analyze_test.exs`). A
+  syntax rule emitted as `_check_test.exs` would fail the review-loop syntax gate (which expects
+  `_analyze_test`+`_fix_test`, or a single `_test`). The role markers stay role-based — only the filename
+  the orchestrator writes them to forks by phase.
 - **Bugfix** → edit whatever test files exist *in place* (single `<name>_test.exs`? add the must-not-fire
   assertion to it; already split? edit `_check`). No renames, no deletes, no migration. Keeps the bugfix diff
   modify-only so the Gate's pure-deletion/scope checks stay trivial and the mutation gate has an unambiguous
@@ -602,6 +873,31 @@ exactly what must not be re-sent verbatim.
 The loop self-terminates at the retry bound or the size ceiling, whichever trips first — a bounded loop of
 small, size-capped calls can't run away.
 
+### 5.6 Test conventions — emit the reviewer's required shape the first time
+
+The `evolution → main` reviewer enforces an **exact** test shape and *rewrites* any set that misses it — which
+is Claude tokens spent. The implementer must emit that shape directly so the reviewer only has to *confirm*,
+not repair. Inject these as hard rules in the implementer seed (`08` T5.1); the retry-loop `mix test` already
+runs the result, so a violation that breaks compilation is caught locally for free.
+
+- **Split, per kind** (§5.4): pattern → `_check_test.exs` (findings only — **including the deliberately-skipped
+  unsafe cases asserted as "no issue"**, so the safe-core narrowing of §4.1 is locked into the tests) +
+  `_fix_test.exs` (exact rewrites). semantic → `_check` + ≥1 `_fix` variant. syntax → `_analyze`+`_fix` (or a
+  single `_test`).
+- **Every fix-test assertion compares the WHOLE output with `==`** — `assert fix(code) == expected`, or
+  `assert fix(code) == code` for a no-op. **Never** match a fragment. **BANNED in fix tests** (each lets an
+  unintended change *elsewhere* in the output slip through): `=~`, `String.contains?`,
+  `String.match?` / `Regex.match?`, `String.starts_with?` / `String.ends_with?`, and `String.split` + `Enum.at`
+  slicing — **even for negative / must-NOT-change cases.** Pin the entire string.
+- **`expected` is taken from the rule's REAL output** (run the rule, copy the string), never hand-written —
+  `mix format` normalizes layout later, the exact string pins the *meaning*.
+- **Triple-quoted heredocs (`"""…"""`) for `code` and `expected`** — never `\n`-escaped single-quoted strings.
+- **`check` and `fix` must agree** — never flag a case the fix won't touch; never leave a fixable case the
+  check misses.
+
+These are deterministic conventions, not judgment calls — getting them right at emit time is the single biggest
+lever on downstream reviewer cost (the reviewer's longest sub-task is normalizing tests to exactly this shape).
+
 ---
 
 ## 6. The AST helper (the exploration-killer)
@@ -613,6 +909,18 @@ Sourceror tuple shape. Hand it the shape and the exploration disappears.
 - **Phase scope (§3.6): the AST helper is for `pattern`/`semantic` only.** A `syntax`-phase `before` does not
   parse, so `Sourceror.parse_string!` *raises* — never run the helper on a syntax snippet; its implementer
   seed is raw strings (§5.3). The orchestrator gates on phase before invoking the helper.
+  - **⚠️ Assumption, not fact — validate before building `08` T5.1's syntax branch.** "Syntax ⇒ raw-string
+    seed, no structural help" rests on the premise that a non-parsing `before` yields *nothing usable*
+    structurally. [`09`](09_external_research_self_evolving_rule_systems.md) §3 left this **unresolved across
+    two research passes** and flagged it for a **code spike, not more web search** (~1–2 h, zero paid tokens):
+    feed 5–10 real non-parsing solve attempts (from `escalated/`) to `Code.string_to_quoted/2` **and**
+    Sourceror's fault-tolerant parser, and record whether a **usable error locus** (line/col + offending token)
+    or a **partial AST** comes back. **If yes** → the syntax seed (§5.3) can upgrade from blind before/after
+    strings to a **targeted locus seed** ⇒ far more precise syntax-rule discovery (and this bullet's "no
+    structural help" claim is partly false). **If no** → the string-only seed is *confirmed*, not merely
+    assumed. The same spike also answers §16's "does seed→mutate transfer to non-parsing syntax." Only ~4
+    genuine syntax rules exist (the rest were reclassified to `pattern`, `08` Phase 1 baseline), so don't
+    over-engineer — let the spike decide.
 - **Home: a new `mix credence.ast` task in the Credence repo** (reads code from stdin/file, prints the AST).
   Lives there so it uses Credence's exact Sourceror version + can reuse `RuleHelpers.strip_layout_meta`; it is
   also a genuine standalone dev tool for human rule-authors. Tunex shells out to it against the clone, exactly
@@ -630,8 +938,8 @@ Sourceror tuple shape. Hand it the shape and the exploration disappears.
   (The standard parser `Code.string_to_quoted` would give a different, un-wrapped AST — Credence never uses
   it.)
 - **Usage:** the orchestrator runs the helper on **both** the `before` and `after` snippets and injects both
-  dumps into the implementer's seed (before-only for check-only). Writing the rule becomes mechanical: "match
-  this exact `before` tuple shape, emit a patch producing this exact `after` tuple shape."
+  dumps into the implementer's seed (always both — every rule is fixable, §4.1). Writing the rule becomes
+  mechanical: "match this exact `before` tuple shape, emit a patch producing this exact `after` tuple shape."
 - **Dogfood:** before relying on it, run the helper on a snippet a *known* rule matches and confirm the dump
   matches what that rule actually pattern-matches.
 - **Nice-to-have (documented, not built):** append a short static Sourceror-gotchas cheatsheet (wrapped
@@ -680,11 +988,12 @@ is bounded by a run, not forever.
 | gave_up / gate-reject / implementer-failed | `escalated/` | (same) |
 | `NO_ACTION` | **`no_action/`** (NEW) | *deleted* (`RowLog.close/1`) |
 | Novelty pre-check = `COVERED` (duplicate) | **`duplicate/`** (NEW) | n/a |
+| Behavioural-equivalence (§3.11) = `DIVERGES` at classify-time | **`behaviour_diverged/`** (NEW) | n/a |
 | Spec malformed after one re-ask | **`classifier_errors/`** (NEW) | n/a |
 
 **`RowLog` gains move targets.** Today it has `open`/`close` (delete)/`escalate`/`commit`. The rebuild:
-`close/1`'s delete → **move to `no_action/`**; add `duplicate/1` and `classifier_errors/1` move methods
-(same `filesync → remove_handler → rename` shape as `escalate/1`). **Retention knob** (default = keep
+`close/1`'s delete → **move to `no_action/`**; add `duplicate/1`, `behaviour_diverged/1` (§3.11) and
+`classifier_errors/1` move methods (same `filesync → remove_handler → rename` shape as `escalate/1`). **Retention knob** (default = keep
 everything): `no_action/` is the bulk, holding full firehose logs — fine for a days-long run + reset; if disk
 bites, retain only the *distilled classifier input + its output* there (enough to debug a false-negative).
 
@@ -701,7 +1010,7 @@ that's not a debugging artifact.)
 | agentic `credence_rule_generator.ex` (`@task`, `build_prompt`, `route`) | **Replaced** by classifier + router + solver-loop implementer. |
 | `max_turns` (config + plumbing) | **Deleted** — no turns. |
 | Per-session token breaker | **Deleted** — bounded loop can't run away. |
-| The 5-part **Gate** (`evolve/gate.ex`) | **Unchanged** — harness-independent; operates on the git diff + `mix test`. The backstop that lets everything upstream be aggressive. |
+| The **Gate** (`evolve/gate.ex`) | **5 parts unchanged + 1 NEW** — harness-independent; operates on the git diff + `mix test`. **Gains a 6th check: the §3.11 behavioural-equivalence diff** (`credence.equiv` on `before` vs the actual `fix(before)`, pattern-phase) — the executable behaviour net that lets everything upstream be aggressive. |
 | `decisions.md` **ledger** (`evolve/ledger.ex`) | **Kept** — feeds the classifier (whole, uncapped). Write-sites **move into the new router**: **implementer-failed** (≈ old `gave_up`) + **gate_reject** only. **`phantom` retires** (deterministic whole-file emit → no claim-without-diff). `duplicate/` + `classifier_errors/` do **not** ledger (never attempted; a duplicate is *solved*, not impossible). |
 | Rule-name **index** | **Dropped** from the prompt (§3.5). |
 | `Git.commit_and_push` to `evolution` | **Unchanged.** |
@@ -721,8 +1030,25 @@ that's not a debugging artifact.)
   over-aggressive narrowing or any rule that breaks the suite.
 - **A bad spec can't burn an implementer** — `before`/`after` are full `defmodule`s with phase-conditional
   parse/compile gates (§3.6); the **novelty pre-check** kills duplicates/multi-issue leakage *before* the
-  implementer; over-cap `after` → check-only; malformed → one re-ask → `classifier_errors/`.
+  implementer; over-cap `after` → narrow-or-`NO_ACTION` (no check-only); malformed → one re-ask →
+  `classifier_errors/`.
 - **A false `NO_ACTION` is bounded** — human-sampled audit of retained `no_action/` logs (§12), zero token cost.
+- **Behaviour preservation is now a deterministic Gate property for pattern rules (§3.11), discipline for the
+  rest.** §3.11's `credence.equiv` check **executes** `before` vs `fix(before)` across an adversarial battery —
+  at classify-time (reject → `behaviour_diverged/`) and as a **6th Gate check** (reject → `escalated/`) —
+  catching value / type / exception / order divergence (the bulk of the live `followup.md`: a rule that passes
+  the suite but diverges on a battery input **no longer lands**). What stays on **discipline + human review**:
+  divergence only on a non-battery input, **evaluation-order / side-effect** divergence (the battery is values,
+  not side-effecting operands — §3.11 limits), and **semantic/syntax** phases (no compilable `before` to run).
+  The classifier still never proposes a behaviour-changing `after`, and the implementer prompt re-states the
+  invariant (§5.3) — but those are now the *upstream* belt, with `credence.equiv` the executable airbag.
+- **0.7.0 gives the Gate *partial* teeth on the switch machinery (NEW).** The clone is now Credence 0.7.0, and
+  the full `mix test` the Gate runs includes its assumptions meta-tests: every `assumptions/0` ⊆ known switch
+  names, and every switch-tagged rule has a loadable `<Rule>PropertyTest`. So a rule that names a bogus switch
+  or tags a switch without a property test **fails the Gate mechanically** — which is precisely why a
+  switch-gated rule **cannot land this round** (the implementer authors no property test, §5.3/§15) and the
+  rare-text-divergent class stays `NO_ACTION` by construction, not just by prompt. (The meta-tests do **not**
+  check behaviour identity, so the type-change discipline above still has no Gate net.)
 - **The `:reverted` lane can't fix a healthy rule** — Pattern's entry gate (`pattern.ex:52`) skips
   non-compiling input, so its only revert is a genuine compiling→non-compiling regression. Every `:reverted`
   is therefore an already-attributed broken rule — deterministic, ~zero false-positive, no Credence change.
@@ -749,9 +1075,11 @@ that's not a debugging artifact.)
      what's left?" legible. *Prereq for trusting every later number; ~free.*
 1. **AST helper** — `mix credence.ast` in Credence + dogfood against a known rule's snippet. Unblocks the
    implementer. **Same Credence pass (ship together — all Credence-side):** (i) `mix credence.covers`
-   behavioral novelty task (§3.7); (ii) *optional* — `log_diff` in the Pattern revert branch for seed
-   visibility (§3.9). **No revert-gate fix — `:reverted` is already a clean signal (Pattern entry gate,
-   `pattern.ex:52`).**
+   behavioral novelty task (§3.7); (ii) **`mix credence.equiv` behavioural-equivalence task (§3.11)** — compile
+   `before` + `fix(before)`, run both over the adversarial battery, print `EQUIVALENT`/`DIVERGES`; dogfood on a
+   known-unsafe `followup.md` snippet (must report `DIVERGES`); (iii) *optional* — `log_diff` in the Pattern
+   revert branch for seed visibility (§3.9). **No revert-gate fix — `:reverted` is already a clean signal
+   (Pattern entry gate, `pattern.ex:52`).**
 2. **Classifier** — raw `Tunex.LLM`, **configurable provider** (default Mimo-pro, `:anthropic_opus`
    alternative — §3.1), marker output, validation gates, option-shaping, coarse Python-cut distillation
    (`===SOLVE_BOUNDARY===` sentinel, §7), `APPLIED_RULES` + ledger inputs.
@@ -797,6 +1125,11 @@ So:
   deleted (§8), every classifier input+output is on disk, so the *same* comparison can be run **offline** by
   re-feeding saved `no_action/`/`committed/` inputs through the other model — build the online A/B sampler only
   if offline replay proves too coarse. Sampling rate `classifier_ab_sample_every` (0 = off, default).
+  - **Why A/B is calibration, NEVER selection.** [`09`](09_external_research_self_evolving_rule_systems.md)
+    **F5** (EVOL-RL `arXiv:2509.15194`, 3-0) shows majority-vote / self-consistency *selection* collapses
+    output diversity (entropy + pass@n drop); the fix is a **novelty reward, not a vote**. So this sampler only
+    *logs* divergence to inform the model choice (§3.1) — it must never *pick* the answer by model agreement.
+    External backing for staying at **one** classifier call (§3) rather than N-sample-and-vote.
 
 ---
 
@@ -809,12 +1142,16 @@ So:
 | Classifier input | distilled log + `APPLIED_RULES` + ledger; **no rule-name index** — dedup is the §3.7 pre-check, not a construction proof |
 | Phase asymmetry | Syntax (non-parsing, string-level) / Semantic (warnings) / Pattern (compiling, AST). Seed + `before` gates are **phase-conditional** (§3.6); new rules are *plurality* pattern but syntax/semantic are first-class (from failed rows, §3.3); BUGFIX is phase-polymorphic |
 | Novelty pre-check | `POTENTIAL_NEW_RULE` only: run `before` through `Credence.fix` in the clone (`mix credence.covers`); `COVERED` (a **real rule engaged** — `code` changed / `applied_rules` non-empty / non-parse-error issue; **🔴 NOT** the bare `parse_error_issue`, else every novel syntax rule dies — §3.7) ⇒ duplicate ⇒ `duplicate/`, skip implementer. Behavioral, names no rule, phase-agnostic, no compile gate (§3.6) |
-| Output | marker-fenced thick spec `{decision, rule_name?|proposed_name?, phase, before, fixable:{after}|check_only, rationale}`; `before`/`after` are **full `defmodule`s, all phases** (syntax = module template), each **isolating exactly ONE issue** (composition: N rules rescue garbage, none alone — isolation makes pre-check + mutation gate attributable, §4.1) |
+| **Behavioural-equivalence gate** | **NEW (§3.11) — the executable behaviour net.** `mix credence.equiv`: compile `before` + `fix(before)`, run both over a **fixed adversarial battery** (empty/single/short list, Range, >32-key & present-key maps, nil, -1, 0, number-vs-char, combining-accent/emoji/flag strings, side-effecting closure), require **same value or same exception** on every input. **Pattern-phase only** (needs a compilable `before`). Runs **at classify-time** (`DIVERGES` ⇒ `NO_ACTION` → `behaviour_diverged/`, no build) **and as a 6th Gate check** (on the actual `fix`; `DIVERGES` ⇒ reject). Catches ~22/27 of live `followup.md`. Limits: eval-order/side-effect divergence + non-pattern phases stay §3.10 discipline |
+| Output | marker-fenced thick spec `{decision, rule_name?|proposed_name?, phase, before, after, rationale}` — **`after` always present; NO check-only** (§4.1); `before`/`after` are **full `defmodule`s, all phases** (syntax = module template), each **isolating exactly ONE issue** (composition: N rules rescue garbage, none alone — isolation makes pre-check + mutation gate attributable, §4.1) |
 | Option-shaping | empty `APPLIED_RULES` → BUGFIX not offered. **Runs on every row that reached solve (success AND failed)**; solve outcome forks the task lens — solved → idiomatic residual; failed → unfixed syntax/semantic issue (new-syntax source) (§3.3) |
 | BUGFIX | constrained to `APPLIED_RULES` (over-firing only); under-firing → NEW |
 | `:reverted` lane | `:reverted` (Pattern-only) is **already** a genuine compiling→non-compiling broken rule — Pattern's entry gate (`pattern.ex:52`) skips non-compiling input, so `compiles?(source)` is invariant. → **deterministic** bugfix, **skips classifier**, **no Credence change** (§3.9) |
 | NEW | **always create new**, never extend; classifier emits `proposed_name` (on-convention `no_/prefer_/avoid_`); order = classify → pre-check → resolve name+suffix → implement; orchestrator owns final naming |
-| `after` complexity | capped; over-cap → auto check-only; **CHECK-ONLY is the universal fallback** |
+| Fixable-only (NO check-only) | **2026-06-04 policy:** every proposed rule carries a real `after`/`fix_patches`. No `fix_patches/2 -> []` stubs. Can't safely fix even a narrow core (or only fix changes a value's **type**) → **`NO_ACTION`**, not check-only. Matches the `evolution → main` reviewer's fixable-only bar (kills the `unfixable.md` lane at source) (§4.1) |
+| `after` complexity | capped; over-cap → **narrow to a fixable core, else `NO_ACTION`** (never check-only) (§4.1) |
+| Test shape (emit reviewer-ready) | fix tests compare **whole output with `==`** (no `=~`/`String.contains?`/`match?`/`starts_with?`/split-slice — even for negatives); `expected` from the rule's **real** output; **heredocs only** (no `\n`-escapes); `_check` includes the dropped-unsafe cases as "no issue"; `check`/`fix` agree (§5.6) |
+| **Behaviour preservation** | **Absolute *relative to declared `assumptions:`* (§3.10; Credence ≥0.7.0).** `after` must be output-identical to `before` for **every input the active promises admit**; Tunex runs the **default (helpful)** mode (`single_codepoint_graphemes` on), never `:strict`. The old "FORBIDDEN: codepoint↔grapheme" class **splits**: **(a) type-change** rewrites (`Enum.at(to_charlist)` → `String.at`, int vs string) = `NO_ACTION` *forever* (no switch rescues — Credence dec. 15); **(b) rare-text-divergent** (count·reverse·palindrome) = legal in Credence as **switch-gated** rules (+ property test) but **deferred this round → `NO_ACTION`** (implementer emits no `assumptions/0`/property test, §15). Same-space rewrites OK. Type-change is **not** Gate-caught (§10) → classifier + implementer prompt discipline (`08` T3.1/T5.1); the 0.7.0 meta-tests mechanically block an untested switch-gated rule at the Gate (§10) |
 | Validation | deterministic gates; one re-ask → `classifier_errors/` |
 | Implementer | **one** solver-style loop (raw LLM, no harness/tools), parameterized new/bugfix; whole-file emit via a **file-keyed marker scheme** (new = fixed-role `RULE`/`CHECK_TEST`/`FIX_TEST`; bugfix = path-keyed `TEST:<path>` ⊆ glob, modify-only) (§5.2) |
 | Implementer seed | thick spec + precomputed before+after AST dumps + exemplar (+ rule source for bugfix) |
@@ -822,7 +1159,7 @@ So:
 | Bound | dedicated `rule_gen_max_retries` (~5) **+ local per-row input/output ceiling** (zero console poll) + flat (non-accumulating) retry prompt + trimmed `Report.format_errors` feedback; **no console-polling breaker**; **no `max_turns`** (§5.5) |
 | AST helper | `mix credence.ast` in Credence; raw + layout-stripped views; never `normalize`/unwrapped; dogfooded |
 | Distillation | coarse cut **only** this round: drop everything above an explicit `===SOLVE_BOUNDARY===` sentinel (invariant — no absent-marker handling); full marker-fencing documented-not-built |
-| Gate | **unchanged** (5-part backstop) |
+| Gate | 5-part backstop **+ a 6th behavioural-equivalence check** (`credence.equiv` on `before` vs actual `fix`, pattern-phase — §3.11) |
 | Ledger | kept, feeds classifier whole/uncapped (stays near-empty by design); writes on implementer-failed + gate_reject only; phantom retired; duplicate/classifier_errors don't ledger |
 | No deletion | move-to-outcome-dir; new `no_action/`, `classifier_errors/`; `tunex.reset` still clears |
 | Measurement | **no `summed_usage` port** — the undercount was a CC-harness artifact deleted with it; per-call `Budget.record` IS the bucket basis (expect ledger ≈ console ~1×). Add **per-stage tagging** (`:classify`/`:implement`/`:solve`). Trust console for absolutes (§11.0) |
@@ -839,7 +1176,15 @@ So:
 1b. Prompt discipline for **single-issue isolation** of `before` (§4.1) — reducing one Python-ism out of a
    multi-issue garbage attempt is a real classifier difficulty (esp. syntax, where fixes compose). The
    pre-check catches multi-issue leakage as false-`COVERED`; tune the prompt against the `duplicate/` rate.
-2. The `after` complexity-cap threshold (lines / statement count) that triggers auto check-only.
+2. The `after` complexity-cap threshold (lines / statement count) that triggers narrow-to-core-or-`NO_ACTION`
+   (§4.1 — no longer an auto check-only downgrade).
+2b. **The §3.11 `credence.equiv` adversarial battery** — the concrete input set + the arity-matching strategy.
+   Seed it from the `followup.md` triggers (so every known failure class is represented), then grow it as new
+   divergence classes surface in `behaviour_diverged/`. A battery miss = a divergence that slips the gate.
+2c. **Phase-2 `credence.equiv`: operand side-effect tracer** — to catch the eval-order / side-effect-count
+   class (`no_cond_two_clauses`, `no_doc_false_on_private`) the value battery can't construct: wrap the rule's
+   matched operands in an evaluation tracer and compare call counts/order between `before` and `fix(before)`.
+   Build only if `followup.md`-style eval-order misses recur after the value gate ships.
 3. `rule_gen_max_retries` starting value (~5) — tune against landed-rules/attempt.
 3b. `rule_gen_input_ceiling` / `rule_gen_output_ceiling` (the §5.5 local size guard) — set high enough not to
    clip a legit hard rule, low enough to kill a 552-line-rule pathology; tune against `escalated/` size logs.
@@ -856,9 +1201,82 @@ So:
 - **Automated second-opinion shadow** (§12) — footnote; human sampling first.
 - **Model-divergence A/B sampling** (§12) — run both classifier models on 1-in-N rows to quantify how
   differently they judge; build the online sampler only if offline replay of saved logs proves too coarse.
+- **Failure-/success-recycling RAG into prompts** — backed by [`09`](09_external_research_self_evolving_rule_systems.md)
+  **F6** (`arXiv:2505.00234`, confirmed 3-0: a self-generated trajectory DB used as **in-context examples, no
+  fine-tuning**). §8 already persists every outcome; the §5.3 implementer seed and the §3 classifier prompt are
+  currently *static*. Retrieve 1–2 *relevant* past outcomes as few-shot examples: **(a) implementer** — the
+  most-recent `committed/` rule of the **same phase** (+ same rule for bugfix) as a real worked template (fewer
+  retries to match Credence's AST conventions, §6); **(b) classifier** — past *confirmed* `POTENTIAL_NEW_RULE`
+  examples to calibrate the clean-but-non-idiomatic call (**"the one load-bearing unknown,"** `08`), plus
+  `no_action/` "leave-alone" negatives. Retrieval is dead-cheap (a `var/run/rag_index.jsonl` filtered by
+  phase + recency, K=1, **no embeddings**); injected tokens count against the §5.5 `rule_gen_input_ceiling`.
+  **Measurement-gated, not critical-path:** every example adds tokens to a *paid* call (fights the cost thesis),
+  so build only if §11-step-6 shows low implementer first-try yield, or the §12 `no_action/` audit shows poor
+  classifier precision. Positives from `committed/` only (never `escalated/`). The classifier-calibration half
+  **(b)** is the higher-value one — it directly de-risks the load-bearing unknown.
 - **Focused-agentic escalation for long-tail complex rules** — the solver loop is the *sole* implementer this
   round; if it can't land a genuinely complex rule it `gave_up`s. Measure yield before reintroducing any
   agentic lane.
 - **Sourceror-gotchas cheatsheet** appended to the AST helper output (§6).
 - **Migrating existing rules to split test files** — a separate human/mechanical pass, never entangled with
   the autonomous bugfix loop.
+- **Switch-gated (assumption-tagged) rule generation** — Credence 0.7.0 ("safety switches") makes
+  rare-text-divergent rewrites legal *behind* `assumptions: [:single_codepoint_graphemes]` **with a mandatory
+  StreamData property test** (§3.10). To author one, the classifier would emit a `switch` field, the
+  implementer would emit `def assumptions, do: […]` **plus** a `<Rule>PropertyTest` over the shared
+  single-codepoint generator (else the clone's 0.7.0 meta-test reds the Gate, §10), and the seed would carry a
+  property-test exemplar. None of that is built this round, so the whole rare-text-divergent class
+  (count·reverse·palindrome) stays `NO_ACTION` — a *scoped deferral*, not a prohibition. Build it once the
+  no-promise pipeline is proven and if `no_action/` audits show this vein is worth the machinery. (Type-change
+  rewrites stay forbidden regardless — a switch can't promise away a type change.)
+
+---
+
+## 16. Complementary pipeline (deferred): offline metamorphic rule audit
+
+*Backed by external research — see [`09`](09_external_research_self_evolving_rule_systems.md) **F3** (StaAgent
+`arXiv:2507.15892`, confirmed 3-0: 64 problematic rules found across 5 production Java analyzers; Statfier,
+79 bugs / 46 confirmed). **Deferred / off the critical path** — prototype after the rebuild lands 2–3 rules
+(`09` §5 step 1). Documented here so it isn't re-derived from scratch.*
+
+The rebuild detects bad *existing* rules only **reactively**: the BUGFIX lane (§3.4) fires when the dataset
+walk *happens* to trip an over-firing rule, and the `:reverted` lane (§3.9) catches only
+compiling→non-compiling breakage. There is **no proactive audit** of the ~90 existing rules, and §3.9 leaves
+the "rules fighting each other" (composition) detection question open. Metamorphic auditing fills both gaps
+**off the paid path**.
+
+**Idea.** For a rule R, generate programs R *should* flag (seeds), apply **semantics-preserving mutations**,
+and assert R's verdict stays **consistent** across the mutation. An inconsistency ⇒ R keys on something
+incidental ⇒ brittle (over- or under-firing).
+
+**Process (reuses the existing back-end — only the front-end is new):**
+1. **Seed** — take R's own `_check_test.exs` must-fire snippet (a guaranteed positive); optionally have **local
+   Qwen** generate more from R's moduledoc. No paid call.
+2. **Mutate** — a *small, provably-safe* transform set: α-rename bound vars; reorder provably-independent
+   statements; swap equivalent call syntax (`&(&1 > 0)` ↔ `fn x -> x > 0 end`); reformat. Each preserves
+   behaviour under the §3.10 invariant. **Start with α-renaming only** (trivially safe, catches the most common
+   name-keyed brittleness); add transforms one at a time.
+3. **Oracle = Credence itself** (run in the clone): check rule ⇒ `flags(seed) == flags(mutant)`; fix rule ⇒
+   `fix(seed)` / `fix(mutant)` is the same transformation modulo the mutation.
+4. **Triage** (StaAgent Type1/Type2): under-fires (misses an equivalent mutant) ⇒ broaden; over-fires (fires
+   post-mutation where it shouldn't) ⇒ narrow.
+5. **Route into existing machinery** — each violation is a **BUGFIX-shaped spec** (`rule_name = R`,
+   `before = seed`, `after = inconsistent behaviour`) ⇒ **§5.1 implementer bugfix mode** ⇒ **§9 Gate**. No new
+   back-end is built.
+
+**Example.** `no_filter_then_map` seed `Enum.map(Enum.filter(list, &(&1 > 0)), &(&1 * 2))`; mutate (α-rename +
+capture→anon-fn) to `Enum.map(Enum.filter(xs, fn x -> x > 0 end), fn x -> x * 2 end)`. If R matches only the
+`&` capture and misses the `fn` form ⇒ Type A (under-fires) ⇒ broaden.
+
+**Fit.** Reuses §5.1 bugfix implementer, §9 Gate, the `mix credence.ast` helper (§6), §5 clone single-writer
+discipline, §8 outcome dirs. Orthogonal to the dataset walk (idle-GPU or one-shot pre-pass); never touches the
+classifier, distillation, or the OpenCoder dataset. Serves the PRIMARY GOAL (improve existing rules) and
+answers §3.9's "rules fighting each other" — mutate *across* rule boundaries to surface composition conflicts.
+**Cost: local Qwen + Credence harness only — off the paid bucket.**
+
+**Risks.** (R1) the mutator is the hard part — a non-equivalent "mutation" yields false violations ⇒ start
+α-rename-only, validate each transform compiles + preserves behaviour. (R2) Java→Elixir transfer unproven
+(`09` caveat) — the *method* is language-agnostic, only the mutators are Elixir-specific; prove on **5 rules**
+first. (R3) noise / low precision — it is *advisory* into the implementer; the Gate (mutation-RED + suite-green)
+and the human `evolution → main` review still gate every landing. (R4) the §3 syntax spike (error-locus, §6)
+also answers "does seed→mutate transfer to non-parsing syntax rules," so run that first.

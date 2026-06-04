@@ -94,8 +94,10 @@ TUNEX_RUN=1 mix run --no-halt
 - **Workspace mix.exs** injection is idempotent (`Workspace.rewrite_deps/1`) — an earlier non-greedy regex
   corrupted it on re-inject and blacklisted every row.
 - **Solve parser** falls back to bare `defmodule` blocks (models drop `---MODULE---/---TEST---` on retries).
-- **Rule-gen prompt** injects a rule-name INDEX (so the agent doesn't read all ~90 rule files) and now allows
-  **CHECK-ONLY rules** (`fix_patches/2 -> []`) when a clean auto-fix is too complex.
+- **Rule-gen prompt** (current agentic flow) injects a rule-name INDEX so the agent doesn't read all ~90 rule
+  files. NOTE: the live flow historically allowed **CHECK-ONLY rules** (`fix_patches/2 -> []`); the planned
+  classifier-split rebuild **removes that** — fixable-only, narrow-to-safe-core-or-`NO_ACTION`, no check-only
+  stubs (see `docs/07` §4.1). When the rebuild lands and deletes the agentic generator, this whole bullet goes.
 - A `gave_up` pattern goes into `decisions.md` and is then NOT re-attempted in the same run (cleared by
   `tunex.reset`).
 - **Prompt caching WORKS against MiMo** (~58.7M cache-read tokens measured; `cache_read_input_tokens` is
