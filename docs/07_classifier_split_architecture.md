@@ -142,13 +142,14 @@ target paths.
   - **Behaviour preservation is absolute *relative to Credence's declared assumptions* (§3.10; Credence ≥0.7.0
     "safety switches").** A proposed `after` must be output-identical to `before` for **every input the active
     `assumptions:` admit**. Tunex runs Credence in its **default (helpful)** mode (one promise on,
-    `single_codepoint_graphemes`), so "every input" here means "every single-piece-character input." Two
-    sub-classes still route to `NO_ACTION`: **type-changing** rewrites (charlist↔grapheme, integer vs string —
-    forbidden *forever*, no switch can rescue) and **rare-text-divergent** rewrites (grapheme/codepoint
-    count·reverse·palindrome — legal in Credence only as *switch-gated* rules with a property test, which the
-    non-agentic implementer can't author this round → deferred, §15). For pattern rules, §3.11's deterministic
-    `credence.equiv` check now *executes* this (catching the type-change class on any exercised input); the
-    classifier quality-bar duty remains the backstop for non-battery inputs, eval-order, and non-pattern phases.
+    `single_codepoint_graphemes`), so "every input" here means "every single-piece-character input." The two
+    sub-classes now diverge: **type-changing** rewrites (charlist↔grapheme, integer vs string) stay `NO_ACTION`
+    *forever* (no switch can rescue a type change), while **rare-text-divergent** rewrites (grapheme/codepoint
+    count·reverse·palindrome) are **buildable as switch-gated rules** (§3.12 — Tier-1 existing switch + a
+    property test from the shared generator, or Tier-2 `SWITCH_PROPOSAL`). For pattern rules, §3.11's
+    deterministic `credence.equiv` check *executes* the equivalence (catching the type-change class on any
+    exercised input, and confirming the minimal assumption set); the classifier quality-bar duty remains the
+    backstop for non-battery inputs, eval-order, and non-pattern phases.
 - Runs on **100% of rows that reached solve — success AND failed** (preserving today's
   `orchestrator.ex:169` behavior; **not** solved-only), minus the `:reverted` deterministic lane (§3.9).
   Failed rows are the richest source of new-**syntax** rules (an unfixed Python-ism no rule caught); the task
@@ -445,17 +446,17 @@ whether the divergence is a **type change** or a **rare-text-only** difference:
   `Enum.at(String.to_charlist(s), i)` → `String.at(s, i)` returns an **integer** vs a **string** — it diverges
   on *every* input, incl. plain ASCII. That is not rare-text; it is a type change. Stays `NO_ACTION`, not
   check-only, not switch-gated, ever.
-- **(b) Rare-text-divergent rewrites — legal in Credence behind `single_codepoint_graphemes`, but DEFERRED for
-  Tunex this round ⇒ still `NO_ACTION`.** Same return type, diverge *only* on multi-piece characters:
-  grapheme/codepoint **count·reverse·palindrome**, e.g. `length(String.to_charlist(s))` → `String.length(s)`
-  (codepoint vs grapheme count, both integers) and `String.to_charlist(s) == Enum.reverse(String.to_charlist(s))`
-  → `s == String.reverse(s)` (codepoint vs grapheme palindrome; flips on NFD). Credence 0.7.0 keeps exactly
-  these as **switch-gated rules** (`assumptions: [:single_codepoint_graphemes]` + a property test — the shipped
-  `no_codepoint_string_reverse` example *is* this). **Tunex's non-agentic implementer this round emits no
-  `assumptions/0` and no StreamData property test (§15), so it cannot author one** — and the clone's 0.7.0
-  meta-test would reject an `assumptions`-tagged rule lacking a `<Rule>PropertyTest` at the Gate anyway. So the
-  classifier routes this sub-class to **`NO_ACTION`** as a *scoped deferral* (machinery not built), **not** a
-  *correctness prohibition* (Credence proved them safe behind the switch).
+- **(b) Rare-text-divergent rewrites — now BUILDABLE via §3.12 (2026-06-04), no longer auto-`NO_ACTION`.** Same
+  return type, diverge *only* on multi-piece characters: grapheme/codepoint **count·reverse·palindrome**, e.g.
+  `length(String.to_charlist(s))` → `String.length(s)` (codepoint vs grapheme count, both integers) and
+  `String.to_charlist(s) == Enum.reverse(String.to_charlist(s))` → `s == String.reverse(s)` (codepoint vs
+  grapheme palindrome; flips on NFD). Credence 0.7.0 keeps exactly these as **switch-gated rules**
+  (`assumptions: [:single_codepoint_graphemes]` + a property test — the shipped `no_codepoint_string_reverse`
+  example *is* this). **§3.12 now generates them:** if `credence.equiv`'s minimal-set is an *existing* switch →
+  **Tier-1 switch-gated rule** (implementer emits `assumptions/0` + a property test from the shared generator);
+  if the residual is a clean rare-text class **no** existing switch covers → **Tier-2 `SWITCH_PROPOSAL`**
+  (human-gated). Only a residual that diverges on *plain* inputs (a bug) or changes **type** (sub-class (a))
+  stays `NO_ACTION`.
 - **Same-space rewrites are unaffected** — `String.graphemes(s) == Enum.reverse(String.graphemes(s))` →
   `s == String.reverse(s)` is grapheme→grapheme, needs no promise, and is a normal Pattern rule (it is the
   always-safe half of the now-split `no_manual_string_reverse`).
@@ -558,8 +559,14 @@ a `before` snippet + the rule:
 3. Require `before(input) ≡ after(input)` — **same value, or the same exception class** — for **every** battery
    input. Any divergence ⇒ **NOT equivalent**.
 4. Print `EQUIVALENT` / `DIVERGES <input> <before_result> <after_result>` — deterministic, dogfoodable, names
-   no rule. **Fixed battery, NOT StreamData** — for determinism (resume-safe, reproducible logs); §15's "no
-   property test this round" governs *shipped* rule tests, not this internal gate.
+   no rule. **Fixed battery, NOT StreamData** — for determinism (resume-safe, reproducible logs).
+
+**Assumption-aware (the §3.12 hook).** `credence.equiv` takes `--assumptions` and runs in that Credence mode,
+**filtering the battery to the admitted domain** (a `single_codepoint_graphemes` rule drops the
+combining-accent / emoji / flag inputs, keeps the rest). Run under `:strict` + each registered switch, it
+reports the **minimal switch set** that makes `before ≡ fix(before)` (∅ = no-promise; a set = switch-gated;
+"none works" = bug-or-new-switch). This is what lets §3.12 lift the §15 rare-text deferral *without* weakening
+the gate — the promise only ever removes promise-violating inputs, never the plain ones (Credence dec. 6a).
 
 **Two run-points (reuse it, exactly like `covers`):**
 - **Classify-time pre-check** — on the classifier's proposed `before`/`after`, *before* building. `DIVERGES`
@@ -591,6 +598,63 @@ kills many bad proposals before the deterministic gate runs (saving the build) �
 is NOT the safety net** (it is the same mechanism that produced `followup.md`). `credence.equiv` is the net.
 Belt **and** airbag.
 
+### 3.12 Assumption-aware generation & switch discovery (propose-with-evidence)
+
+> Lifts the §15 deferral **partially** (decided 2026-06-04, autonomy = *propose-with-evidence*). Credence 0.7.0
+> "safety switches" let a rule be **partially** behaviour-equivalent — identical on every input a declared
+> promise (`assumptions/0`) admits, a no-op when the promise is off (§3.10). This unlocks the
+> **rare-text-divergent** class §3.10(b) used to send to `NO_ACTION`. Two capabilities, deliberately split by
+> risk.
+
+**The reframe (why this is safe, not a loophole).** An assumption is **a restriction of §3.11's battery**, not
+a weakening of it (§3.11 hook). For a rule tagged `assumptions: [:single_codepoint_graphemes]` the battery
+**drops the promise-violating inputs** (combining accents, ZWJ emoji, flags) and **keeps everything else**
+(`[]`, `nil`, `-1`, negative ints, big maps, ASCII). So Credence's decision **6a** — *"shrink the rule first,
+lean on a promise second; a promise covers only the rare-text residual, never a plain bug"* — is enforced
+**mechanically**: a switch-gated rule that diverges on any *non*-rare-text input is still caught by the
+restricted battery. **A switch can never hide a bug.**
+
+#### Tier 1 — use EXISTING switches (build now)
+A contained lift of §15, every part reusing something that already exists:
+- **Registry injection** — inject `Credence.Assumptions.all()` (switch **names + summaries**) into the
+  classifier (`08` T3.1) and implementer (`08` T5.1) prompts — a tiny dynamic block, like the
+  `no_/prefer_/avoid_` prefixes. The harness now *knows which promises it may lean on.*
+- **Classifier** may add an `assumptions: [...]` field (existing switch names only) to a proposal; the §4.3
+  gate rejects an unknown name (`⊆ Assumptions.names()`).
+- **`credence.equiv` is the authority** — it *confirms/corrects* the tag to the **minimal** switch set
+  (a rule tagged with a switch it doesn't need, or needs more than, is fixed deterministically).
+- **Implementer** emits `def assumptions, do: [...]` **plus** a `<Rule>PropertyTest` — but **authors NO
+  generator**: it reuses Credence 0.7.0's **shared, honesty-tested** `single_codepoint_string/0`, so the
+  property test is a **fixed template parameterized by before/after**, not novel StreamData authoring (the part
+  §15 rightly feared). Credence's 0.7.0 meta-tests (every tagged rule has a loadable `<Rule>PropertyTest`;
+  every `assumptions/0 ⊆ names()`) then gate it at the **Gate** for free.
+- **Recovers** the pure rare-text rejections in `followup.md` — `no_codepoint_string_reverse` (Credence's own
+  example #2), `no_grapheme_palindrome_check`, `avoid_graphemes_enum_count_with_predicate` (after shrink-first)
+  — while §3.11's strict battery keeps rejecting genuine value/type divergences (`no_integer_to_string_length`,
+  the type-changes). Clean split, no overlap.
+
+#### Tier 2 — DISCOVER new switches (propose-with-evidence; HUMAN-gated)
+A new switch is **not** a new rule: it is a **global default-policy change on a shared file**
+(`lib/assumptions.ex`) whose safety rests on a judgment about the *whole population's runtime data* — which the
+harness **never sees** (it sees code, not the strings the code will process). And authoring a correct generator
+(one that emits *only* promise-satisfying strings) is the exact trap Credence's plan warns about (a buggy
+generator makes every proof pass for nothing). So **the harness never creates a switch.** Instead:
+- When `credence.equiv` reports "diverges under all registered switches" **and** the classifier judges the
+  residual a **clean rare-text class** (not a value/type bug), the classifier emits a **`SWITCH_PROPOSAL`**
+  (decision, §4.1): the proposed promise (name + one-line summary + suggested default), the rule it would
+  unblock, the divergence class + the failing input. **Neither a built rule nor `NO_ACTION`** — a *would-be
+  rule pending a switch*, logged to **`switch_proposals/`** (§8).
+- **The evidence the harness uniquely provides = DEMAND, not data-frequency.** It can't measure "how often does
+  decomposed-accent text appear at runtime" (no runtime data). It **can** count how many **distinct rule
+  proposals** the same promise would unblock across the 118k-row walk — *demand* (code-pattern frequency, which
+  is exactly what it sees). A periodic aggregation over `switch_proposals/` clusters by proposed promise and
+  ranks by that count. **The population-safety call ("would most Phoenix apps accept this?") stays human** — the
+  harness hands over ranked demand + the classifier's reasoning; the human ratifies by writing the switch +
+  generator + CHANGELOG in Credence (a manual PR, per Credence's own §16/§18 teeth). Next run, Tier 1 picks the
+  new switch up automatically.
+- **The harness touches `lib/assumptions.ex` NEVER** — consistent with shared-files-out-of-scope (review-loop
+  Decision 2) and the global-default risk.
+
 ## 4. The classifier output contract (the "thick spec")
 
 We extract **maximum value from the one call** — it does heavy thinking over the whole log, and we discard the
@@ -599,13 +663,15 @@ log afterward, so the spec must carry everything downstream needs.
 ### 4.1 Fields
 
 ```
-decision      : NO_ACTION | BUGFIX_RULE | POTENTIAL_NEW_RULE   (must be in the offered set)
-rule_name     : present iff BUGFIX_RULE; must be ∈ APPLIED_RULES (a module name, §Q1)
-proposed_name : present iff POTENTIAL_NEW_RULE; semantic snake_case, prefixed no_/prefer_/avoid_ (§3.8)
-phase         : pattern | syntax | semantic                    (present iff a rule is proposed; plurality pattern, but syntax/semantic first-class from failed rows, §3.6/§3.3)
-before        : the offending / non-idiomatic snippet          (parse/compile gate is phase-conditional, §3.6/§4.3)
-after         : <idiomatic rewrite>   (REQUIRED whenever a rule is proposed — there is NO check-only path; narrow `before` to a fixable core or emit NO_ACTION, §4.1)
-rationale     : one line — why this is non-idiomatic / how the existing rule over-fires
+decision        : NO_ACTION | BUGFIX_RULE | POTENTIAL_NEW_RULE | SWITCH_PROPOSAL   (must be in the offered set)
+rule_name       : present iff BUGFIX_RULE; must be ∈ APPLIED_RULES (a module name, §Q1)
+proposed_name   : present iff POTENTIAL_NEW_RULE; semantic snake_case, prefixed no_/prefer_/avoid_ (§3.8)
+phase           : pattern | syntax | semantic                  (present iff a rule is proposed; plurality pattern, but syntax/semantic first-class from failed rows, §3.6/§3.3)
+before          : the offending / non-idiomatic snippet        (parse/compile gate is phase-conditional, §3.6/§4.3)
+after           : <idiomatic rewrite>   (REQUIRED whenever a rule is proposed — there is NO check-only path; narrow `before` to a fixable core or emit NO_ACTION, §4.1)
+assumptions     : [] | [<existing switch name>, …]   (§3.12 Tier 1; existing switches ONLY, ⊆ Assumptions.names(); credence.equiv confirms/corrects to the minimal set; [] = no-promise = strict-safe)
+proposed_switch : present iff SWITCH_PROPOSAL; {name, summary, default, divergence_class} — the promise that would unblock this rule, for HUMAN ratification (§3.12 Tier 2)
+rationale       : one line — why this is non-idiomatic / how the existing rule over-fires
 ```
 
 - **`before` is the rule's first test case** (must-fire); **`after` is always present** — the must-not-fire
@@ -616,13 +682,14 @@ rationale     : one line — why this is non-idiomatic / how the existing rule o
   contract — §3.10, Credence ≥0.7.0).** Not "correct for the shown snippet" — a true refactor whose rewrite
   produces the same output on *all admitted* inputs (Tunex's default helpful mode = every single-codepoint
   input). If the only idiomatic form would change behaviour on *some admitted* input, the case is **not
-  fixable** and is **`NO_ACTION`** (there is no check-only fallback — §4.1). The codepoint↔grapheme class (§3.10) is the canonical
-  trap, now read in two parts: **type-change** rewrites (e.g. `Enum.at(String.to_charlist …)` → `String.at`)
-  are `NO_ACTION` *forever*; **rare-text-divergent** rewrites (count·reverse·palindrome) are `NO_ACTION` *this
-  round only* (legal in Credence as switch-gated rules, but the implementer can't author one — §15). This is
-  **not** deterministically checkable (no oracle for "same on every admitted input"); like single-issue
-  isolation below, it is the **classifier's** judgment + prompt discipline (`08` T3.1), re-stated to the
-  **implementer** (§5.3).
+  fixable** and is **`NO_ACTION`** (there is no check-only fallback — §4.1) — **unless** a declared assumption
+  admits it (§3.12). The codepoint↔grapheme class (§3.10) is the canonical trap, now read in two parts:
+  **type-change** rewrites (e.g. `Enum.at(String.to_charlist …)` → `String.at`) are `NO_ACTION` *forever* (no
+  switch rescues a type change); **rare-text-divergent** rewrites (count·reverse·palindrome) are **buildable as
+  switch-gated rules** — tag `assumptions: [<existing switch>]` (§3.12 Tier 1), or emit `SWITCH_PROPOSAL` if no
+  switch covers the class (Tier 2). This judgment is now **largely deterministic**: `credence.equiv` (§3.11)
+  reports the minimal assumption set that makes `before ≡ fix(before)`, so "no-promise vs switch-gated vs bug"
+  is mostly computed, not reasoned (the residual judgment is "clean rare-text class vs plain bug", §3.12).
 - **Always a full, self-contained `defmodule` — ALL phases.** Pattern/semantic snippets are full modules
   already; a **syntax** snippet is wrapped in a **module template** (it still won't *parse* — that's the issue —
   but it's a full-module-shaped string). One canonical form read identically by the novelty pre-check (§3.7),
@@ -675,12 +742,18 @@ pattern
 <snippet>
 ===AFTER===           (REQUIRED — every proposed rule is fixable; there is no ===CHECK_ONLY=== marker)
 <snippet>
+===ASSUMPTIONS===     (OPTIONAL — omit or empty = no-promise; else existing switch names, §3.12 Tier 1)
+single_codepoint_graphemes
 ===RATIONALE===
 <one line>
 ```
 
 For `POTENTIAL_NEW_RULE`, swap `===RULE_NAME===` for `===PROPOSED_NAME===` (semantic snake_case, e.g.
-`prefer_map_put_new`); the orchestrator owns final naming + suffix de-collision (§3.8).
+`prefer_map_put_new`); the orchestrator owns final naming + suffix de-collision (§3.8). For a
+**`SWITCH_PROPOSAL`** (§3.12 Tier 2 — `credence.equiv` diverges under *all* registered switches but the residual
+is a clean rare-text class) there is no `===AFTER===`/build; instead a `===PROPOSED_SWITCH===` block
+(`name` · `summary` · `default` · `divergence_class`) + the `===BEFORE===` it would unblock → logged to
+`switch_proposals/` for a human, never built.
 
 ### 4.3 Deterministic validation gates
 
@@ -701,6 +774,12 @@ Parse + validate; on failure → **one re-ask**; if still invalid → log to `va
 - `after` is **present and parses** (the phase isn't `syntax`); a **missing `after` is an invalid spec** →
   re-ask. Over the cap → the classifier should have narrowed; an un-narrowed over-cap `after` ⇒ **`NO_ACTION`**
   (no check-only downgrade — that path is gone, §4.1).
+- **`assumptions` (§3.12 Tier 1):** every name ⊆ `Credence.Assumptions.names()` (an unknown switch ⇒ invalid →
+  re-ask — the classifier may NOT invent a switch via this field; that's `SWITCH_PROPOSAL`). The tag is
+  **advisory** — `credence.equiv --assumptions` is the authority and **corrects it to the minimal set** (a rule
+  tagged with a switch it doesn't need is shipped no-promise; one that still diverges under the tagged switch is
+  rejected). **`SWITCH_PROPOSAL`** ⇒ no build: validate `proposed_switch` shape, log → `switch_proposals/` with
+  demand evidence (§3.12 Tier 2), never enters the implementer.
 
 On a malformed/invalid spec we do **one** re-ask, then stop (a row we can't get a clean spec for is not worth
 an implementer). The failed spec + log land in `classifier_errors/` for debugging.
@@ -816,17 +895,23 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
   implementer *writes* `fix/2`/`fix_patches/2` and could regress it (e.g. broaden the match so the rewrite now
   fires on a behaviour-diverging input). Inject the invariant (output-identical for **every input the active
   assumptions admit**) + the codepoint↔grapheme split (type-change = forbidden forever; rare-text-divergent =
-  deferred this round). **The implementer also has NO check-only escape (§4.1):** it must write a real
-  `fix_patches/2`; if it cannot keep the fix safe even on the narrow core the classifier handed it, it does
-  **not** ship a `-> []` stub — it `gave_up`s (and the row is logged), because we no longer accept non-fixable
-  rules. **The §3.11 `credence.equiv` gate WILL execute its `fix` across the adversarial battery** (classify-time
-  + 6th Gate check) and a `DIVERGES` is a hard reject — so the seed instructs the model to **self-run that
-  battery** (`{input, before, after}` per input) before emitting and to **narrow the match until every battery
-  input is a no-op**, not discover the divergence at the gate. **Also instruct it to emit NO `def assumptions`
-  and NO StreamData property test this round** — every rule it writes must be no-promise / always-safe; a
-  switch-gated rule it can't pair with a property test would fail the clone's 0.7.0 meta-test at the Gate (§10).
-  The Gate won't catch a *type-change* behaviour regression (§10), so this prompt line is the backstop on the
-  implementer side.
+  **switch-gated via §3.12**, not deferred). **The implementer also has NO check-only escape (§4.1):** it must
+  write a real `fix_patches/2`; if it cannot keep the fix safe even on the narrow core the classifier handed it,
+  it does **not** ship a `-> []` stub — it `gave_up`s (and the row is logged), because we no longer accept
+  non-fixable rules. **The §3.11 `credence.equiv` gate WILL execute its `fix` across the (assumption-restricted)
+  battery** (classify-time + 6th Gate check) and a `DIVERGES` is a hard reject — so the seed instructs the model
+  to **self-run that battery** (`{input, before, after}` per input) before emitting and to **narrow the match
+  until every admitted-battery input is a no-op**, not discover the divergence at the gate.
+- **Assumptions (§3.12 Tier 1) — when the spec carries `assumptions: [...]`:** emit
+  `def assumptions, do: [...]` (the existing switch names the spec/`credence.equiv` settled on) **plus** a
+  `Credence.Pattern.<Rule>PropertyTest` — built from a **fixed template** that asserts `before ≡ fix` across
+  Credence's **shared** `single_codepoint_string/0` generator (injected as an exemplar in the seed). **The
+  implementer authors NO generator** — reusing the shared, honesty-tested one is what makes this safe and cheap;
+  inventing a new switch/generator is Tier 2 and **out of the implementer's scope** (human-gated, §3.12). For a
+  **no-promise** rule (`assumptions: []`) it emits **no** `assumptions/0` and **no** property test, exactly as
+  before. The clone's 0.7.0 meta-tests (tagged-rule-needs-property-test; `assumptions/0 ⊆ names()`) gate both
+  cases at the Gate. The Gate won't catch a *type-change* regression (§10), so the invariant restatement above
+  is the implementer-side backstop.
 
 ### 5.4 The split-test rule
 
@@ -989,11 +1074,12 @@ is bounded by a run, not forever.
 | `NO_ACTION` | **`no_action/`** (NEW) | *deleted* (`RowLog.close/1`) |
 | Novelty pre-check = `COVERED` (duplicate) | **`duplicate/`** (NEW) | n/a |
 | Behavioural-equivalence (§3.11) = `DIVERGES` at classify-time | **`behaviour_diverged/`** (NEW) | n/a |
+| `SWITCH_PROPOSAL` (§3.12 Tier 2 — would-be rule pending a new switch) | **`switch_proposals/`** (NEW) | n/a |
 | Spec malformed after one re-ask | **`classifier_errors/`** (NEW) | n/a |
 
 **`RowLog` gains move targets.** Today it has `open`/`close` (delete)/`escalate`/`commit`. The rebuild:
 `close/1`'s delete → **move to `no_action/`**; add `duplicate/1`, `behaviour_diverged/1` (§3.11) and
-`classifier_errors/1` move methods (same `filesync → remove_handler → rename` shape as `escalate/1`). **Retention knob** (default = keep
+`switch_proposals/1` (§3.12) and `classifier_errors/1` move methods (same `filesync → remove_handler → rename` shape as `escalate/1`). **Retention knob** (default = keep
 everything): `no_action/` is the bulk, holding full firehose logs — fine for a days-long run + reset; if disk
 bites, retain only the *distilled classifier input + its output* there (enough to debug a false-negative).
 
@@ -1042,13 +1128,15 @@ that's not a debugging artifact.)
   not side-effecting operands — §3.11 limits), and **semantic/syntax** phases (no compilable `before` to run).
   The classifier still never proposes a behaviour-changing `after`, and the implementer prompt re-states the
   invariant (§5.3) — but those are now the *upstream* belt, with `credence.equiv` the executable airbag.
-- **0.7.0 gives the Gate *partial* teeth on the switch machinery (NEW).** The clone is now Credence 0.7.0, and
+- **0.7.0 gates the switch machinery — and §3.12 Tier 1 now USES it (UPDATED).** The clone is Credence 0.7.0;
   the full `mix test` the Gate runs includes its assumptions meta-tests: every `assumptions/0` ⊆ known switch
-  names, and every switch-tagged rule has a loadable `<Rule>PropertyTest`. So a rule that names a bogus switch
-  or tags a switch without a property test **fails the Gate mechanically** — which is precisely why a
-  switch-gated rule **cannot land this round** (the implementer authors no property test, §5.3/§15) and the
-  rare-text-divergent class stays `NO_ACTION` by construction, not just by prompt. (The meta-tests do **not**
-  check behaviour identity, so the type-change discipline above still has no Gate net.)
+  names, and every switch-tagged rule has a loadable `<Rule>PropertyTest`. A switch-gated rule the implementer
+  emits (§3.12 Tier 1) **lands** precisely because it satisfies these — it tags only existing switches and ships
+  a property test from the **shared** generator (§5.3); a malformed one (bogus switch, or tagged-without-test)
+  **fails the Gate mechanically.** Plus the §3.11 `credence.equiv` restricted-battery proves the partial
+  equivalence *before* the Gate. (The meta-tests don't check behaviour identity — that's what §3.11 adds; the
+  *type-change* class still has no Gate net beyond §3.11's exercised-input catch + the §5.3 discipline.) A
+  **new** switch still can't land autonomously — that's the human-gated Tier 2 (§3.12).
 - **The `:reverted` lane can't fix a healthy rule** — Pattern's entry gate (`pattern.ex:52`) skips
   non-compiling input, so its only revert is a genuine compiling→non-compiling regression. Every `:reverted`
   is therefore an already-attributed broken rule — deterministic, ~zero false-positive, no Credence change.
@@ -1075,11 +1163,14 @@ that's not a debugging artifact.)
      what's left?" legible. *Prereq for trusting every later number; ~free.*
 1. **AST helper** — `mix credence.ast` in Credence + dogfood against a known rule's snippet. Unblocks the
    implementer. **Same Credence pass (ship together — all Credence-side):** (i) `mix credence.covers`
-   behavioral novelty task (§3.7); (ii) **`mix credence.equiv` behavioural-equivalence task (§3.11)** — compile
-   `before` + `fix(before)`, run both over the adversarial battery, print `EQUIVALENT`/`DIVERGES`; dogfood on a
-   known-unsafe `followup.md` snippet (must report `DIVERGES`); (iii) *optional* — `log_diff` in the Pattern
-   revert branch for seed visibility (§3.9). **No revert-gate fix — `:reverted` is already a clean signal
-   (Pattern entry gate, `pattern.ex:52`).**
+   behavioral novelty task (§3.7); (ii) **`mix credence.equiv` behavioural-equivalence task (§3.11/§3.12)** —
+   compile `before` + `fix(before)`, run both over the adversarial battery, print `EQUIVALENT`/`DIVERGES`;
+   **takes `--assumptions` and reports the minimal switch set** (run under `:strict` + each registered switch),
+   battery filtered to the admitted domain (§3.12); dogfood on a known-unsafe `followup.md` snippet (must report
+   `DIVERGES`) and a rare-text one (must report `EQUIVALENT under single_codepoint_graphemes`); (iii)
+   *optional* — `log_diff` in the Pattern revert branch for seed visibility (§3.9). **No revert-gate fix —
+   `:reverted` is already a clean signal (Pattern entry gate, `pattern.ex:52`).** *(No `lib/assumptions.ex`
+   change — Tunex only READS `Credence.Assumptions`; switch creation is human/Credence-side, §3.12 Tier 2.)*
 2. **Classifier** — raw `Tunex.LLM`, **configurable provider** (default Mimo-pro, `:anthropic_opus`
    alternative — §3.1), marker output, validation gates, option-shaping, coarse Python-cut distillation
    (`===SOLVE_BOUNDARY===` sentinel, §7), `APPLIED_RULES` + ledger inputs.
@@ -1092,10 +1183,11 @@ that's not a debugging artifact.)
    key (or a mis-set override) fails *boot*, not mid-run. Unlike the remote-solve skip (which shares Mimo's
    already-proven host), the classifier provider may be a **distinct vendor/auth**, so it is always smoked —
    the one-token cost is trivial insurance against losing a whole run on a stale key.
-3. **Solver-loop implementer** — both modes (phase-conditional seed, §3.6) + AST-dump injection + the new
-   outcome directories (`no_action/`, `duplicate/`, `classifier_errors/`). Runs in the **clone** (§5); the
-   commit path calls `Workspace.recompile_credence/1`. **Wired classifier → implementer end-to-end
-   immediately** (no measure-only sub-phase).
+3. **Solver-loop implementer** — both modes (phase-conditional seed, §3.6) + AST-dump injection + Tier-1
+   assumptions/property-test emission (§3.12) + the new outcome directories (`no_action/`, `duplicate/`,
+   `behaviour_diverged/`, `switch_proposals/`, `classifier_errors/`). Runs in the **clone** (§5); the commit
+   path calls `Workspace.recompile_credence/1`. **Wired classifier → implementer end-to-end immediately** (no
+   measure-only sub-phase).
 4. **`credence_failed` escalation branch** — **UNBUILT (doc-06 design, no code yet)**; independent of the
    rebuild (failures already land in local `escalated/`); can land any time, or never. Not a rebuild prereq.
 5. **Delete** `claude_code.ex` + the agentic generator once 2–3 are proven landing rules.
@@ -1151,7 +1243,7 @@ So:
 | Fixable-only (NO check-only) | **2026-06-04 policy:** every proposed rule carries a real `after`/`fix_patches`. No `fix_patches/2 -> []` stubs. Can't safely fix even a narrow core (or only fix changes a value's **type**) → **`NO_ACTION`**, not check-only. Matches the `evolution → main` reviewer's fixable-only bar (kills the `unfixable.md` lane at source) (§4.1) |
 | `after` complexity | capped; over-cap → **narrow to a fixable core, else `NO_ACTION`** (never check-only) (§4.1) |
 | Test shape (emit reviewer-ready) | fix tests compare **whole output with `==`** (no `=~`/`String.contains?`/`match?`/`starts_with?`/split-slice — even for negatives); `expected` from the rule's **real** output; **heredocs only** (no `\n`-escapes); `_check` includes the dropped-unsafe cases as "no issue"; `check`/`fix` agree (§5.6) |
-| **Behaviour preservation** | **Absolute *relative to declared `assumptions:`* (§3.10; Credence ≥0.7.0).** `after` must be output-identical to `before` for **every input the active promises admit**; Tunex runs the **default (helpful)** mode (`single_codepoint_graphemes` on), never `:strict`. The old "FORBIDDEN: codepoint↔grapheme" class **splits**: **(a) type-change** rewrites (`Enum.at(to_charlist)` → `String.at`, int vs string) = `NO_ACTION` *forever* (no switch rescues — Credence dec. 15); **(b) rare-text-divergent** (count·reverse·palindrome) = legal in Credence as **switch-gated** rules (+ property test) but **deferred this round → `NO_ACTION`** (implementer emits no `assumptions/0`/property test, §15). Same-space rewrites OK. Type-change is **not** Gate-caught (§10) → classifier + implementer prompt discipline (`08` T3.1/T5.1); the 0.7.0 meta-tests mechanically block an untested switch-gated rule at the Gate (§10) |
+| **Behaviour preservation** | **Absolute *relative to declared `assumptions:`* (§3.10; Credence ≥0.7.0).** `after` must be output-identical to `before` for **every input the active promises admit**; Tunex runs the **default (helpful)** mode (`single_codepoint_graphemes` on), never `:strict`. The old "FORBIDDEN: codepoint↔grapheme" class **splits**: **(a) type-change** rewrites (`Enum.at(to_charlist)` → `String.at`, int vs string) = `NO_ACTION` *forever* (no switch rescues — Credence dec. 15); **(b) rare-text-divergent** (count·reverse·palindrome) = **now buildable via §3.12** (Tier-1 switch-gated rule on an existing switch, or Tier-2 `SWITCH_PROPOSAL` if no switch covers it) — no longer auto-`NO_ACTION`. Same-space rewrites OK. **§3.11's `credence.equiv` now gates behaviour** (incl. type-change on exercised inputs) for pattern; the 0.7.0 meta-tests block an untested switch-gated rule at the Gate (§10) |
 | Validation | deterministic gates; one re-ask → `classifier_errors/` |
 | Implementer | **one** solver-style loop (raw LLM, no harness/tools), parameterized new/bugfix; whole-file emit via a **file-keyed marker scheme** (new = fixed-role `RULE`/`CHECK_TEST`/`FIX_TEST`; bugfix = path-keyed `TEST:<path>` ⊆ glob, modify-only) (§5.2) |
 | Implementer seed | thick spec + precomputed before+after AST dumps + exemplar (+ rule source for bugfix) |
@@ -1161,7 +1253,8 @@ So:
 | Distillation | coarse cut **only** this round: drop everything above an explicit `===SOLVE_BOUNDARY===` sentinel (invariant — no absent-marker handling); full marker-fencing documented-not-built |
 | Gate | 5-part backstop **+ a 6th behavioural-equivalence check** (`credence.equiv` on `before` vs actual `fix`, pattern-phase — §3.11) |
 | Ledger | kept, feeds classifier whole/uncapped (stays near-empty by design); writes on implementer-failed + gate_reject only; phantom retired; duplicate/classifier_errors don't ledger |
-| No deletion | move-to-outcome-dir; new `no_action/`, `classifier_errors/`; `tunex.reset` still clears |
+| No deletion | move-to-outcome-dir; new `no_action/`, `behaviour_diverged/`, `switch_proposals/`, `classifier_errors/`; `tunex.reset` still clears |
+| Assumptions / switch discovery (§3.12) | **propose-with-evidence (2026-06-04).** Tier 1: classifier may tag a rule with an **existing** switch (`Credence.Assumptions` injected); `credence.equiv --assumptions` confirms the minimal set; implementer emits `assumptions/0` + a property test from Credence's **shared** generator (no generator authoring). Tier 2: a clean rare-text class with **no** existing switch ⇒ `SWITCH_PROPOSAL` → `switch_proposals/` with **demand** evidence; a **human** writes the switch (harness never touches `lib/assumptions.ex`). Recovers the pure rare-text `followup.md` rejections |
 | Measurement | **no `summed_usage` port** — the undercount was a CC-harness artifact deleted with it; per-call `Budget.record` IS the bucket basis (expect ledger ≈ console ~1×). Add **per-stage tagging** (`:classify`/`:implement`/`:solve`). Trust console for absolutes (§11.0) |
 | Shadow | human-sampled `no_action/` audit; automated second-opinion = footnote only; **model-divergence A/B sampling** (run both classifier models on 1-in-N rows for calibration data) = documented-not-built, mostly replayable offline from saved logs (§12) |
 | Escalation archive | `credence_failed` branch kept as-is |
@@ -1220,15 +1313,16 @@ So:
 - **Sourceror-gotchas cheatsheet** appended to the AST helper output (§6).
 - **Migrating existing rules to split test files** — a separate human/mechanical pass, never entangled with
   the autonomous bugfix loop.
-- **Switch-gated (assumption-tagged) rule generation** — Credence 0.7.0 ("safety switches") makes
-  rare-text-divergent rewrites legal *behind* `assumptions: [:single_codepoint_graphemes]` **with a mandatory
-  StreamData property test** (§3.10). To author one, the classifier would emit a `switch` field, the
-  implementer would emit `def assumptions, do: […]` **plus** a `<Rule>PropertyTest` over the shared
-  single-codepoint generator (else the clone's 0.7.0 meta-test reds the Gate, §10), and the seed would carry a
-  property-test exemplar. None of that is built this round, so the whole rare-text-divergent class
-  (count·reverse·palindrome) stays `NO_ACTION` — a *scoped deferral*, not a prohibition. Build it once the
-  no-promise pipeline is proven and if `no_action/` audits show this vein is worth the machinery. (Type-change
-  rewrites stay forbidden regardless — a switch can't promise away a type change.)
+- **Switch-gated rule generation — the deferral is now SPLIT (§3.12, 2026-06-04).**
+  - **Tier 1 (use EXISTING switches) is NO LONGER deferred — build it (§3.12).** The classifier may tag a rule
+    with an existing switch, `credence.equiv --assumptions` confirms the minimal set, and the implementer emits
+    `assumptions/0` + a `<Rule>PropertyTest` from Credence's **shared** generator (a fixed template, *not*
+    authored StreamData — which is what made this hard). This recovers the rare-text `followup.md` rejections.
+  - **Tier 2 (DISCOVER new switches) stays deferred to a HUMAN** — *propose-with-evidence*: the harness emits a
+    `SWITCH_PROPOSAL` with demand evidence to `switch_proposals/`, a human writes the switch + generator +
+    CHANGELOG in Credence. The harness never authors a new generator or touches `lib/assumptions.ex` (global
+    default; the generator-authoring trap). Type-change rewrites stay forbidden regardless — a switch can't
+    promise away a type change (§3.10(a)).
 
 ---
 
