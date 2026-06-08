@@ -11,6 +11,51 @@ ledger undercounts ~20×) and the **corrected cost model** in `06` (cost ≈ 92%
 > flow (`lib/tunex/claude_code.ex` + the agentic `lib/tunex/evolve/credence_rule_generator.ex`) is **deleted**
 > by this plan — not flagged, not kept as a fallback.
 
+> **⚑ Credence-side reconciliation (2026-06-08 — read before §3.11/§5/§6).** Since this doc was written,
+> the Credence clone (`main`) **independently shipped two things this plan assumed it would build, but in a
+> different shape** — verified in the clone, not hypothetical. They *strengthen* the rebuild; they do **not**
+> change its skeleton. The deltas:
+>
+> 1. **Behaviour-equivalence is now a PER-RULE TEST + a HARD meta-gate, NOT a `mix credence.equiv` task.**
+>    Credence shipped `Credence.BehaviourEquivalence` (`assert_equivalent/2`, `assert_equivalent_module/2`,
+>    `assert_effect_trace_equivalent/2`, `eval_outcome/2` with **strict `===`** + exception-module parity,
+>    `mark_equivalence_{cosmetic,unconstructible,repair}/1`) + a curated `Credence.EquivalenceInputs` battery
+>    (`term_lists`/`signed_integers`/`unicode_strings`/`single_codepoint_strings`/`multi_codepoint_strings`/
+>    `stability_lists`) + a **hard** `equivalence_meta_test.exs` that fails the suite unless **every Pattern
+>    rule** carries a real `<name>_equivalence_test.exs` (anti-stub: fires + rewrote + ≥3 **discriminating**
+>    inputs). **Consequences:** (a) §3.11's "6th Gate check" is **subsumed** — a behaviour-diverging fix fails
+>    its *own* mandatory equivalence test, which the Gate's full `mix test` already runs; no separate
+>    `equiv`-on-the-built-rule plumbing. (b) §3.11's **classify-time** pre-check still needs a deterministic
+>    snippet-vs-snippet check (no rule exists yet), but it is now a **thin task built ON TOP of**
+>    `BehaviourEquivalence`/`EquivalenceInputs` (reuse `eval_outcome` + the shipped battery — don't reinvent).
+>    (c) Every **new Pattern rule the implementer ships now MUST include an equivalence test** (§5.6) — a new
+>    mandatory artifact the generator scaffolds. (d) The shipped **`mark_equivalence_repair`** tier legitimizes
+>    a *behaviour-changing* "fix broken → working" family (does-not-compile / always-crashes), which §3.10's
+>    blanket "absolute" framing forbade — see §3.10's repair note.
+> 2. **A rule SCAFFOLD GENERATOR shipped: `mix credence.gen.rule <Name> [--type pattern|syntax|semantic]`**
+>    (+ `Credence.RuleName` derive/test_path/test_module — the single name/path source of truth — and
+>    `Credence.RuleScaffold`). It emits correctly-named, heredoc-fixtured, **honest-red, gate-passing**
+>    skeletons (Pattern → rule + `_check_test` + `_fix_test` + **`_equivalence_test`**; Syntax → rule +
+>    `_analyze_test` + `_fix_test`; Semantic → rule + `_check_test` + `_fix_test`), formats them, aborts on
+>    collision. **This is the "use the generator" step (§5.0/§6.1):** the implementer no longer hand-builds
+>    paths/module-names/test-shapes — the orchestrator runs the generator with the final name, then the
+>    implementer **fills the red stubs**. This subsumes T5.4a's phase-conditional check-test filename and
+>    de-risks every structural meta-gate.
+> 3. **Syntax & Semantic rules now carry HARD meta-gates too** (`syntax_meta_test.exs` /
+>    `semantic_meta_test.exs` + a `generator_meta_test.exs` pin): completeness + substance (positive +
+>    negative) + **`valid_syntax?(fix(x))`** + the **fixpoint** `analyze(fix(x)) == []` + attribution. So a new
+>    Syntax/Semantic rule can no longer ship inert — the implementer must emit those shapes (§5.6); the
+>    generator does, by construction.
+> 4. **`Credence.Assumptions` now has TWO default-on switches** — `single_codepoint_graphemes` **and**
+>    `proper_lists`. §3.10/§3.12's "the one promise on" prose generalizes to "the helpful-mode promises"; the
+>    dynamic `Assumptions.all()` injection (T3.1/T5.1) already handles N switches, so no design change — only
+>    the shared-generator reference (§3.12) gains `proper_list/0` alongside `single_codepoint_string/0`.
+>
+> **Still NOT built** (Tunex's planned Credence PR, `08` Phase 1): `mix credence.ast`, `credence.covers`,
+> `credence.equiv`. Build them as planned — but `credence.equiv` reuses the shipped support module (delta 1b),
+> and the implementer flow gains a generator-scaffold step (delta 2). Inline notes below thread each delta into
+> the section it touches.
+
 ---
 
 ## 1. Why rebuild (the one-paragraph case)
@@ -264,7 +309,9 @@ Consequences threaded through the rest of the doc:
   by both routes:
   - **Pattern** target/new → AST-dump seed (§6); `before` must parse **and** compile.
   - **Semantic** target → `before` must parse (AST available) but **need not compile**; seed centers on the
-    *diagnostic* the rule keys on, not pure AST shape.
+    *diagnostic* the rule keys on, not pure AST shape — specifically the **real `%{message, position, severity}`
+    captured from the failed-solve trace** (§5.3, the `[credence_fix] no rule matched diagnostic` line; `08`
+    T1.3b), so `match?` keys on a genuine compiler message and the rule isn't dead in production.
   - **Syntax** target → **no AST dump** (`before` doesn't parse — the AST helper would *raise*); seed = the raw
     before/after strings + the `Credence.Syntax.Rule` (string-level `fix/1`) exemplar; **no parse/compile gate.**
     (The raw-string-seed choice is an **unverified assumption** — Sourceror's fault-tolerant parser *might*
@@ -398,8 +445,11 @@ This is strictly **additive** to the classifier flow: the 100%-classifier floor 
 > behaviour-preservation **relative to a declared domain**: *"Credence never changes behaviour on any input the
 > stated promises (`assumptions:`) admit."* In **`:strict`** mode zero promises are made ⇒ the admitted domain
 > is *every possible input* ⇒ bit-identical output, the old iron-clad guarantee, reachable by one word. In the
-> **default (helpful)** mode one checkable promise — `single_codepoint_graphemes` (every character is a single
-> codepoint: no decomposed/NFD accents, ZWJ emoji, flags) — is **on**, so a rule may also fire when its rewrite
+> **default (helpful)** mode the curated **helpful-mode promises** are **on** — as of 2026-06-08 that is
+> **`single_codepoint_graphemes`** (every character is a single codepoint: no decomposed/NFD accents, ZWJ emoji,
+> flags) **and `proper_lists`** (every list's tail is a list — no improper `[1 | 2]`); read "the promise(s) on"
+> generically, the set grows as Credence adds switches and Tunex reads them dynamically via
+> `Credence.Assumptions.all()` (§3.12) — so a rule may also fire when its rewrite
 > is output-identical *for every promise-satisfying input*, declared via `def assumptions, do:
 > [:single_codepoint_graphemes]` and **proved by a mandatory StreamData property test**.
 >
@@ -433,6 +483,23 @@ This is strictly **additive** to the classifier flow: the 100%-classifier floor 
   fix-*complexity* now route to the **same** place: a pattern whose only idiomatic form changes behaviour on
   admitted input → **`NO_ACTION`**; a behaviour-safe pattern that is merely hard to auto-fix → **narrow to the
   fixable core, or `NO_ACTION`**. Never a check-only stub.
+
+- **The one principled exception — the REPAIR family (Credence's `mark_equivalence_repair`, shipped
+  2026-06-08).** "Absolute behaviour preservation" has a sound carve-out Credence now formalizes: a rule whose
+  **`before` has NO valid output on ANY admitted input** — it either *does not compile* (a hallucinated guard /
+  missing `require`) or *always crashes* (an arg-order bug like `value |> Regex.replace(...)`, or
+  `Keyword.get(l, <int>)` which the `is_atom(key)` guard rejects on every list) — is a **correction**, not a
+  behaviour change, because there is no behaviour to preserve. These ship with `mark_equivalence_repair(reason)`
+  (the reason must prove the broken precondition) instead of `assert_equivalent`. **For Tunex this is exactly
+  the failed-row / Python-ism source** (§3.3): an `a div b`-style always-broken snippet is a repair, not a
+  `NO_ACTION`. So the classifier/`credence.equiv` pre-check must **not** auto-`NO_ACTION` a `before` that
+  *crashes on every battery input* — that is a repair candidate. **The mechanism (§3.11): `credence.equiv` is a
+  trichotomy `EQUIVALENT | REPAIR | DIVERGES`** — it deterministically returns `REPAIR` when `before` raises on
+  every admitted input and `after` succeeds, and the router proceeds to the implementer in repair sub-mode
+  (the implementer emits `mark_equivalence_repair`; Syntax rules are repairs by nature and live outside the
+  equivalence suite, §5.6). A
+  `before` that returns a **valid-but-undesired** value on *some* input is NOT a repair — it is a behaviour
+  change → narrow or `NO_ACTION` (Credence's own line: `no_map_get_sentinel` was dropped for exactly this).
 
 **The old "FORBIDDEN: codepoint↔grapheme" class splits in two under 0.7.0 — read the split, don't blanket-ban.**
 `String.to_charlist/1`·`?c`·`String.codepoints/1` work in **codepoint** space; `String.at`·`String.reverse`·
@@ -537,6 +604,29 @@ Same-answer on every one of these, or it is not a fixable rule.
 > asks *"is the proposed fix actually a no-op on behaviour?"* Both are **deterministic, execute the snippet, and
 > invoke no model judgment.**
 
+> **⚑ Reconciliation (2026-06-08): this exists in Credence now — but as a PER-RULE TEST + a HARD gate, not a
+> `mix credence.equiv` task.** Credence shipped `Credence.BehaviourEquivalence.assert_equivalent/2` (compiles
+> `before`/`fix(before)` as `fn`s, runs a curated `Credence.EquivalenceInputs` battery, **strict `===`** +
+> exception-module parity; anti-stub: rule fires + rewrote + ≥3 **discriminating** inputs) + `assert_equivalent_module/2`
+> (T2 whole-module) + `assert_effect_trace_equivalent/2` (the §3.11-phase-2 eval-order tracer — already built)
+> + the `mark_equivalence_{cosmetic,unconstructible,repair}/1` opt-outs, and a **hard** `equivalence_meta_test.exs`
+> demanding every Pattern rule own a real `<name>_equivalence_test.exs`. This **splits §3.11's two run-points**:
+> - **The "6th Gate check" is SUBSUMED.** The Gate already runs the clone's full `mix test`; that now *includes*
+>   each rule's mandatory equivalence test executing the **actual** `fix(before)` over the battery. A
+>   behaviour-diverging fix the implementer wrote fails its own test → suite RED → Gate rejects. **No separate
+>   `equiv`-on-the-built-rule invocation is needed** (T4.3b reduces to "the rule's equivalence test, run by the
+>   Gate suite"). The implementer's job becomes *authoring a real equivalence test* (anti-stub + `===` enforced
+>   by the meta-gate), seeded from `Credence.EquivalenceInputs` — the generator scaffolds the file (§5.0).
+> - **The classify-time pre-check still needs a standalone check** (no rule/test exists yet — only a proposed
+>   `before`/`after` string pair), so `mix credence.equiv` is still built — but as a **thin task reusing**
+>   `BehaviourEquivalence.eval_outcome/2` + the `EquivalenceInputs` battery in *snippet-vs-snippet* mode (the
+>   `equivalence_regression_test.exs` pattern: run two snippets directly, no rule), so the classify-time battery
+>   is **byte-identical** to the one the shipped per-rule tests use. The `--assumptions` minimal-set logic
+>   (below) stays.
+>
+> The mechanism description below is **correct as the contract**; only its *home* changed (per-rule test +
+> meta-gate for the built rule; a thin `EquivalenceInputs`-reusing task for the proposal).
+
 **Why it's needed (the evidence, not a hypothetical).** The live agentic generator *already* carries a
 behaviour-preservation instruction in its `@task` — and still shipped ~25 behaviour-diverging rules
 (`followup.md`), **each with a green test suite**, because the model that misjudges safety also writes the
@@ -548,18 +638,40 @@ runtime-bound variables** (`followup.md` repeats "list & index are always variab
 bare variable") — is precisely what makes them **differentially testable**: substitute an adversarial battery
 into those variables and run both sides.
 
-**Mechanism — `mix credence.equiv` (new Credence task, sibling to `credence.ast` / `credence.covers`).** Given
-a `before` snippet + the rule:
+**Mechanism — `mix credence.equiv` (new Credence task, sibling to `credence.ast` / `credence.covers`).**
+**⚑ Run-env caveat (2026-06-08):** `Credence.BehaviourEquivalence` + `Credence.EquivalenceInputs` live in
+`test/support/` (`elixirc_paths(:test)` only), so the reused `eval_outcome/2` + battery are **not on the `:dev`
+code path**. Tunex therefore shells **`MIX_ENV=test mix credence.equiv …`** in the clone (a separate
+`_build/test`, warmed at preflight/first-run alongside the `:dev` build that `covers`/`ast` use). No
+Credence module-home change — the task resolves the support modules because `test/support` is compiled under
+`:test` (test `*_test.exs` files are *not* compiled by a plain task, so this stays cheap). Given a `before`
+snippet + the rule:
 1. Compile `before` as a module; compute `after = Rule.fix(before)`; **compile `after`** (a non-compiling
    `after` — an unbound var from a dropped binding, e.g. `no_destructure_reconstruct` / `no_manual_frequencies`
    / `no_manual_enum_uniq` — fails here immediately).
 2. Call each public function with a **fixed adversarial battery** (the §3.10 checklist made concrete, matched
    to arity): `[]`, `[x]`, `[x, y, z]`, a `Range`, a **>32-key map**, a **present-key map**, `nil`, `-1`, `0`,
    `7`, `"7"`, `"10"`, ASCII / combining-accent / multi-codepoint-emoji / flag strings, a side-effecting closure.
-3. Require `before(input) ≡ after(input)` — **same value, or the same exception class** — for **every** battery
-   input. Any divergence ⇒ **NOT equivalent**.
-4. Print `EQUIVALENT` / `DIVERGES <input> <before_result> <after_result>` — deterministic, dogfoodable, names
-   no rule. **Fixed battery, NOT StreamData** — for determinism (resume-safe, reproducible logs).
+   **⚑ Reuse, don't reinvent:** this battery is exactly the shipped `Credence.EquivalenceInputs` dimensions
+   (`term_lists`/`signed_integers`/`unicode_strings`/`single_codepoint_strings`/`multi_codepoint_strings`/
+   `stability_lists`); the classify-time task picks the dimension(s) matching the rule's risk, identical to how
+   the per-rule equivalence tests do. Comparison is **strict `===`** (catches `6 == 6.0` value-kind drift) +
+   exception-module parity — Credence's `eval_outcome/2` semantics, not `==`.
+3. Classify the outcome into a **trichotomy** (the task is the authority — §3.10 repair carve-out is
+   *executed*, not reasoned):
+   - **`EQUIVALENT`** — `before(input) ≡ after(input)` (same value under strict `===`, or the same exception
+     class) for **every** battery input (+ the minimal switch set, §3.12).
+   - **`REPAIR`** — `before` **raises on every** battery input *and* `after` returns `{:ok, _}` on ≥1. The
+     `before` has no valid output on any admitted input, so the rewrite is a **correction**, not a behaviour
+     change (§3.10 repair family). The verdict carries the evidence (exception class + `N/N raised`) so the
+     implementer can write the mandatory `mark_equivalence_repair(reason)` reason string. (At classify-time
+     only the *always-crashes* repair flavour is reachable — the *does-not-compile* `unconstructible` flavour
+     fails §4.3's Pattern "must compile" gate and never gets here.)
+   - **`DIVERGES`** — anything else: `before` produced a **valid value on some input** that `after` disagrees
+     with (a real behaviour change), or a non-compiling `after`.
+4. Print `EQUIVALENT` / `REPAIR <exc> <n>/<n>` / `DIVERGES <input> <before_result> <after_result>` —
+   deterministic, dogfoodable, names no rule. **Fixed battery, NOT StreamData** — for determinism (resume-safe,
+   reproducible logs).
 
 **Assumption-aware (the §3.12 hook).** `credence.equiv` takes `--assumptions` and runs in that Credence mode,
 **filtering the battery to the admitted domain** (a `single_codepoint_graphemes` rule drops the
@@ -571,11 +683,19 @@ the gate — the promise only ever removes promise-violating inputs, never the p
 **Two run-points (reuse it, exactly like `covers`):**
 - **Classify-time pre-check** — on the classifier's proposed `before`/`after`, *before* building. `DIVERGES`
   ⇒ the spec is behaviour-changing ⇒ **`NO_ACTION`** (log → `behaviour_diverged/`), **zero implementer spend**.
-  Kills the bad *idea* cheaply (most `followup.md` greenfield rejections).
-- **6th Gate check** — on the **actual** `fix(before)` the implementer produced (not just the proposed
-  `after`). Catches an implementer that **broadened the match** onto a diverging input — most of the *delta*
-  rejections (`no_explicit_sum_reduce`, `no_doc_false_on_private`, `no_grapheme_palindrome_check`, …).
-  `DIVERGES` ⇒ Gate reject → `escalated/`.
+  Kills the bad *idea* cheaply (most `followup.md` greenfield rejections). `REPAIR` ⇒ **proceed** to the
+  implementer in **repair sub-mode** (it emits `mark_equivalence_repair` instead of `assert_equivalent`, §5.6)
+  — this is the mechanism that keeps §3.10's repair carve-out from being silently swallowed by the gate.
+  `EQUIVALENT` ⇒ proceed (no-promise or switch-gated per the minimal set).
+- **6th Gate check — now SUBSUMED by the mandatory per-rule equivalence test (2026-06-08).** The check on the
+  **actual** `fix(before)` (catching an implementer that **broadened the match** onto a diverging input — most
+  of the *delta* rejections: `no_explicit_sum_reduce`, `no_doc_false_on_private`, `no_grapheme_palindrome_check`,
+  …) is no longer a *separate* `credence.equiv` invocation. Credence's hard `equivalence_meta_test.exs` forces
+  the rule to carry a `<name>_equivalence_test.exs` whose `assert_equivalent` runs the **actual** `fix(before)`
+  over the battery with strict `===`; the Gate already runs the full `mix test`, so a broadened/diverging fix
+  fails its own equivalence test → suite RED → Gate reject → `escalated/`. The implementer must therefore
+  **author** that test (seeded from `EquivalenceInputs`) — and the anti-stub checks (fires + rewrote + ≥3
+  discriminating inputs) + the meta-gate's no-skeleton/real-assert rules stop it faking a green one.
 
 **Coverage (measured against the live `followup.md`):** catches **~22 of ~27** — every value / exception / type
 (codepoint↔grapheme) / order (>32-key map) / compile divergence in that file. It is what converts §3.10 from
@@ -624,9 +744,10 @@ A contained lift of §15, every part reusing something that already exists:
 - **`credence.equiv` is the authority** — it *confirms/corrects* the tag to the **minimal** switch set
   (a rule tagged with a switch it doesn't need, or needs more than, is fixed deterministically).
 - **Implementer** emits `def assumptions, do: [...]` **plus** a `<Rule>PropertyTest` — but **authors NO
-  generator**: it reuses Credence 0.7.0's **shared, honesty-tested** `single_codepoint_string/0`, so the
-  property test is a **fixed template parameterized by before/after**, not novel StreamData authoring (the part
-  §15 rightly feared). Credence's 0.7.0 meta-tests (every tagged rule has a loadable `<Rule>PropertyTest`;
+  generator**: it reuses Credence 0.7.0's **shared, honesty-tested** generator for the relevant switch
+  (`AssumptionGenerators.single_codepoint_string/0` for `single_codepoint_graphemes`, `proper_list/0` for
+  `proper_lists` — one per switch, picked by the tag), so the property test is a **fixed template parameterized
+  by before/after + switch**, not novel StreamData authoring (the part §15 rightly feared). Credence's 0.7.0 meta-tests (every tagged rule has a loadable `<Rule>PropertyTest`;
   every `assumptions/0 ⊆ names()`) then gate it at the **Gate** for free.
 - **Recovers** the pure rare-text rejections in `followup.md` — `no_codepoint_string_reverse` (Credence's own
   example #2), `no_grapheme_palindrome_check`, `avoid_graphemes_enum_count_with_predicate` (after shrink-first)
@@ -819,6 +940,59 @@ path-dep picks up the landed rule. Now *solve-quality* (fewer residuals reach th
 dedup-critical — the §3.7 pre-check reads the clone directly, which is fresh on commit — but dropping it
 silently degrades solve coverage over a long run.
 
+### 5.0 Scaffold first — run the generator, then fill the red stubs (2026-06-08)
+
+> **The "use the generator" step.** Credence shipped `mix credence.gen.rule <Name> [--type pattern|syntax|semantic]`
+> (+ `Credence.RuleName` as the single name/path source of truth + `Credence.RuleScaffold`). The implementer
+> **no longer hand-constructs file paths, module names, or test scaffolds** — that was a per-file failure mode
+> and a drift point against the meta-gates. Instead:
+
+1. **Orchestrator resolves the final name + suffix** (§3.8 — `proposed_name` → first free `_N`), then shells
+   `mix credence.gen.rule <FinalPascalName> --type <phase>` **in the clone**. The generator writes
+   correctly-named, **honest-red, gate-passing** skeletons, `mix format`s them, and **aborts (writes nothing)
+   on any path collision** — which doubles as a deterministic name-collision backstop alongside §3.8's suffix
+   resolver. (`RuleName` is now the authority for *every* path/module the orchestrator would otherwise hand-type,
+   so **T5.4a's phase-conditional check-test filename is handled by the generator** — pattern/semantic →
+   `_check_test.exs`, syntax → `_analyze_test.exs` — not by Tunex logic.)
+1b. **★ Read the generated files back and inject their full contents into the implementer seed (§5.3).** This is
+   the explicit "send the scaffold as context" step: the stub `rule.ex` + every generated test file becomes the
+   verbatim template the fill pass preserves (exact module names, file boundaries, heredoc fixtures, the
+   gate-passing test shapes). It is a distinct orchestrator action between "run the generator" (step 1) and "the
+   model fills" (step 3) — not an implicit side effect of wiring (a).
+2. **The generated stubs already pass the structural meta-gates** (naming, triplet/quad completeness, positive
+   + negative shapes, whole-string `==` fix, heredoc fixtures, no parser calls, the Pattern `_equivalence_test`
+   existence, the Syntax/Semantic `valid_syntax?`/fixpoint/attribution shapes) — but **fail their own runtime
+   assertions** against the empty stub (the positive `flagged?`, the `fix` transform, the equivalence
+   "rule must fire" precheck). This is the honest-red contract: structure green, behaviour red.
+3. **The implementer's job is the FILL pass** — make the red assertions green: write `check/2` + `fix_patches/2`
+   (or `analyze`/`fix` for syntax, `match?`/`to_issue`/`fix` for semantic), replace the placeholder fixtures
+   with the spec's `before`/`after` (heredocs) — **for semantic, also replace the stub `diag` with the real
+   captured `%{message, position, severity}` (§5.3) and key `match?` on it** — and replace the
+   `_equivalence_test` stub's literal `inputs:`
+   TODO with the right `Credence.EquivalenceInputs` dimension(s) for the rule's risk class (or, for the rare
+   non-preserving rule, swap `assert_equivalent` for the correct `mark_equivalence_*` per §5.6).
+
+**How this meshes with whole-file emit (§5.2).** Two equivalent wirings; pick one at build time:
+- **(a) Generate-then-fill (preferred):** the generated files are part of the implementer's *seed* (their exact
+  shape is the template); the model emits the **whole** filled files via the role markers (§5.2), overwriting
+  the stubs. The generator's value is that the seed now carries the **exact gate-passing shape** to preserve, so
+  a wholesale rewrite can't silently drop a required test shape (the meta-gate + the focused `mix test` catch it
+  if it does).
+- **(b) Generate-only-for-paths:** run the generator purely to establish paths/names, then overwrite. Same end
+  state; (a) is strictly better because it also teaches the model the shape.
+
+Either way the **generator output is the contract** — the orchestrator does not invent paths, and the role
+markers (§5.2) map onto the generator's file set (now **including** the Pattern `EQUIVALENCE_TEST`, §5.6).
+
+> **⚠️ New dirty-tree path (the generator writes BEFORE the fill loop).** Unlike the old flow — where the
+> implementer only touched the clone tree when it *emitted* files — `gen.rule` (T5.4) writes stub `lib/`+`test/`
+> files up front. The pre-checks that *reject* (novelty `COVERED` → `duplicate/`; `credence.equiv` `DIVERGES`
+> → `behaviour_diverged/`) all run **before** the generator, so they leave a clean tree. But an **implementer
+> abort *after* scaffolding** (`gave_up` / size-ceiling / implementer-failed) has **no Gate** to clean up, so
+> the router MUST call `Gate.discard(clone)` (`git reset --hard HEAD` + `clean -fd`, the existing primitive) on
+> every post-scaffold abort path — otherwise the orphan generator stubs pollute the next row's tree (which the
+> serial single-writer invariant, §5, forbids).
+
 ### 5.1 One engine, two modes
 
 | | `POTENTIAL_NEW_RULE` (new mode) | `BUGFIX_RULE` (bugfix mode) |
@@ -857,9 +1031,13 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
   the model never picks paths. The `CHECK_TEST` role → a **phase-conditional** filename (pattern/semantic →
   `_check_test.exs`, syntax → `_analyze_test.exs`; §5.4):
   ```
-  ===RULE===          <rule.ex>
-  ===CHECK_TEST===    <_check_test.exs / syntax: _analyze_test.exs>
-  ===FIX_TEST===      <_fix_test.exs>   (ALWAYS — every rule is fixable, §4.1; no check-only)
+  ===RULE===              <rule.ex>
+  ===CHECK_TEST===        <_check_test.exs / syntax: _analyze_test.exs>
+  ===FIX_TEST===          <_fix_test.exs>   (ALWAYS — every rule is fixable, §4.1; no check-only)
+  ===EQUIVALENCE_TEST===  <_equivalence_test.exs>   (PATTERN ONLY — mandatory, §5.6; the hard
+                          equivalence_meta_test gate fails the Gate suite without it. syntax/semantic
+                          omit it — they carry the §5.6 valid_syntax?/fixpoint/attribution shapes instead)
+  ===PROPERTY_TEST===     <_property_test.exs>   (PATTERN, iff the spec carries assumptions — §3.12 Tier 1)
   ===END===
   ```
 - **Bugfix mode — path-keyed markers** (the `test/<phase>/<name>*_test.exs` glob can be 1..N); the prompt
@@ -874,12 +1052,35 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
   ===END===
   ```
 - **Validation:** new → `RULE` + `CHECK_TEST` + `FIX_TEST` **all required** (every rule is fixable — §4.1; a
-  missing `FIX_TEST` is an invalid emit, not a check-only rule). bugfix → `RULE` = the known
+  missing `FIX_TEST` is an invalid emit, not a check-only rule); **for a Pattern rule, `EQUIVALENCE_TEST` is
+  ALSO required** (Credence's hard `equivalence_meta_test`, 2026-06-08 — a missing or skeleton equivalence test
+  fails the Gate's `mix test`); `PROPERTY_TEST` required **iff** the spec carries `assumptions` (§3.12 Tier 1),
+  rejected if present without. Syntax/Semantic new rules require `RULE` + `CHECK_TEST`(=`_analyze_test` for
+  syntax) + `FIX_TEST` only — **no** equivalence test (Pattern-only). bugfix → `RULE` = the known
   rule path; every `TEST:<path>` **⊆ the known glob set** (≥1 changed); **no new/renamed files** — this is
   exactly what *enforces* §5.4's modify-only invariant and keeps the Gate's pure-deletion/scope checks trivial.
 
 ### 5.3 Seed context = what the agent used to explore for
 
+- **★ The generator-produced scaffold files, FULL CONTENTS (the exact template to fill — §5.0 step ★9).**
+  After §5.0's `mix credence.gen.rule` writes the honest-red stubs, the orchestrator **reads those files back
+  and injects their verbatim contents** into the seed — the rule stub + `_check_test` + `_fix_test`
+  (+ Pattern `_equivalence_test`, + `_property_test` iff switch-gated), or the syntax/semantic stub set. This is
+  the load-bearing ingredient that makes the fill a *fill* and not a from-scratch emit: the model sees the exact
+  module names, file boundaries, heredoc-fixture shape, and the gate-passing test scaffolding it must preserve,
+  and only has to make the red assertions green (write `check`/`fix`, swap fixtures, pick `inputs:`). Without
+  this, a whole-file emit (§5.2) can silently drop a required shape; with it, the meta-gates + focused `mix test`
+  only ever have to catch a *deviation* from a template the model was shown. (This is wiring (a) in §5.0, now an
+  explicit seed ingredient, not an aside.)
+- **★ Semantic only — the REAL captured diagnostic.** A semantic rule keys on a compiler diagnostic
+  `%{message, position, severity}`, and `match?` regex-matches `message`; a *fabricated* message passes every
+  gate but leaves the rule **dead in production** (the live pipeline feeds it `Code.with_diagnostics` output). So
+  the semantic seed carries the **real** `%{message, position, severity}` captured from the failed-solve trace —
+  Credence's `[credence_fix] no rule matched diagnostic: …` line (the new-semantic-rule signal itself, logged at
+  `semantic.ex:130`, already in the row log at `:debug`), upgraded to log the **full** `inspect(diagnostic)` (a
+  Credence visibility tweak, `08` T1.3-sibling). The implementer copies it verbatim into the test `diag` literal
+  and derives `match?` from it, so the generated rule provably fires on real code. (Pattern/syntax have no
+  diagnostic; this ingredient is semantic-only.)
 - **Both before + after AST dumps**, precomputed by the AST helper (§6) and passed as **arguments** to the
   loop. The loop never invokes the helper itself (keeps it non-agentic; no `mix run -e`, ever).
   **Phase-conditional (§3.6):** AST dumps apply to `pattern` (and `semantic`, which parses); for a **`syntax`**
@@ -898,14 +1099,17 @@ MODULE+TEST; the implementer emits up to 3 (new) or 1+N (bugfix) files, so use a
   **switch-gated via §3.12**, not deferred). **The implementer also has NO check-only escape (§4.1):** it must
   write a real `fix_patches/2`; if it cannot keep the fix safe even on the narrow core the classifier handed it,
   it does **not** ship a `-> []` stub — it `gave_up`s (and the row is logged), because we no longer accept
-  non-fixable rules. **The §3.11 `credence.equiv` gate WILL execute its `fix` across the (assumption-restricted)
-  battery** (classify-time + 6th Gate check) and a `DIVERGES` is a hard reject — so the seed instructs the model
+  non-fixable rules. **The §3.11 behaviour gate WILL execute its `fix` across the (assumption-restricted)
+  battery** (the classify-time `credence.equiv` pre-check **and** the rule's own mandatory `_equivalence_test`
+  run by the Gate suite — the *subsumed* 6th check) and a `DIVERGES` is a hard reject — so the seed instructs the model
   to **self-run that battery** (`{input, before, after}` per input) before emitting and to **narrow the match
   until every admitted-battery input is a no-op**, not discover the divergence at the gate.
 - **Assumptions (§3.12 Tier 1) — when the spec carries `assumptions: [...]`:** emit
   `def assumptions, do: [...]` (the existing switch names the spec/`credence.equiv` settled on) **plus** a
   `Credence.Pattern.<Rule>PropertyTest` — built from a **fixed template** that asserts `before ≡ fix` across
-  Credence's **shared** `single_codepoint_string/0` generator (injected as an exemplar in the seed). **The
+  Credence's **shared** generator **for the tagged switch** — `AssumptionGenerators.single_codepoint_string/0`
+  for `single_codepoint_graphemes`, `proper_list/0` for `proper_lists` (one per switch, picked by the tag;
+  injected as an exemplar in the seed). **The
   implementer authors NO generator** — reusing the shared, honesty-tested one is what makes this safe and cheap;
   inventing a new switch/generator is Tier 2 and **out of the implementer's scope** (human-gated, §3.12). For a
   **no-promise** rule (`assumptions: []`) it emits **no** `assumptions/0` and **no** property test, exactly as
@@ -967,8 +1171,36 @@ runs the result, so a violation that breaks compilation is caught locally for fr
 
 - **Split, per kind** (§5.4): pattern → `_check_test.exs` (findings only — **including the deliberately-skipped
   unsafe cases asserted as "no issue"**, so the safe-core narrowing of §4.1 is locked into the tests) +
-  `_fix_test.exs` (exact rewrites). semantic → `_check` + ≥1 `_fix` variant. syntax → `_analyze`+`_fix` (or a
-  single `_test`).
+  `_fix_test.exs` (exact rewrites) **+ `_equivalence_test.exs` (mandatory, below)**. semantic → `_check` + ≥1
+  `_fix` variant. syntax → `_analyze`+`_fix` (or a single `_test`).
+- **Pattern: a mandatory `_equivalence_test.exs` (2026-06-08, Credence hard gate).** Define
+  `<Name>EquivalenceTest`; call `assert_equivalent(before, rule: Rule, vars: [...], inputs: <dimension>)` where
+  `<dimension>` is the matching `Credence.EquivalenceInputs` set(s) for the rule's risk class (term_lists /
+  signed_integers / unicode_strings / single_codepoint_strings / multi_codepoint_strings / stability_lists). It
+  must clear the anti-stub checks (rule fires + a rewrite happened + ≥3 **discriminating** inputs) and pass
+  under **strict `===`** + exception-module parity.
+  - **`vars` + `inputs` are implementer fills, self-corrected by the loop.** The classifier spec carries **no**
+    free-var field; the implementer reads the **ordered free variables of `before` off the AST dump** already
+    in its seed (§5.3) for `vars:`, and picks the `inputs:` dimension by the rule's risk class. A wrong `vars`
+    list (won't compile / rule won't fire) **or** a non-discriminating dimension fails the focused `mix test`
+    → RED → retry, so neither needs a new spec field. A **constant-output-by-design** rule (rare — `no_tautological_if`)
+    needs `allow_constant_output: true`; the seed names the flag so the implementer can set it. (If `vars`/dimension
+    misfills cluster in practice, a deterministic free-var helper, §6, is the tuning fallback — open item.)
+  - For the rare non-preserving rule swap the assert for the exact opt-out: `mark_equivalence_cosmetic`
+    (provably inert — param/attr/doc/typespec), `mark_equivalence_unconstructible` (behavioural but no runnable
+    `before` — macro/compile-time), or **`mark_equivalence_repair`** (the `before` has no valid output on any
+    input — §3.10 repair family). **In repair sub-mode** (routed by a `credence.equiv` `REPAIR` verdict, §3.11)
+    the implementer emits `mark_equivalence_repair(reason)` and writes the reason from the verdict's evidence
+    (exception class + `N/N raised` — "the before raises `<exc>` on every admitted input, so no input yields a
+    valid result"). The generator scaffolds this file as `assert_equivalent` + a TODO; **never** weaken or
+    `@tag`-skip it — a divergence is a real bug → narrow/drop the rule.
+- **Syntax/Semantic: emit the §3b substance shapes (Credence hard `syntax_meta_test`/`semantic_meta_test`,
+  2026-06-08), or the Gate suite rejects an inert rule.** Syntax → a positive `analyze(...) = [%Issue{rule: :<snake>}]`
+  + a negative `analyze(...) == []` + a real `fix(A) == B` transform + the **fixpoint** `analyze(fix(...)) == []`
+  + **`valid_syntax?(fix(...))`** (the repaired source parses). Semantic → a positive `match?` + a negative
+  `refute match?` + attribution `to_issue(...).rule == :<snake>` + a real `fix(src, diag) == expected` +
+  `valid_syntax?(fix(...))`. Use the `Credence.RuleCase` verb `valid_syntax?/1` (parser-hidden, so the
+  `no_parser_calls` gate stays satisfied). The generator emits all of these; the fill pass makes them green.
 - **Every fix-test assertion compares the WHOLE output with `==`** — `assert fix(code) == expected`, or
   `assert fix(code) == code` for a no-op. **Never** match a fragment. **BANNED in fix tests** (each lets an
   unintended change *elsewhere* in the output slip through): `=~`, `String.contains?`,
@@ -1029,6 +1261,27 @@ Sourceror tuple shape. Hand it the shape and the exploration disappears.
   matches what that rule actually pattern-matches.
 - **Nice-to-have (documented, not built):** append a short static Sourceror-gotchas cheatsheet (wrapped
   literals, atom positions, `:delimiter` meta — all already in Credence's `CONTEXT.md`).
+
+### 6.1 The scaffold generator (the other exploration-killer — already in Credence, 2026-06-08)
+
+Where the AST helper kills *AST-shape* exploration, `mix credence.gen.rule <Name> [--type pattern|syntax|semantic]`
+kills *file-shape* exploration — the old agent re-discovered the triplet naming, the heredoc-fixture rule, the
+whole-string `==` fix convention, the equivalence-test requirement one meta-gate failure at a time. The
+generator **embodies that contract as a template** and is pinned (`generator_meta_test.exs`) against the same
+predicates the real meta-gates enforce, so it cannot drift from the gates.
+
+- **Home: Credence `lib/` (shipped).** `Credence.RuleName.derive/2` (name → snake/Pascal/module/path),
+  `test_path/2`, `test_module/2` are the **single source of truth** for every path + module name — the
+  generator, the pin, *and* the real gates all call it. Tunex's orchestrator shells the task in the clone
+  (exactly as it does `run_credence_fix.exs` / will do `credence.ast`).
+- **Output:** correctly-named, `mix format`-clean, **honest-red, gate-passing** skeletons — Pattern → 4 files
+  (rule + `_check_test` + `_fix_test` + **`_equivalence_test`**); Syntax → rule + `_analyze_test` + `_fix_test`;
+  Semantic → rule + `_check_test` + `_fix_test`. **Aborts (writes nothing) on any path collision** — a free
+  deterministic backstop to §3.8's suffix de-collision.
+- **Use:** §5.0 — orchestrator runs it with the final name, the implementer fills the red stubs. Replaces all
+  hand-typed paths/module-names and **subsumes T5.4a** (phase-conditional check-test filename).
+- **Dogfood (before relying on it):** `mix credence.gen.rule NoExampleScaffold` → 4 files, format-clean, only
+  the runtime assertions red, every meta-gate green; delete the throwaway; suite green again.
 
 ---
 
@@ -1096,7 +1349,7 @@ that's not a debugging artifact.)
 | agentic `credence_rule_generator.ex` (`@task`, `build_prompt`, `route`) | **Replaced** by classifier + router + solver-loop implementer. |
 | `max_turns` (config + plumbing) | **Deleted** — no turns. |
 | Per-session token breaker | **Deleted** — bounded loop can't run away. |
-| The **Gate** (`evolve/gate.ex`) | **5 parts unchanged + 1 NEW** — harness-independent; operates on the git diff + `mix test`. **Gains a 6th check: the §3.11 behavioural-equivalence diff** (`credence.equiv` on `before` vs the actual `fix(before)`, pattern-phase) — the executable behaviour net that lets everything upstream be aggressive. |
+| The **Gate** (`evolve/gate.ex`) | **5 parts unchanged; the planned 6th check is now SUBSUMED (2026-06-08).** Harness-independent; operates on the git diff + `mix test`. The §3.11 behavioural-equivalence check on the **actual** `fix(before)` no longer needs separate Gate plumbing — Credence's hard `equivalence_meta_test` forces every Pattern rule to carry a real `_equivalence_test.exs` that runs the actual `fix` over the `EquivalenceInputs` battery (strict `===`), and the Gate's full `mix test` already runs it. The same `mix test` now also runs the hard `syntax_meta_test`/`semantic_meta_test` (substance + `valid_syntax?` + fixpoint + attribution) + the generator pin — so the Gate transparently gained the whole 0.7.0+ meta-gate suite as a behaviour/substance net **for free**. |
 | `decisions.md` **ledger** (`evolve/ledger.ex`) | **Kept** — feeds the classifier (whole, uncapped). Write-sites **move into the new router**: **implementer-failed** (≈ old `gave_up`) + **gate_reject** only. **`phantom` retires** (deterministic whole-file emit → no claim-without-diff). `duplicate/` + `classifier_errors/` do **not** ledger (never attempted; a duplicate is *solved*, not impossible). |
 | Rule-name **index** | **Dropped** from the prompt (§3.5). |
 | `Git.commit_and_push` to `evolution` | **Unchanged.** |
@@ -1119,11 +1372,22 @@ that's not a debugging artifact.)
   implementer; over-cap `after` → narrow-or-`NO_ACTION` (no check-only); malformed → one re-ask →
   `classifier_errors/`.
 - **A false `NO_ACTION` is bounded** — human-sampled audit of retained `no_action/` logs (§12), zero token cost.
-- **Behaviour preservation is now a deterministic Gate property for pattern rules (§3.11), discipline for the
-  rest.** §3.11's `credence.equiv` check **executes** `before` vs `fix(before)` across an adversarial battery —
-  at classify-time (reject → `behaviour_diverged/`) and as a **6th Gate check** (reject → `escalated/`) —
-  catching value / type / exception / order divergence (the bulk of the live `followup.md`: a rule that passes
-  the suite but diverges on a battery input **no longer lands**). What stays on **discipline + human review**:
+- **The Gate's `mix test` now carries the whole Credence meta-gate suite — a free substance/behaviour net
+  (2026-06-08).** Beyond the original 5 mechanical checks, the clone's full `mix test` (which the Gate runs)
+  fails on: a Pattern rule **missing or faking** its `_equivalence_test` (hard `equivalence_meta_test`: real
+  `assert_equivalent`/mark, references the rule, no skeleton, anti-stub fires+rewrote+≥3 discriminating
+  inputs); an **inert** Syntax/Semantic rule (hard `syntax_meta_test`/`semantic_meta_test`: positive+negative
+  substance, `valid_syntax?(fix)`, fixpoint `analyze(fix)==[]`, attribution); a fixture that isn't a heredoc;
+  a test that calls the parser directly; a switch-gated rule without a `<Rule>PropertyTest`. So the implementer
+  must satisfy all of these — which the **generator** guarantees structurally and the **fill pass** makes green.
+- **Behaviour preservation is now a deterministic property for pattern rules (§3.11), discipline for the
+  rest.** §3.11's check **executes** `before` vs `fix(before)` across the `EquivalenceInputs` battery (strict
+  `===`) at **two points**: a **classify-time** `credence.equiv` pre-check on the proposal (reject →
+  `behaviour_diverged/`, no build), and — for the built rule — the **rule's own mandatory equivalence test**,
+  run by the Gate's `mix test` (diverge → suite RED → reject → `escalated/`; this is the *subsumed* 6th check,
+  §3.11). Together they catch value / type / exception / order divergence (the bulk of the live `followup.md`:
+  a rule that passes the *other* tests but diverges on a battery input **no longer lands**). What stays on
+  **discipline + human review**:
   divergence only on a non-battery input, **evaluation-order / side-effect** divergence (the battery is values,
   not side-effecting operands — §3.11 limits), and **semantic/syntax** phases (no compilable `before` to run).
   The classifier still never proposes a behaviour-changing `after`, and the implementer prompt re-states the
@@ -1162,10 +1426,19 @@ that's not a debugging artifact.)
      breakdown can separate classifier from implementer — the thing that makes step 6's "did we hit 4–8×, and
      what's left?" legible. *Prereq for trusting every later number; ~free.*
 1. **AST helper** — `mix credence.ast` in Credence + dogfood against a known rule's snippet. Unblocks the
-   implementer. **Same Credence pass (ship together — all Credence-side):** (i) `mix credence.covers`
-   behavioral novelty task (§3.7); (ii) **`mix credence.equiv` behavioural-equivalence task (§3.11/§3.12)** —
-   compile `before` + `fix(before)`, run both over the adversarial battery, print `EQUIVALENT`/`DIVERGES`;
-   **takes `--assumptions` and reports the minimal switch set** (run under `:strict` + each registered switch),
+   implementer. **⚑ Baseline already landed (2026-06-08, verify in clone): the per-rule behaviour-equivalence
+   suite** (`Credence.BehaviourEquivalence` + `EquivalenceInputs` + hard `equivalence_meta_test`), **the scaffold
+   generator** (`mix credence.gen.rule` + `Credence.RuleName` + `RuleScaffold`), **the Syntax/Semantic +
+   generator meta-gates**, and **the 2nd assumption switch `proper_lists`** — so this step builds only the three
+   *still-missing* tasks. **Same Credence pass (ship together — all Credence-side):** (i) `mix credence.covers`
+   behavioral novelty task (§3.7); (ii) **`mix credence.equiv` behavioural-equivalence task (§3.11/§3.12) — now
+   a THIN task built on the shipped support module** (reuse `BehaviourEquivalence.eval_outcome/2` + the
+   `EquivalenceInputs` battery in snippet-vs-snippet mode, the `equivalence_regression_test.exs` pattern); it is
+   the **classify-time** pre-check only — the built rule's equivalence is the per-rule test the Gate suite runs.
+   Compile `before` + the proposed `after`, run both over the battery, print `EQUIVALENT`/`REPAIR`/`DIVERGES`
+   (the trichotomy, §3.11 — `REPAIR` = `before` raises on every admitted input, after succeeds);
+   **shelled `MIX_ENV=test`** (the support modules are `test/support`-only); **takes `--assumptions` and reports
+   the minimal switch set** (run under `:strict` + each registered switch),
    battery filtered to the admitted domain (§3.12); dogfood on a known-unsafe `followup.md` snippet (must report
    `DIVERGES`) and a rare-text one (must report `EQUIVALENT under single_codepoint_graphemes`); (iii)
    *optional* — `log_diff` in the Pattern revert branch for seed visibility (§3.9). **No revert-gate fix —
@@ -1183,8 +1456,10 @@ that's not a debugging artifact.)
    key (or a mis-set override) fails *boot*, not mid-run. Unlike the remote-solve skip (which shares Mimo's
    already-proven host), the classifier provider may be a **distinct vendor/auth**, so it is always smoked —
    the one-token cost is trivial insurance against losing a whole run on a stale key.
-3. **Solver-loop implementer** — both modes (phase-conditional seed, §3.6) + AST-dump injection + Tier-1
-   assumptions/property-test emission (§3.12) + the new outcome directories (`no_action/`, `duplicate/`,
+3. **Solver-loop implementer** — both modes (phase-conditional seed, §3.6) + **generator scaffold (§5.0:
+   `mix credence.gen.rule`, then fill the red stubs)** + AST-dump injection + **mandatory Pattern
+   `_equivalence_test` emission seeded from `EquivalenceInputs` (§5.6)** + Tier-1 assumptions/property-test
+   emission (§3.12) + the new outcome directories (`no_action/`, `duplicate/`,
    `behaviour_diverged/`, `switch_proposals/`, `classifier_errors/`). Runs in the **clone** (§5); the commit
    path calls `Workspace.recompile_credence/1`. **Wired classifier → implementer end-to-end immediately** (no
    measure-only sub-phase).
@@ -1234,7 +1509,8 @@ So:
 | Classifier input | distilled log + `APPLIED_RULES` + ledger; **no rule-name index** — dedup is the §3.7 pre-check, not a construction proof |
 | Phase asymmetry | Syntax (non-parsing, string-level) / Semantic (warnings) / Pattern (compiling, AST). Seed + `before` gates are **phase-conditional** (§3.6); new rules are *plurality* pattern but syntax/semantic are first-class (from failed rows, §3.3); BUGFIX is phase-polymorphic |
 | Novelty pre-check | `POTENTIAL_NEW_RULE` only: run `before` through `Credence.fix` in the clone (`mix credence.covers`); `COVERED` (a **real rule engaged** — `code` changed / `applied_rules` non-empty / non-parse-error issue; **🔴 NOT** the bare `parse_error_issue`, else every novel syntax rule dies — §3.7) ⇒ duplicate ⇒ `duplicate/`, skip implementer. Behavioral, names no rule, phase-agnostic, no compile gate (§3.6) |
-| **Behavioural-equivalence gate** | **NEW (§3.11) — the executable behaviour net.** `mix credence.equiv`: compile `before` + `fix(before)`, run both over a **fixed adversarial battery** (empty/single/short list, Range, >32-key & present-key maps, nil, -1, 0, number-vs-char, combining-accent/emoji/flag strings, side-effecting closure), require **same value or same exception** on every input. **Pattern-phase only** (needs a compilable `before`). Runs **at classify-time** (`DIVERGES` ⇒ `NO_ACTION` → `behaviour_diverged/`, no build) **and as a 6th Gate check** (on the actual `fix`; `DIVERGES` ⇒ reject). Catches ~22/27 of live `followup.md`. Limits: eval-order/side-effect divergence + non-pattern phases stay §3.10 discipline |
+| **Behavioural-equivalence gate** | **§3.11 — the executable behaviour net; split across two homes (2026-06-08).** **Classify-time:** `mix credence.equiv` (a THIN task reusing the shipped `BehaviourEquivalence.eval_outcome/2` + `Credence.EquivalenceInputs` battery, strict `===` + exception-module parity, snippet-vs-snippet; **shelled as `MIX_ENV=test …`** since the support modules are `test/support`-only) on the proposal. **Trichotomy verdict `EQUIVALENT | REPAIR | DIVERGES`** — `DIVERGES` ⇒ `NO_ACTION` → `behaviour_diverged/`, no build; **`REPAIR`** (before raises on every admitted input, after succeeds) ⇒ proceed in repair sub-mode (implementer emits `mark_equivalence_repair`, §3.10 carve-out); `EQUIVALENT` ⇒ proceed (no-promise or switch-gated per the minimal set). **Built rule:** the planned 6th Gate check is **SUBSUMED** — Credence's hard `equivalence_meta_test` makes every Pattern rule carry a real `_equivalence_test` that runs the **actual** `fix` over the battery; the Gate's full `mix test` runs it (diverge ⇒ suite RED ⇒ reject → `escalated/`). **Pattern-phase only.** Catches ~22/27 of live `followup.md`. Limits: eval-order/side-effect divergence (Credence's `assert_effect_trace_equivalent` exists if needed) + non-pattern phases stay §3.10 discipline. **Repair family** (`before` invalid on every input) ships `mark_equivalence_repair`, not an auto-`NO_ACTION` (§3.10) |
+| **Scaffold generator** | **NEW step (2026-06-08, §5.0/§6.1).** Orchestrator shells `mix credence.gen.rule <FinalName> --type <phase>` (Credence-shipped; `Credence.RuleName` = single name/path source of truth) → correctly-named, heredoc, honest-red, **meta-gate-passing** stubs (Pattern incl. `_equivalence_test`); implementer **fills** the red assertions. Replaces all hand-typed paths/module-names; **subsumes T5.4a**; aborts on collision (free name backstop) |
 | Output | marker-fenced thick spec `{decision, rule_name?|proposed_name?, phase, before, after, rationale}` — **`after` always present; NO check-only** (§4.1); `before`/`after` are **full `defmodule`s, all phases** (syntax = module template), each **isolating exactly ONE issue** (composition: N rules rescue garbage, none alone — isolation makes pre-check + mutation gate attributable, §4.1) |
 | Option-shaping | empty `APPLIED_RULES` → BUGFIX not offered. **Runs on every row that reached solve (success AND failed)**; solve outcome forks the task lens — solved → idiomatic residual; failed → unfixed syntax/semantic issue (new-syntax source) (§3.3) |
 | BUGFIX | constrained to `APPLIED_RULES` (over-firing only); under-firing → NEW |
@@ -1247,11 +1523,11 @@ So:
 | Validation | deterministic gates; one re-ask → `classifier_errors/` |
 | Implementer | **one** solver-style loop (raw LLM, no harness/tools), parameterized new/bugfix; whole-file emit via a **file-keyed marker scheme** (new = fixed-role `RULE`/`CHECK_TEST`/`FIX_TEST`; bugfix = path-keyed `TEST:<path>` ⊆ glob, modify-only) (§5.2) |
 | Implementer seed | thick spec + precomputed before+after AST dumps + exemplar (+ rule source for bugfix) |
-| Split tests | new rules emit `_check`+`_fix`; bugfix edits existing tests **in place** (no migration) |
+| Split tests | new rules emit `_check`+`_fix` **+ (Pattern) a mandatory `_equivalence_test`** (§5.6); Syntax/Semantic emit the §3b `valid_syntax?`/fixpoint/attribution shapes; bugfix edits existing tests **in place** (the `<name>*_test.exs` glob already catches `_equivalence_test`; keep it green) (no migration) |
 | Bound | dedicated `rule_gen_max_retries` (~5) **+ local per-row input/output ceiling** (zero console poll) + flat (non-accumulating) retry prompt + trimmed `Report.format_errors` feedback; **no console-polling breaker**; **no `max_turns`** (§5.5) |
 | AST helper | `mix credence.ast` in Credence; raw + layout-stripped views; never `normalize`/unwrapped; dogfooded |
 | Distillation | coarse cut **only** this round: drop everything above an explicit `===SOLVE_BOUNDARY===` sentinel (invariant — no absent-marker handling); full marker-fencing documented-not-built |
-| Gate | 5-part backstop **+ a 6th behavioural-equivalence check** (`credence.equiv` on `before` vs actual `fix`, pattern-phase — §3.11) |
+| Gate | 5-part backstop; the planned 6th behavioural-equivalence check is **subsumed** by the rule's mandatory `_equivalence_test` (+ the §3b syntax/semantic + generator-pin meta-gates) which the Gate's full `mix test` already runs (§3.11/§10, 2026-06-08) |
 | Ledger | kept, feeds classifier whole/uncapped (stays near-empty by design); writes on implementer-failed + gate_reject only; phantom retired; duplicate/classifier_errors don't ledger |
 | No deletion | move-to-outcome-dir; new `no_action/`, `behaviour_diverged/`, `switch_proposals/`, `classifier_errors/`; `tunex.reset` still clears |
 | Assumptions / switch discovery (§3.12) | **propose-with-evidence (2026-06-04).** Tier 1: classifier may tag a rule with an **existing** switch (`Credence.Assumptions` injected); `credence.equiv --assumptions` confirms the minimal set; implementer emits `assumptions/0` + a property test from Credence's **shared** generator (no generator authoring). Tier 2: a clean rare-text class with **no** existing switch ⇒ `SWITCH_PROPOSAL` → `switch_proposals/` with **demand** evidence; a **human** writes the switch (harness never touches `lib/assumptions.ex`). Recovers the pure rare-text `followup.md` rejections |
@@ -1271,9 +1547,11 @@ So:
    pre-check catches multi-issue leakage as false-`COVERED`; tune the prompt against the `duplicate/` rate.
 2. The `after` complexity-cap threshold (lines / statement count) that triggers narrow-to-core-or-`NO_ACTION`
    (§4.1 — no longer an auto check-only downgrade).
-2b. **The §3.11 `credence.equiv` adversarial battery** — the concrete input set + the arity-matching strategy.
-   Seed it from the `followup.md` triggers (so every known failure class is represented), then grow it as new
-   divergence classes surface in `behaviour_diverged/`. A battery miss = a divergence that slips the gate.
+2b. **The §3.11 `credence.equiv` adversarial battery** — **now the shipped `Credence.EquivalenceInputs`
+   dimensions** (2026-06-08); the tuning item is *which dimension(s) to pick per rule* + the arity-matching
+   strategy. Grow `EquivalenceInputs` in Credence as new divergence classes surface in `behaviour_diverged/` (it
+   already encodes the `followup.md` failure classes). A battery miss = a divergence that slips the gate —
+   fixed once in `EquivalenceInputs`, picked up by both the classify-time task and every per-rule test.
 2c. **Phase-2 `credence.equiv`: operand side-effect tracer** — to catch the eval-order / side-effect-count
    class (`no_cond_two_clauses`, `no_doc_false_on_private`) the value battery can't construct: wrap the rule's
    matched operands in an evaluation tracer and compare call counts/order between `before` and `fix(before)`.
