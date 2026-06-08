@@ -3,23 +3,26 @@ defmodule Tunex.Config do
   Resolves per-stage providers (with env overrides), Claude Code settings,
   storage paths, and Budget knobs from application config.
 
-  Only the two chat stages (`:translate`, `:solve`) are configurable; the
-  rule-gen stage is hardcoded in `Tunex.Evolve.CredenceRuleGenerator`.
+  The configurable chat stages are `:translate`, `:solve`, `:classify`, and
+  `:implement` (the classifier-split rebuild added the latter two — `07` §3.1,
+  `08` T0.1). The deleted ClaudeCode rule-gen stage was hardcoded; it is gone.
   """
+
+  @configurable_stages [:translate, :solve, :classify, :implement]
 
   @doc """
   Provider atom for a chat stage. `TUNEX_<STAGE>_PROVIDER` env wins over the
   configured `stages[stage]`.
   """
-  def provider_for(stage) when stage in [:translate, :solve] do
+  def provider_for(stage) when stage in @configurable_stages do
     case env_provider(stage) do
       nil -> Map.fetch!(stages(), stage)
       provider -> provider
     end
   end
 
-  @doc "Output-token floor for a chat stage (translate 32k, solve 8k)."
-  def stage_max_tokens(stage) when stage in [:translate, :solve] do
+  @doc "Output-token floor for a chat stage (translate 32k, solve 16k, classify/implement 16k)."
+  def stage_max_tokens(stage) when stage in @configurable_stages do
     Application.get_env(:tunex, :stage_max_tokens, %{}) |> Map.fetch!(stage)
   end
 
@@ -28,6 +31,11 @@ defmodule Tunex.Config do
 
   @doc "Max solve/translate validation retries."
   def max_retries, do: Application.get_env(:tunex, :max_retries, 5)
+
+  # ── Implementer loop bounds (07 §5.5) ───────────────────────────────
+  def rule_gen_max_retries, do: Application.get_env(:tunex, :rule_gen_max_retries, 5)
+  def rule_gen_input_ceiling, do: Application.get_env(:tunex, :rule_gen_input_ceiling, 240_000)
+  def rule_gen_output_ceiling, do: Application.get_env(:tunex, :rule_gen_output_ceiling, 480_000)
 
   def subset, do: Application.get_env(:tunex, :subset, "educational_instruct")
 

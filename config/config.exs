@@ -47,6 +47,20 @@ config :tunex,
       token_param: :max_tokens,
       max_tokens: 8_192,
       stream: false
+    },
+    # Optional alternative CLASSIFIER provider (07 §3.1, 08 T0.1b). Claude Opus
+    # via an **OpenAI-compatible** endpoint ONLY — Tunex.LLM speaks OpenAI Chat
+    # Completions; native Anthropic /v1/messages won't parse. Use Anthropic's
+    # /v1/chat/completions compat layer or a gateway (OpenRouter / LiteLLM).
+    # The auth header (Authorization/x-api-key) lives in config/secrets.exs
+    # under secret_providers[:anthropic_opus] — absent by default, so this
+    # provider is inert unless stages.classify is repointed at it.
+    anthropic_opus: %{
+      url: "https://api.anthropic.com/v1/chat/completions",
+      model: "claude-opus-4-8",
+      token_param: :max_tokens,
+      max_tokens: 16_384,
+      stream: false
     }
   },
 
@@ -58,7 +72,13 @@ config :tunex,
     # Solve runs LOCAL Qwen on the 3090 — free, and its weaker/less-idiomatic
     # output is the rule-discovery feedstock (the original design). The remote
     # :xiaomi_mimo_2_5 path is the GPU-less dev fallback (TUNEX_SOLVE_PROVIDER).
-    solve: :local_qwen_thinking
+    solve: :local_qwen_thinking,
+    # Classifier-split rebuild (07 §3.1). The classifier carries the hardest
+    # judgment — default to the strong Mimo-pro (in-bucket, thinking on by
+    # default); repoint at :anthropic_opus (or TUNEX_CLASSIFY_PROVIDER) to pay
+    # for Opus brains. The implementer is the solver-style fill loop.
+    classify: :xiaomi_mimo_2_5_pro,
+    implement: :xiaomi_mimo_2_5_pro
   },
 
   # ── Per-stage output-token floors ───────────────────────────────────
@@ -68,9 +88,22 @@ config :tunex,
   # Translate truncation the ceiling is raised up to `translate_ceiling`.
   stage_max_tokens: %{
     translate: 32_768,
-    solve: 16_384
+    solve: 16_384,
+    # Classifier emits a marker-fenced spec (decision + before/after); the
+    # implementer emits whole rule + test files. 16k floors are a starting
+    # point — tune against truncation (08 T0.1 / 07 §14).
+    classify: 16_384,
+    implement: 16_384
   },
   translate_ceiling: 131_072,
+
+  # ── Implementer loop bounds (07 §5.5, 08 T5.5) ──────────────────────
+  # Dedicated knobs (NOT shared with solve's max_retries). The ceilings are a
+  # cheap local string guard (char-length proxy for tokens) that kills the
+  # 552-line-rule pathology — zero console poll, no max_turns.
+  rule_gen_max_retries: 5,
+  rule_gen_input_ceiling: 240_000,
+  rule_gen_output_ceiling: 480_000,
 
   # ── Claude Code (rule-gen) — Mimo via the Anthropic-compatible endpoint
   # auth_token lives in secrets.exs (see claude_code_auth_token).
@@ -126,7 +159,11 @@ config :tunex,
     prices: %{
       xiaomi_mimo_2_5_pro: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000},
       xiaomi_mimo_2_5: %{in: 1.0 / 1_000_000, cache_read: 0.20 / 1_000_000, out: 3.0 / 1_000_000},
-      cc: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000}
+      cc: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000},
+      # Anthropic public pay-as-you-go for Opus (per-token). Only used when the
+      # classifier is repointed at :anthropic_opus; logged $ is a relative
+      # estimate either way (token COUNTS are exact). (08 T0.1b)
+      anthropic_opus: %{in: 15.0 / 1_000_000, cache_read: 1.5 / 1_000_000, out: 75.0 / 1_000_000}
     },
     # Fallback price for an unknown provider (uses pro rates).
     default_price: %{in: 0.435 / 1_000_000, cache_read: 0.0036 / 1_000_000, out: 0.87 / 1_000_000},

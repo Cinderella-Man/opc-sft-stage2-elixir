@@ -1,0 +1,87 @@
+defmodule Tunex.Evolve.RouterTest do
+  use ExUnit.Case, async: false
+
+  alias Tunex.Evolve.Router
+  alias Tunex.Classify.Spec
+
+  setup do
+    # Isolate var/run to a temp dir so the router's outcome-dir moves don't
+    # touch the real run dir.
+    prev = Application.get_env(:tunex, :run_dir)
+    tmp = Path.join(System.tmp_dir!(), "tunex_router_#{System.unique_integer([:positive])}")
+    Application.put_env(:tunex, :run_dir, tmp)
+    Tunex.RowLog.ensure_ready()
+    on_exit(fn ->
+      if prev, do: Application.put_env(:tunex, :run_dir, prev), else: Application.delete_env(:tunex, :run_dir)
+      File.rm_rf!(tmp)
+    end)
+
+    %{tmp: tmp}
+  end
+
+  defp write_log(idx, body) do
+    path = Path.join([Tunex.Config.run_path("logs"), "#{idx}.log"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, body)
+    path
+  end
+
+  defp moved?(dir, idx), do: File.exists?(Path.join(Tunex.Config.run_path(dir), "#{idx}.log"))
+
+  test "NO_ACTION moves the log to no_action/", %{tmp: _tmp} do
+    write_log(1, "no rules fired\n")
+    classify = fn _log, _outcome, _opts -> {:ok, %Spec{decision: :no_action}} end
+
+    assert %{outcome: :no_action} = Router.run(1, :solved, "/nonexistent_clone", classify: classify)
+    assert moved?("no_action", 1)
+  end
+
+  test "SWITCH_PROPOSAL records + moves to switch_proposals/" do
+    write_log(2, "log\n")
+
+    spec = %Spec{
+      decision: :switch_proposal,
+      before: "defmodule B do\nend",
+      proposed_switch: %{"name" => "nfc_strings", "summary" => "all NFC", :raw => "..."},
+      rationale: "rare-text"
+    }
+
+    classify = fn _l, _o, _opts -> {:ok, spec} end
+
+    assert %{outcome: :switch_proposal} = Router.run(2, :failed, "/x", classify: classify)
+    assert moved?("switch_proposals", 2)
+    # the proposal record file exists too
+    assert File.exists?(Path.join(Tunex.Config.run_path("switch_proposals"), "2.json"))
+  end
+
+  test "classifier error moves to classifier_errors/" do
+    write_log(3, "log\n")
+    classify = fn _l, _o, _opts -> {:error, {:classifier_errors, :missing_after, "raw"}} end
+
+    assert %{outcome: :classifier_error} = Router.run(3, :solved, "/x", classify: classify)
+    assert moved?("classifier_errors", 3)
+  end
+
+  test "POTENTIAL_NEW_RULE that is COVERED moves to duplicate/" do
+    write_log(4, "log\n")
+    spec = %Spec{decision: :potential_new_rule, phase: :pattern, proposed_name: "no_foo", before: "defmodule B do\nend", after: "defmodule A do\nend"}
+    classify = fn _l, _o, _opts -> {:ok, spec} end
+    novelty = fn _before, _clone -> :covered end
+
+    assert %{outcome: :duplicate} = Router.run(4, :solved, "/x", classify: classify, novelty: novelty)
+    assert moved?("duplicate", 4)
+  end
+
+  test "POTENTIAL_NEW_RULE NOVEL but equiv DIVERGES moves to behaviour_diverged/" do
+    write_log(5, "log\n")
+    spec = %Spec{decision: :potential_new_rule, phase: :pattern, proposed_name: "no_foo", before: "defmodule B do\nend", after: "defmodule A do\nend"}
+    classify = fn _l, _o, _opts -> {:ok, spec} end
+    novelty = fn _b, _c -> :novel end
+    equiv = fn _spec -> {:diverges, "int vs string"} end
+
+    assert %{outcome: :behaviour_diverged} =
+             Router.run(5, :solved, "/x", classify: classify, novelty: novelty, equiv: equiv)
+
+    assert moved?("behaviour_diverged", 5)
+  end
+end

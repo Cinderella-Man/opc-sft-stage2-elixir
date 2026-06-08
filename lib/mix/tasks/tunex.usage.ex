@@ -60,7 +60,7 @@ defmodule Mix.Tasks.Tunex.Usage do
     by_stage = Enum.group_by(usage, &stage/1)
 
     header("BY STAGE (every Mimo/CC call)")
-    Enum.each(~w(translate solve rule-gen other), fn s ->
+    Enum.each(~w(translate solve classify implement rule-gen other), fn s ->
       calls = Map.get(by_stage, s, [])
       if calls != [], do: print_group(s, calls)
     end)
@@ -192,6 +192,10 @@ defmodule Mix.Tasks.Tunex.Usage do
 
   # ── Classification ────────────────────────────────────────────────────
 
+  # Prefer the explicit stage tag (T0.2 — classify/implement share the pro
+  # provider with translate, so provider-inference is ambiguous now). Fall back
+  # to the legacy provider/kind inference for pre-T0.2 ledger lines.
+  defp stage(%{"stage" => s}) when is_binary(s) and s != "", do: s
   defp stage(%{"kind" => "cc"}), do: "rule-gen"
   defp stage(%{"kind" => "chat", "provider" => "xiaomi_mimo_2_5_pro"}), do: "translate"
   defp stage(%{"kind" => "chat", "provider" => "xiaomi_mimo_2_5"}), do: "solve"

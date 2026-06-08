@@ -19,7 +19,7 @@ defmodule Tunex.Orchestrator do
 
   alias Tunex.{Budget, Config, Dataset, Preflight, Progress, RowLog, Workspace}
   alias Tunex.Pipeline.{RoundTrip, Solve}
-  alias Tunex.Evolve.CredenceRuleGenerator
+  alias Tunex.Evolve.Router
 
   # ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -151,6 +151,13 @@ defmodule Tunex.Orchestrator do
   end
 
   defp solve_and_finish(idx, row, payload, src, state) do
+    # Distillation boundary (T2.1): the classifier drops everything ABOVE this
+    # sentinel (Python / translate / round-trip / reference) and keeps the solve
+    # attempts + fix traces below it. Emitted unconditionally on every row,
+    # immediately before the solve stage — a dedicated line so the cut decouples
+    # from Solve's own log wording (07 §7).
+    Logger.info("===SOLVE_BOUNDARY===")
+
     solve =
       stage(
         fn -> Solve.run(payload.instruction, payload.test, row.entry_point, state.workspace) end,
@@ -166,9 +173,10 @@ defmodule Tunex.Orchestrator do
           {:error, error_record(idx, row, payload, info)}
       end
 
-    # Rule-gen runs on EVERY row that reached Solve (success or failed); it reads
-    # the row log and routes its fate (delete / escalate / commit) itself.
-    rg = safe_rule_gen(idx)
+    # Rule-gen runs on EVERY row that reached Solve (success or failed); the
+    # Router reads the row log and routes its fate (move to an outcome dir /
+    # commit) itself. The solve outcome forks the classifier lens (07 §3.3).
+    rg = safe_rule_gen(idx, router_outcome(solve))
 
     # SFT append is based on Solve (step 5), independent of rule-gen (step 6).
     case record do
@@ -187,15 +195,21 @@ defmodule Tunex.Orchestrator do
     }
   end
 
-  defp safe_rule_gen(idx) do
-    CredenceRuleGenerator.run(idx)
+  defp safe_rule_gen(idx, solve_outcome) do
+    Router.run(idx, solve_outcome)
   rescue
     e ->
-      Logger.error("[idx=#{idx}] rule-gen raised: #{Exception.message(e)} — discarding clone")
+      Logger.error("[idx=#{idx}] router raised: #{Exception.message(e)} — discarding clone")
       discard_clone()
       safe_close_log(idx)
       %{outcome: :raised, decision: nil}
   end
+
+  # The classifier lens forks on solve outcome (07 §3.3): :solved judges the
+  # clean final for idiomatic residual; :failed judges the attempts for an
+  # unfixed issue.
+  defp router_outcome({:ok, _}), do: :solved
+  defp router_outcome(_), do: :failed
 
   defp solve_tag({:ok, _}), do: :ok
   defp solve_tag({:failed, _}), do: :failed

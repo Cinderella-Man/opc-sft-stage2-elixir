@@ -26,13 +26,19 @@ defmodule Tunex.RowLog do
 
   @handler :row_file
 
+  # Classifier-split outcome dirs (07 §8). Nothing is deleted — every outcome
+  # MOVES the log to its dir (08 T6.2/T6.5).
+  @outcome_dirs ~w(escalated committed no_action duplicate behaviour_diverged switch_proposals classifier_errors)
+
   @doc "Create the run-scoped log dirs. Safe to call at boot."
   def ensure_ready do
     File.mkdir_p!(logs_dir())
-    File.mkdir_p!(Config.run_path("escalated"))
-    File.mkdir_p!(Config.run_path("committed"))
+    Enum.each(@outcome_dirs, fn d -> File.mkdir_p!(Config.run_path(d)) end)
     :ok
   end
+
+  @doc "All classifier-split outcome dir names (for `mix tunex.reset`)."
+  def outcome_dirs, do: @outcome_dirs
 
   # ── Per-row lifecycle ───────────────────────────────────────────────
 
@@ -67,6 +73,21 @@ defmodule Tunex.RowLog do
 
   @doc "Move the row log to `committed/` (a rule landed)."
   def commit(index), do: move(index, Config.run_path("committed"))
+
+  @doc "Move to `no_action/` (the classifier said NO_ACTION — 07 §8; nothing deleted)."
+  def no_action(index), do: move(index, Config.run_path("no_action"))
+
+  @doc "Move to `duplicate/` (novelty pre-check = COVERED)."
+  def duplicate(index), do: move(index, Config.run_path("duplicate"))
+
+  @doc "Move to `behaviour_diverged/` (classify-time equiv = DIVERGES)."
+  def behaviour_diverged(index), do: move(index, Config.run_path("behaviour_diverged"))
+
+  @doc "Move to `switch_proposals/` (a would-be rule pending a new switch)."
+  def switch_proposal(index), do: move(index, Config.run_path("switch_proposals"))
+
+  @doc "Move to `classifier_errors/` (malformed spec after one re-ask)."
+  def classifier_errors(index), do: move(index, Config.run_path("classifier_errors"))
 
   # ── Internal ────────────────────────────────────────────────────────
 

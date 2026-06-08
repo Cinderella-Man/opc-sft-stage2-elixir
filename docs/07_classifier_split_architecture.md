@@ -708,6 +708,13 @@ the gate — the promise only ever removes promise-violating inputs, never the p
   call counts (§14). Until then, discipline-only.
 - **Semantic / syntax phases** — `before` doesn't compile, so it can't execute; the check is **pattern-only**
   (which is where ~all `followup.md` failures are).
+- **T1 expression-level only at classify-time (verified building it, 2026-06-08).** The shipped `credence.equiv`
+  compiles `fn <vars> -> expr end` and the `EquivalenceInputs` dims are flat single-arg lists — so the
+  classify-time check is **expression-level, single-var** (multi-var needs an explicit `--inputs-file`). A
+  **module-structural (T2)** rewrite (inline-defp, case→heads, cross-statement) has no self-contained callable
+  expression, so it **skips** the classify-time gate; its safety net is the built rule's mandatory
+  `_equivalence_test`, which IS T2-capable (`assert_equivalent_module`) and runs in the Gate suite. So the
+  classify-time equiv is best-effort over T1; T2 is caught at the Gate, not before the build.
 - **Battery-completeness** — a divergence *only* on an input not in the battery slips through. The battery is a
   tuning item (§14); **seed it from the `followup.md` triggers** so every known failure class is represented.
 

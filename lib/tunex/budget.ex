@@ -270,6 +270,9 @@ defmodule Tunex.Budget do
         ts: System.os_time(:second),
         row: state.current_row,
         kind: kind,
+        # Stage atom (:translate | :solve | :classify | :implement) threaded
+        # from LLM.for_stage — drives `mix tunex.usage`'s by-stage split (T0.2).
+        stage: Map.get(meta, :stage),
         provider: provider,
         model: Map.get(meta, :model),
         in: breakdown.in,

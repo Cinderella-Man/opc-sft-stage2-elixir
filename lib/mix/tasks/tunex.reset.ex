@@ -13,7 +13,8 @@ defmodule Mix.Tasks.Tunex.Reset do
 
   @run_dir "var/run"
   @cache_dir "var/cache"
-  @run_subdirs ~w(logs escalated committed workspace)
+  # logs + workspace + every classifier-split outcome dir (07 §8, 08 T6.5).
+  @run_subdirs ["logs", "workspace" | Tunex.RowLog.outcome_dirs()]
 
   @impl true
   def run(_args) do

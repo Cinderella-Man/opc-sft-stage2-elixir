@@ -34,6 +34,7 @@ defmodule Tunex.LLM do
       opts
       |> Keyword.put_new(:active_provider, provider)
       |> Keyword.put_new(:max_tokens, floor)
+      |> Keyword.put_new(:stage, stage)
 
     call(user_prompt, system_prompt, opts)
   end
@@ -79,7 +80,7 @@ defmodule Tunex.LLM do
     record_chat_diag(raw, active, body_params[:model], elapsed)
     result = handle_response(raw)
 
-    maybe_record_usage(result, active, body_params[:model])
+    maybe_record_usage(result, active, body_params[:model], Keyword.get(opts, :stage))
 
     Logger.info("[LLM.call] #{active} completed in #{elapsed}ms — #{elem(result, 0)}")
     result
@@ -114,11 +115,11 @@ defmodule Tunex.LLM do
   # (for per-provider pricing + the per-call usage ledger). A cast to an
   # unstarted Budget is a no-op, so this is safe in tests and on the free
   # local-Qwen path (usage may be nil).
-  defp maybe_record_usage({tag, _content, usage}, provider, model)
+  defp maybe_record_usage({tag, _content, usage}, provider, model, stage)
        when tag in [:ok, :truncated] and is_map(usage),
-       do: Tunex.Budget.record(usage, :chat, %{provider: provider, model: model})
+       do: Tunex.Budget.record(usage, :chat, %{provider: provider, model: model, stage: stage})
 
-  defp maybe_record_usage(_, _provider, _model), do: :ok
+  defp maybe_record_usage(_, _provider, _model, _stage), do: :ok
 
   # ── Body assembly ───────────────────────────────────────────────────
 

@@ -1,0 +1,164 @@
+defmodule Tunex.ImplementTest do
+  use ExUnit.Case, async: true
+
+  alias Tunex.Implement.{Naming, Output, Seed}
+
+  describe "Output.parse/2 — new mode" do
+    @pattern_emit """
+    ===RULE===
+    defmodule Credence.Pattern.NoFoo do
+    end
+    ===CHECK_TEST===
+    defmodule X do
+    end
+    ===FIX_TEST===
+    defmodule Y do
+    end
+    ===EQUIVALENCE_TEST===
+    defmodule Z do
+    end
+    ===END===
+    """
+
+    test "pattern requires RULE+CHECK+FIX+EQUIVALENCE" do
+      assert {:ok, %{rule: rule, tests: tests}} =
+               Output.parse(@pattern_emit, mode: :new, phase: :pattern, assumptions?: false)
+
+      assert rule =~ "NoFoo"
+      assert Map.has_key?(tests, "EQUIVALENCE_TEST")
+    end
+
+    test "pattern missing EQUIVALENCE_TEST is rejected" do
+      emit = "===RULE===\nx\n===CHECK_TEST===\nx\n===FIX_TEST===\nx\n===END==="
+      assert {:error, :pattern_missing_equivalence_test} = Output.parse(emit, mode: :new, phase: :pattern, assumptions?: false)
+    end
+
+    test "syntax WITH an equivalence test is rejected" do
+      assert {:error, :non_pattern_has_equivalence_test} =
+               Output.parse(@pattern_emit, mode: :new, phase: :syntax, assumptions?: false)
+    end
+
+    test "switch-gated pattern must carry PROPERTY_TEST" do
+      assert {:error, :switch_gated_missing_property_test} =
+               Output.parse(@pattern_emit, mode: :new, phase: :pattern, assumptions?: true)
+    end
+
+    test "no-promise pattern with a stray PROPERTY_TEST is rejected" do
+      emit = @pattern_emit |> String.replace("===END===", "===PROPERTY_TEST===\nx\n===END===")
+      assert {:error, :no_promise_has_property_test} = Output.parse(emit, mode: :new, phase: :pattern, assumptions?: false)
+    end
+  end
+
+  describe "Output.parse/2 — bugfix mode" do
+    test "accepts path-keyed tests within the glob" do
+      emit = """
+      ===RULE===
+      defmodule Credence.Pattern.NoFoo do
+      end
+      ===TEST:test/pattern/no_foo_check_test.exs===
+      x
+      ===END===
+      """
+
+      assert {:ok, %{rule: _, tests: tests}} =
+               Output.parse(emit, mode: :bugfix, test_glob: ["test/pattern/no_foo_check_test.exs"])
+
+      assert Map.has_key?(tests, "test/pattern/no_foo_check_test.exs")
+    end
+
+    test "rejects a test path outside the glob (no new/renamed files)" do
+      emit = "===RULE===\nx\n===TEST:test/pattern/sneaky_test.exs===\nx\n===END==="
+      assert {:error, {:test_path_out_of_glob, "test/pattern/sneaky_test.exs"}} =
+               Output.parse(emit, mode: :bugfix, test_glob: ["test/pattern/no_foo_check_test.exs"])
+    end
+  end
+
+  describe "Seed.build/1" do
+    test "new pattern seed carries scaffold + AST + invariants + contract" do
+      ctx = %{
+        mode: :new,
+        phase: :pattern,
+        spec: %{before: "defmodule B do\nend", after: "defmodule A do\nend", rationale: "x", assumptions: []},
+        scaffold_files: %{"lib/pattern/no_foo.ex" => "defmodule Credence.Pattern.NoFoo do\nend"},
+        ast_before: "{:defmodule, ...}",
+        ast_after: "{:defmodule, ...}",
+        minimal_set: [],
+        repair?: false
+      }
+
+      user = Seed.build(ctx)
+      assert user =~ "Generated scaffold"
+      assert user =~ "lib/pattern/no_foo.ex"
+      assert user =~ "Type-change ban"
+      assert user =~ "EQUIVALENCE_TEST"
+      assert user =~ "AST dumps"
+    end
+
+    test "semantic seed carries the real diagnostic, not an AST dump" do
+      ctx = %{
+        mode: :new,
+        phase: :semantic,
+        spec: %{before: "x", after: "y", rationale: "r", assumptions: []},
+        scaffold_files: %{},
+        real_diagnostic: "%{message: \"undefined\", position: {3, 5}, severity: :error}",
+        minimal_set: [],
+        repair?: false
+      }
+
+      user = Seed.build(ctx)
+      assert user =~ "REAL captured diagnostic"
+      assert user =~ "position: {3, 5}"
+      refute user =~ "AST dumps"
+    end
+
+    test "repair sub-mode instructs mark_equivalence_repair" do
+      ctx = %{
+        mode: :new,
+        phase: :pattern,
+        spec: %{before: "x", after: "y", rationale: "r", assumptions: []},
+        scaffold_files: %{},
+        ast_before: "a",
+        ast_after: "b",
+        minimal_set: [],
+        repair?: true,
+        repair_evidence: "FunctionClauseError 9/9"
+      }
+
+      user = Seed.build(ctx)
+      assert user =~ "mark_equivalence_repair"
+      assert user =~ "FunctionClauseError 9/9"
+    end
+  end
+
+  describe "Naming.resolve_and_scaffold/3 (real clone — integration)" do
+    @describetag :integration
+
+    test "generates honest-red stubs that fail their own focused test, then clean up" do
+      clone = Tunex.Config.credence_clone()
+      name = "no_tunex_scaffold_probe"
+
+      assert {:ok, sc} = Naming.resolve_and_scaffold(name, :pattern, clone)
+
+      # SURGICAL cleanup — delete ONLY the generated scaffold files. NEVER
+      # `git checkout . && git clean -fd` the clone: that wipes any uncommitted
+      # clone work (it once reverted the whole Phase-1 Credence PR mid-build).
+      on_exit(fn ->
+        Enum.each(sc.paths, fn rel -> File.rm(Path.join(clone, rel)) end)
+      end)
+      assert sc.module == :"Elixir.Credence.Pattern.NoTunexScaffoldProbe"
+      # Pattern → 4 files incl. the equivalence test.
+      assert Enum.any?(sc.paths, &String.ends_with?(&1, "_equivalence_test.exs"))
+      assert map_size(sc.files) == length(sc.paths)
+
+      # Honest-red: the generated stub's own tests FAIL (rule must fire, etc.).
+      {_out, code} =
+        System.cmd("mix", ["test" | Enum.filter(sc.paths, &String.starts_with?(&1, "test/"))],
+          cd: clone,
+          stderr_to_stdout: true,
+          env: [{"MIX_ENV", "test"}]
+        )
+
+      assert code != 0, "expected the generated stub tests to be RED"
+    end
+  end
+end

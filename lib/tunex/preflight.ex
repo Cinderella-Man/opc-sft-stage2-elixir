@@ -122,7 +122,33 @@ defmodule Tunex.Preflight do
     cc_smoke!()
     mimo_chat_reachable!()
     solve_endpoint_reachable!()
+    classify_endpoint_reachable!()
     credence_compiles!(clone)
+  end
+
+  # The classifier (07 §3.1) carries the single hardest judgment and may be
+  # pointed at a DISTINCT vendor (Anthropic Opus) with a separate, expirable
+  # key. Unlike the remote-solve skip (which shares Mimo's already-proven host),
+  # ALWAYS smoke whatever `stages.classify` resolves to so a stale/missing
+  # classifier key fails *boot*, not mid-run (08 T0.4). One-token call.
+  defp classify_endpoint_reachable! do
+    provider = Config.provider_for(:classify)
+
+    case LLM.for_stage(:classify, "reply with exactly: OK", "", max_tokens: 16) do
+      {tag, _content, _usage} when tag in [:ok, :truncated] ->
+        Logger.info("[Preflight] classify endpoint reachable (#{provider})")
+
+      {:error, reason} ->
+        fail("""
+        Classifier endpoint unreachable / unauthorized: provider #{provider} → #{inspect(reason)}
+        The classifier (stages.classify = #{provider}) did not answer. If this is a
+        distinct vendor (e.g. :anthropic_opus), check its secret_providers header /
+        OpenAI-compatible base_url. Or repoint: TUNEX_CLASSIFY_PROVIDER=xiaomi_mimo_2_5_pro
+        """)
+
+      other ->
+        Logger.warning("[Preflight] classify endpoint returned #{inspect(other)} (continuing)")
+    end
   end
 
   defp cc_smoke! do
