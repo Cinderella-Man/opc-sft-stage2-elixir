@@ -93,7 +93,7 @@ config :tunex,
     # implementer emits whole rule + test files. 16k floors are a starting
     # point — tune against truncation (08 T0.1 / 07 §14).
     classify: 16_384,
-    implement: 16_384
+    implement: 32_768
   },
   translate_ceiling: 131_072,
 
