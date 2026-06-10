@@ -188,25 +188,100 @@ non-compiling code. It will NOT move the escalated/duplicate buckets, and does N
 attr-before-defmodule rows while the miscategorized Credence rule still false-COVERs them (Credence fix
 below). Keep it — it is a cheap, correct prompt addition — with these expectations.
 
-## What's wrong with Credence (OUT OF SCOPE — findings for the Credence maintainer)
-Root cause of the attr-before-defmodule subset of buckets 3 & 4:
-`lib/pattern/no_attr_before_defmodule.ex` is **miscategorized**. `@attr` before `defmodule` PARSES but
-does not COMPILE (`cannot invoke @/1 outside module`) — a **Semantic-round** concern. As a
-**Pattern-round** rule:
+## Credence fix — DONE 2026-06-10 (`credence@evolution`, working tree; not committed)
+Investigating the redundant rules surfaced a **deeper bug than the rule duplication**, now fixed.
+
+### What was actually wrong
+The tunex evolution runs generated **6 rules for one concern** (module attrs / code outside a
+`defmodule`): 3 in `syntax/` + 3 in `semantic/`, all wrapping bare source in `defmodule Solution`. Testing
+the **real `Credence.fix/2` pipeline** (not the rules' own unit tests) showed **all 6 were DEAD** — none
+ever fired in production:
+- **Syntax round** *skips parseable source* ("source already parses, skipping") — and `@doc/@spec/def`
+  outside a module DOES parse → the syntax rules never ran.
+- **Semantic round** got **0 diagnostics**: `cannot invoke @/1 outside module` is *raised* by the compiler,
+  and `RuleHelpers.compile_and_capture/1` caught the exception but **threw the message away** (returned
+  `{:error, []}`), so no rule's `match?` was ever called.
+- **Pattern round** skips non-compiling source.
+
+So the rules passed their own unit tests (which call `match?`/`fix` directly) and the tunex gate, but did
+nothing in the real pipeline. The 6-way duplication was the *symptom* (the classifier kept re-deriving an
+unfixable rule across rounds — Fix 3's unclear taxonomy); the *root cause* was the swallowed diagnostic.
+
+### What was done (working tree on `evolution`; `mix test` = 4403 tests, 0 failures)
+1. **Fixed `RuleHelpers.compile_and_capture/1`** — when the compiler *raises*, synthesize an `:error`
+   diagnostic from the exception (`%{severity: :error, message: Exception.message(e), position: line}`) and
+   return it, instead of `{:error, []}`. Now semantic rules can match raised compile errors. (Safe:
+   `{:ok,…}`/`compiles?` paths unchanged; unmatched raised errors still no-op, just logged.)
+2. **Consolidated the 6 → 1 canonical `Semantic.RequireDefmoduleWrapper`** (broadest diagnostic match +
+   the already-wraps guard). Deleted the other 5 rules + their 10 test files (−881/+56 lines).
+3. **Hardened the keeper** — its `fix` now **declines (no-op) when a `defmodule` already exists** so it can't
+   produce a broken *nested* wrap; that "attrs above an existing module" case is left for a future
+   move-into-module rule. Verified end-to-end: bare snippet → wrapped + compiles; attrs-above-module →
+   unchanged.
+
+### Follow-up done 2026-06-10 (same working tree)
+4. **Moved `Pattern.NoAttrBeforeDefmodule`'s logic into the semantic rule + deleted the dead pattern rule.**
+   `RequireDefmoduleWrapper.fix` is now **move-or-wrap-or-decline**: doc/spec attrs orphaned ABOVE an
+   existing `defmodule` are MOVED inside it (the pattern rule's `move_attrs`/`relocation` logic, ported to
+   Sourceror-on-source and applied via `patches_from_ast_transform` + `patch_string`); bare code with no
+   module is WRAPPED; a module with nothing movable before it is declined. The pattern rule (dead — its fix
+   never fired on non-compiling input — and false-COVERing) and its 3 tests are removed; its behaviour now
+   actually runs in the semantic round (verified end-to-end: attrs-before-module → moved + compiles).
+5. **Fixed a meta-test false-positive** (`FixtureStringEscapingTest`). `MetaTestSupport.fixtures/1` treated
+   *every* stringish arg to a verb as a code fixture, so an inline diagnostic-message string in a
+   semantic-rule `fix(source, "…msg…")` got flagged as a non-heredoc fixture. Fix: a verb's code fixture is
+   the rule-after alias-first arg (`check(Rule, code)`) or only the first source arg (`fix(source, diag)`,
+   `analyze(code)`) — later string args (diagnostics/opts/reasons) are not fixtures. (`credence@evolution`,
+   `mix test` = 4385 tests, 0 failures.)
+
+---
+### Original analysis (for reference — superseded by "What was actually wrong" above)
+There are **four** rules in the "module attribute / code outside a `defmodule`" space, split across two
+rounds and doing **two different jobs**:
+
+| rule | round | scenario | fix |
+|---|---|---|---|
+| `Pattern.NoAttrBeforeDefmodule` | **pattern** ❌ | doc/spec attrs above an **existing** `defmodule` | **MOVE** them inside that module |
+| `Semantic.NoDocSpecOutsideModule` | semantic | `@doc`/`@spec` with **no** module | **WRAP** in `defmodule Solution` |
+| `Semantic.PreferDefmoduleWrapper` | semantic | `cannot invoke @/1 outside module`, no module | **WRAP** in `defmodule Solution` |
+| `Semantic.RequireDefmoduleWrapper` | semantic | bare code (`@doc`/`def`) at top level | **WRAP** in `defmodule Solution` |
+
+### Problem 1 — `Pattern.NoAttrBeforeDefmodule` is miscategorized
+`@attr` before `defmodule` PARSES but does NOT COMPILE (`cannot invoke @/1 outside module`) — a
+**Semantic-round** concern. As a Pattern-round rule:
 - its **fix can never fire** — `Pattern.fix_with_trace` (`lib/pattern.ex:52`) correctly skips the whole
   pipeline when `!compiles?` (Pattern rules assume valid, compiling code);
-- its **check still fires** in `Pattern.analyze`, so `mix credence.covers` returns COVERED on the
-  snippet → tunex novelty marks every attempt to build the correct rule as `duplicate`.
+- its **check still fires** in `Pattern.analyze`, so `mix credence.covers` returns COVERED on the snippet
+  → tunex novelty marks every attempt to build the correct rule as `duplicate` (this is the false-dupe
+  subset of the `duplicate/` bucket, and part of why the timed-out implement rows kept re-deriving
+  `prefer_defmodule_wrapper`).
 
-It is effectively a **detect-only Pattern rule**, which violates Credence's own promise ("every Pattern
-rule fixes what it finds"). Recommended Credence-side work (NOT done here):
-1. Reimplement it as a **Semantic** rule keyed on the `cannot invoke @/1 outside module` `:error`
-   diagnostic — `Credence.Semantic` already handles compile-FAILED source (`lib/semantic.ex:89`) — and
-   retire the Pattern-round version.
-2. More broadly: make each round's **contract explicit** in the rule docs / a rule-type guide (which
-   round owns parse-failures vs compile-failures vs idiomatic), so human- and pipeline-authored rules
-   land in the round whose fix can actually run. (This is the same taxonomy Fix 3 adds to the tunex
-   classifier prompt.)
+It is a **detect-only Pattern rule**, violating Credence's own promise ("every Pattern rule fixes what it
+finds"). **Its move-into-existing-module LOGIC is correct and worth keeping** — wrapping is the WRONG fix
+for this case (`@moduledoc "x"\ndefmodule Greeter do…end` wrapped in `defmodule Solution` compiles but
+nests `Greeter` and mis-attaches `@moduledoc` to `Solution`). So: **reimplement the move logic as a
+Semantic rule** keyed on the `cannot invoke @/1 outside module` `:error` diagnostic, gated to the
+"a `defmodule` follows the attrs" shape, and **retire the Pattern-round version**. (`Credence.Semantic`
+already handles compile-FAILED source — `lib/semantic.ex:89`.)
+
+### Problem 2 — the three Semantic wrap rules overlap
+`NoDocSpecOutsideModule` / `PreferDefmoduleWrapper` / `RequireDefmoduleWrapper` all key on near-identical
+diagnostics and apply the **same** `defmodule Solution` wrap — redundant and potentially competing in one
+semantic pass. Audit them: pick ONE canonical wrap rule (the "no module at all" case), retire/merge the
+others, and order it AFTER the new move rule (if a `defmodule` follows the attrs → MOVE; else → WRAP).
+
+### Problem 3 — round contracts are implicit
+Make each round's **contract explicit** in the rule docs / a rule-type guide (which round owns
+parse-failures vs compile-failures vs idiomatic), so human- and pipeline-authored rules land in the round
+whose fix can actually run. (Same taxonomy as Fix 3's tunex classifier prompt.)
+
+### Suggested issues to file against `Cinderella-Man/credence`
+1. **Move `NoAttrBeforeDefmodule` from pattern → semantic** (reimplement on the diagnostic; gate to
+   "defmodule follows"; retire the pattern version). Fixes the false-dupe that blocks rule-gen here.
+2. **De-duplicate the three semantic `*defmodule_wrapper` / `*outside_module` wrap rules** → one canonical
+   wrap, ordered after the move rule.
+3. **Document the per-round contract** (parse-fail = syntax, compile-fail = semantic, idiomatic-on-compiling
+   = pattern).
 
 ## Priority order
 1. **Fix 1 timeout knob + 30-min probe** — the primary win; recovers ~26/28 escalated + the classifier_error.
