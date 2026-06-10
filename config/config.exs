@@ -105,6 +105,23 @@ config :tunex,
   rule_gen_input_ceiling: 240_000,
   rule_gen_output_ceiling: 480_000,
 
+  # ── Implement driver (docs/10) ──────────────────────────────────────
+  # :pi (default) = hand the same rich context to the `pi` coding agent, which
+  # fills the on-disk stubs, runs `mix test`, and loops itself (fixes the
+  # single-call timeout via many small fast turns). :llm = the old single-shot
+  # emit→write→test loop. Set TUNEX-style config to :llm to fall back.
+  implement_driver: :pi,
+  pi: %{
+    extension: "pi/mimo_provider.ts",
+    provider: "mimo",
+    model: "mimo-v2.5-pro",
+    # Reasoning level for rule authoring; "off" was only for the speed smoke —
+    # rules need some reasoning. Tune against speed/quality.
+    thinking: "low",
+    tools: "read,bash,edit,write",
+    timeout_ms: 1_800_000
+  },
+
   # ── Claude Code (rule-gen) — Mimo via the Anthropic-compatible endpoint
   # auth_token lives in secrets.exs (see claude_code_auth_token).
   claude_code: %{

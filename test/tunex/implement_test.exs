@@ -118,6 +118,30 @@ defmodule Tunex.ImplementTest do
       assert user =~ "AST dumps"
     end
 
+    test "pi driver: same context, but an AGENT task instead of the marker contract (docs/10)" do
+      ctx = %{
+        mode: :new,
+        phase: :pattern,
+        spec: %{before: "defmodule B do\nend", after: "defmodule A do\nend", rationale: "x", assumptions: []},
+        scaffold: %{phase: :pattern, snake: "no_foo"},
+        scaffold_files: %{"lib/pattern/no_foo.ex" => "defmodule Credence.Pattern.NoFoo do\nend"},
+        ast_before: "a",
+        ast_after: "b",
+        minimal_set: [],
+        repair?: false
+      }
+
+      user = Seed.build(ctx, driver: :pi)
+      # rich context is still injected
+      assert user =~ "Generated scaffold"
+      assert user =~ "Type-change ban"
+      assert user =~ "AST dumps"
+      # ...but the closing is the agent task (loop on mix test), not the markers
+      assert user =~ "AGENTIC"
+      assert user =~ "mix test test/pattern/no_foo*_test.exs"
+      refute user =~ "===RULE==="
+    end
+
     test "semantic seed carries the real diagnostic, not an AST dump" do
       ctx = %{
         mode: :new,

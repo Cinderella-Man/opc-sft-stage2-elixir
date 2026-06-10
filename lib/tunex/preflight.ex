@@ -4,11 +4,12 @@ defmodule Tunex.Preflight do
   actionable guidance** on any miss — never crash-loop.
 
   Order: static checks (clone/branch/CLI/secrets) → reconciliation → runtime
-  checks (clean tree, CC smoke test against Mimo, Mimo chat reachable, local
-  solve endpoint reachable, credence compiles). The CC smoke test validates base
-  URL + token + model end-to-end so a bad rule-gen auth doesn't masquerade as
-  "agent always gives up". The solve-endpoint check catches a down local Qwen
-  server before the first paid row reaches the Solve stage.
+  checks (clean tree, implement-driver smoke, Mimo chat reachable, classify
+  reachable, local solve endpoint reachable, credence compiles). The
+  implement-driver smoke validates the agent end-to-end — for `:pi`, a one-shot
+  `pi` session (CLI + Mimo provider extension + key + reachability) — so a broken
+  rule-builder fails *boot*, not every row. The solve-endpoint check catches a
+  down local Qwen server before the first paid row reaches the Solve stage.
   """
 
   require Logger
@@ -50,26 +51,44 @@ defmodule Tunex.Preflight do
       """)
     end
 
-    unless claude_available?() do
+    # Only the :pi driver needs an external CLI on PATH (the pi coding agent).
+    # :llm runs entirely over the chat endpoint. CC is no longer an implement path.
+    if Config.implement_driver() == :pi, do: pi_static!()
+
+    check_secrets!()
+  end
+
+  defp pi_static! do
+    unless System.find_executable("pi") do
       fail("""
-      `claude` CLI not found on PATH (or `claude --version` failed).
-      Fix: install Claude Code (Node 18+) and ensure `claude` is on PATH.
+      `pi` CLI not found on PATH (implement_driver: :pi).
+      Fix: install it (npm i -g @earendil-works/pi-coding-agent) and ensure `pi`
+      is on PATH, or set implement_driver: :llm to use the single-call driver.
       """)
     end
 
-    check_secrets!()
+    ext = Config.pi_extension()
+
+    unless File.exists?(ext) do
+      fail("""
+      pi provider extension not found at #{ext}.
+      Expected pi/mimo_provider.ts in the project (registers Mimo for pi).
+      """)
+    end
   end
 
   defp check_secrets! do
     secret_providers = Application.get_env(:tunex, :secret_providers, %{})
     has_chat = get_in(secret_providers, [:xiaomi_mimo_2_5_pro, :headers, :Authorization]) != nil
+    # The CC token is only needed for the (legacy) Claude Code path; :pi reuses
+    # the chat key via the env-injected extension, :llm uses the chat endpoint.
+    needs_cc = Config.implement_driver() == :claude_code
     has_cc = Application.get_env(:tunex, :claude_code_auth_token) != nil
 
-    unless has_chat and has_cc do
+    unless has_chat and (has_cc or not needs_cc) do
       fail("""
       Missing credentials in config/secrets.exs.
-      Need: secret_providers.xiaomi_mimo_2_5_pro.headers.Authorization (chat)
-            claude_code_auth_token (Claude Code → Mimo)
+      Need: secret_providers.xiaomi_mimo_2_5_pro.headers.Authorization (chat)#{if needs_cc, do: "\n            claude_code_auth_token (Claude Code → Mimo)", else: ""}
       Copy config/secrets.dummy.exs → config/secrets.exs and fill in real values.
       """)
     end
@@ -99,8 +118,8 @@ defmodule Tunex.Preflight do
       {o, c} -> Logger.warning("[Preflight] push catch-up failed (exit #{c}, non-fatal): #{o}")
     end
 
-    # The Gate + the CC agent run `mix test` directly in the clone, so the
-    # clone's own deps must be present (not just the workspace's path-dep build).
+    # The Gate + the implement agent (pi) run `mix test` directly in the clone, so
+    # the clone's own deps must be present (not just the workspace's path-dep build).
     System.cmd("mix", ["deps.get"], cd: clone, stderr_to_stdout: true)
 
     Workspace.setup()
@@ -119,7 +138,7 @@ defmodule Tunex.Preflight do
       fail("Clone tree not clean after reconciliation — unexpected. Inspect #{clone}.")
     end
 
-    cc_smoke!()
+    rule_gen_smoke!()
     mimo_chat_reachable!()
     solve_endpoint_reachable!()
     classify_endpoint_reachable!()
@@ -151,16 +170,33 @@ defmodule Tunex.Preflight do
     end
   end
 
-  defp cc_smoke! do
-    case Tunex.ClaudeCode.run("reply with exactly: OK", max_turns: 1) do
-      {:ok, %{result_text: text}} ->
-        Logger.info("[Preflight] CC smoke OK: #{text}")
+  # Smoke the IMPLEMENT driver end-to-end so a broken agent fails *boot*, not
+  # every row mid-run. :pi runs a one-shot pi session in a temp dir (proves CLI +
+  # extension + Mimo key + Mimo reachable through pi); :llm is already covered by
+  # the chat-endpoint smokes below (implement uses the same provider as classify).
+  defp rule_gen_smoke! do
+    if Config.implement_driver() == :pi, do: pi_smoke!()
+  end
 
-      other ->
-        fail("""
-        Claude Code smoke test failed: #{inspect(other)}
-        Check ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL (Mimo /anthropic endpoint) in config + secrets.
-        """)
+  defp pi_smoke! do
+    tmp = Path.join(System.tmp_dir!(), "tunex_pi_smoke_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp)
+
+    try do
+      case Tunex.Pi.run("Reply with exactly: OK", cwd: tmp, timeout_ms: 90_000) do
+        {:ok, %{result_text: text}} ->
+          Logger.info("[Preflight] pi smoke OK: #{String.slice(text, 0, 40)}")
+
+        other ->
+          fail("""
+          pi agent smoke test failed: #{inspect(other)}
+          Check: `pi` on PATH, pi/mimo_provider.ts, the Mimo Authorization header in
+          config/secrets.exs (injected as TUNEX_MIMO_KEY), and that Mimo is reachable.
+          Or set implement_driver: :llm to use the single-call driver.
+          """)
+      end
+    after
+      File.rm_rf!(tmp)
     end
   end
 
@@ -235,15 +271,6 @@ defmodule Tunex.Preflight do
   defp rev_parse(clone, args) do
     {out, _} = git(clone, ["rev-parse" | args])
     String.trim(out)
-  end
-
-  defp claude_available? do
-    case System.cmd("claude", ["--version"], stderr_to_stdout: true) do
-      {_o, 0} -> true
-      _ -> false
-    end
-  rescue
-    _ -> false
   end
 
   defp git(clone, args), do: System.cmd("git", args, cd: clone, stderr_to_stdout: true)

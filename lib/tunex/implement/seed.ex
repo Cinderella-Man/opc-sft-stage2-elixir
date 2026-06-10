@@ -30,10 +30,22 @@ defmodule Tunex.Implement.Seed do
   # this line cuts the cause (the model otherwise mirrors the seed's fenced examples).
   @no_fence "Emit each block's RAW file content — do NOT wrap it in ``` code fences."
 
-  @doc "Build the user prompt from a context map (see moduledoc / T5.1)."
-  def build(ctx) do
+  @doc """
+  Build the user prompt from a context map (see moduledoc / T5.1).
+
+  `opts[:driver]` selects the closing instruction (the rich context above it is
+  identical either way — docs/10):
+    * `:llm` (default) — the marker output-contract (single-shot: emit whole files).
+    * `:pi` — an AGENT task: the stub files already exist on disk; edit them in
+      place, run `mix test`, and loop until green (pi runs the loop itself).
+  """
+  def build(ctx, opts \\ []) do
+    driver = Keyword.get(opts, :driver, :llm)
+
+    closing = if driver == :pi, do: agent_task(ctx), else: output_contract(ctx)
+
     [
-      header(ctx),
+      header(ctx, driver),
       spec_block(ctx),
       scaffold_block(ctx),
       ast_block(ctx),
@@ -43,7 +55,7 @@ defmodule Tunex.Implement.Seed do
       conventions_block(),
       assumptions_block(ctx),
       repair_block(ctx),
-      output_contract(ctx)
+      closing
     ]
     |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join("\n\n")
@@ -51,11 +63,47 @@ defmodule Tunex.Implement.Seed do
 
   # ── Sections ─────────────────────────────────────────────────────────────
 
-  defp header(%{mode: :new, phase: phase}),
+  defp header(%{mode: :new, phase: phase}, :pi),
+    do: "## Task: implement a NEW #{phase} Credence rule — agentic. Fill the generated stub files IN PLACE, run `mix test`, and loop until green."
+
+  defp header(%{mode: :bugfix, bugfix: %{sub_shape: shape}}, :pi),
+    do: "## Task: FIX an existing Credence rule (#{shape}) — agentic. Edit it + its tests in place, run `mix test`, and loop until green."
+
+  defp header(%{mode: :new, phase: phase}, _llm),
     do: "## Task: implement a NEW #{phase} rule by filling the generated stubs."
 
-  defp header(%{mode: :bugfix, bugfix: %{sub_shape: shape}}),
+  defp header(%{mode: :bugfix, bugfix: %{sub_shape: shape}}, _llm),
     do: "## Task: FIX an existing rule (#{shape}). Edit it + its tests in place."
+
+  # The agentic closing instruction (replaces the marker output-contract for pi).
+  # The scaffold/bugfix files are already on disk in the agent's cwd (the clone),
+  # so it edits them directly and drives its own edit→test→fix loop.
+  defp agent_task(%{mode: :new, scaffold: sc}),
+    do: agent_task_text("test/#{sc.phase}/#{sc.snake}*_test.exs")
+
+  defp agent_task(%{mode: :bugfix, bugfix: bf}),
+    do: agent_task_text(Enum.join(Map.keys(bf.test_files), " "))
+
+  defp agent_task(_), do: agent_task_text("test/")
+
+  defp agent_task_text(test_target) do
+    """
+    ## Your task — AGENTIC (fill the stubs, then make the tests pass)
+    The files shown above ALREADY EXIST on disk in your working directory. EDIT them
+    in place to implement the real `check`/`fix` (and replace placeholder fixtures
+    with the real before/after) — preserve the module names and file shape. Then run
+    the focused tests and LOOP until every one passes:
+
+        mix test #{test_target}
+
+    Iterate as many times as you need: edit → run → read the failures → fix → re-run.
+    YOU decide when you are done — finish only once `mix test` above is fully green.
+    Rules:
+    - Do NOT weaken, skip, or delete assertions to make them pass. Fix the rule, not the test.
+    - Do NOT create new files beyond the generated stubs (bugfix: modify in place only).
+    - Do NOT run git.
+    """
+  end
 
   defp spec_block(%{spec: s}) do
     """

@@ -17,13 +17,51 @@ defmodule Tunex.Implement do
 
   require Logger
 
-  alias Tunex.{Config, LLM}
+  alias Tunex.{Config, LLM, Pi}
   alias Tunex.Implement.{Output, Seed}
 
+  @doc """
+  Implement the rule for `ctx`. Two drivers (docs/10), chosen by
+  `opts[:driver]` (defaults to `Config.implement_driver/0`):
+
+    * `:llm` — the single-shot emit→write→test→retry loop below.
+    * `:pi` — hand the SAME context to the `pi` coding agent, which fills the
+      already-on-disk stubs, runs `mix test`, and loops itself; we then verify
+      with the same `focused_test/1` (never trust the agent's word).
+
+  Both return `{:ok, %{module, paths}}` or `{:gave_up, reason}` — the Gate runs next.
+  """
   def run(ctx, opts \\ []) do
+    case Keyword.get(opts, :driver, Config.implement_driver()) do
+      :pi -> run_pi(ctx, opts)
+      _ -> run_llm(ctx, opts)
+    end
+  end
+
+  defp run_llm(ctx, opts) do
     emit = Keyword.get(opts, :emit, &default_emit/2)
     seed = Seed.build(ctx)
     loop(ctx, seed, seed, 1, 0, emit)
+  end
+
+  # Agentic driver: the router already wrote the scaffold stubs into the clone
+  # (new mode) or the rule+tests are already there (bugfix), so pi edits them in
+  # place. After it finishes we re-run the focused tests ourselves — a green
+  # claim from the agent is not trusted.
+  defp run_pi(ctx, opts) do
+    pi = Keyword.get(opts, :pi, &Pi.run/2)
+    prompt = Seed.build(ctx, driver: :pi)
+
+    case pi.(prompt, cwd: ctx.clone, row: ctx[:row]) do
+      {:ok, _result} ->
+        case focused_test(ctx) do
+          :pass -> {:ok, result(ctx)}
+          {:fail, failures} -> {:gave_up, {:pi_tests_red, String.slice(failures, 0, 400)}}
+        end
+
+      {:gave_up, reason} ->
+        {:gave_up, {:pi, reason}}
+    end
   end
 
   defp loop(ctx, seed, user, attempt, out_total, emit) do
