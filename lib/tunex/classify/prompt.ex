@@ -126,6 +126,16 @@ defmodule Tunex.Classify.Prompt do
     path. If a pattern has no safe auto-fix even on a narrowed core, or the only fix
     changes a value's TYPE, emit NO_ACTION — never a do-nothing stub.
 
+    ## Hard rule — BEFORE must be SELF-CONTAINED
+    `before` must stand alone: inline or define EVERY helper/function it calls. Do
+    NOT leave a dangling call to something you didn't include. An incomplete snippet
+    fails to compile for a reason UNRELATED to your idiom (an `undefined function`
+    error), an unrelated rule fires on that breakage, and the novelty check then
+    drops your whole proposal as a FALSE DUPLICATE. Keep only the ONE issue you are
+    isolating; everything else must be valid: a Pattern `before` must fully COMPILE;
+    a Semantic `before` may carry only its ONE targeted compiler diagnostic; a Syntax
+    `before` is the lone parse failure.
+
     ## Behaviour preservation (HARD — §3.10)
     `after` must be output-identical to `before` for EVERY admitted input (Tunex
     runs Credence's default helpful mode). A behaviour-changing rewrite is NO_ACTION

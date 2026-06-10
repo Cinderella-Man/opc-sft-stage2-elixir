@@ -142,6 +142,8 @@ defmodule Tunex.ClassifyTest do
       assert user =~ Prompt.phase_taxonomy()
       assert user =~ "Choosing PHASE"
       assert user =~ "NEVER pattern"
+      # self-contained-BEFORE hard rule (docs/10 false-duplicate fix)
+      assert user =~ "BEFORE must be SELF-CONTAINED"
     end
 
     test "failed lens differs from solved lens" do
