@@ -73,6 +73,20 @@ defmodule Tunex.Classify.Prompt do
   fixable rule.
   """
 
+  # ── Phase taxonomy (docs/10 Fix 3): the model is told the PHASE token but not
+  # what the rounds MEAN — define them so it can't propose Pattern for
+  # non-compiling code (whose fix is then gated forever). ──────────────────────
+  @phase_taxonomy ~S"""
+  ## Choosing PHASE — Credence runs 3 ordered rounds; pick by the INPUT's parse/compile status
+  - syntax   — `before` WON'T PARSE (Sourceror fails); fixes raw text. e.g. `n*(n+1) div 2` → `div(n*(n+1), 2)`.
+  - semantic — `before` PARSES but the COMPILER rejects/warns (error- or warning-level diagnostics).
+               e.g. `@attr` ABOVE `defmodule` ("cannot invoke @/1 outside module"), unused var,
+               undefined function. A semantic rule matches a COMPILER DIAGNOSTIC, not an AST shape.
+  - pattern  — `before` COMPILES and runs but is non-idiomatic; deeper AST rewrites.
+  HARD: a Pattern rule's fix ONLY runs on code that COMPILES. If `before` does not compile you MUST
+  choose syntax or semantic — NEVER pattern (a Pattern rule there detects but its fix is skipped forever).
+  """
+
   @system "You classify one solved/failed dataset row for the Credence Elixir AST linter. " <>
             "Decide the SINGLE most valuable deterministic action — a new fixable rule, a fix to an " <>
             "over-firing existing rule, a switch proposal, or nothing. You are the QUALITY BAR: a wrong " <>
@@ -104,6 +118,8 @@ defmodule Tunex.Classify.Prompt do
     Names are snake_case and almost always prefixed: no_ (forbid), prefer_ (steer),
     avoid_ (discourage). Propose a SEMANTIC name; the orchestrator owns the final
     name + any numeric suffix.
+
+    #{@phase_taxonomy}
 
     ## Hard rule — FIXABLE ONLY, no check-only
     Every proposed rule MUST carry a real `after` (a `fix`). There is NO check-only
@@ -207,6 +223,7 @@ defmodule Tunex.Classify.Prompt do
   # Exposed for tests: the canonical blocks must be injected verbatim.
   def type_change_block, do: @type_change_block
   def adversarial_block, do: @adversarial_block
+  def phase_taxonomy, do: @phase_taxonomy
 
   @doc false
   def __spec_fields__, do: Map.keys(Map.from_struct(%Spec{decision: :no_action}))

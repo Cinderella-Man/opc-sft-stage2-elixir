@@ -28,7 +28,7 @@ defmodule Tunex.RowLog do
 
   # Classifier-split outcome dirs (07 §8). Nothing is deleted — every outcome
   # MOVES the log to its dir (08 T6.2/T6.5).
-  @outcome_dirs ~w(escalated committed no_action duplicate behaviour_diverged switch_proposals classifier_errors)
+  @outcome_dirs ~w(escalated committed no_action duplicate behaviour_diverged switch_proposals classifier_errors transient too_slow)
 
   @doc "Create the run-scoped log dirs. Safe to call at boot."
   def ensure_ready do
@@ -88,6 +88,12 @@ defmodule Tunex.RowLog do
 
   @doc "Move to `classifier_errors/` (malformed spec after one re-ask)."
   def classifier_errors(index), do: move(index, Config.run_path("classifier_errors"))
+
+  @doc "Move to `transient/` (a recoverable LLM timeout — row NOT consumed, re-runs)."
+  def transient(index), do: move(index, Config.run_path("transient"))
+
+  @doc "Move to `too_slow/` (gave up after `transient_row_limit` timeouts — row consumed)."
+  def too_slow(index), do: move(index, Config.run_path("too_slow"))
 
   # ── Internal ────────────────────────────────────────────────────────
 

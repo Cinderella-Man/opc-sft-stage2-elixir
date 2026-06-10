@@ -79,6 +79,25 @@ defmodule Tunex.ParserTest do
     end
   end
 
+  describe "strip_outer_fences/1 (docs/10 Fix 2)" do
+    test "removes a single outer ```lang fence" do
+      assert Parser.strip_outer_fences("```elixir\ndefmodule A do\nend\n```") == "defmodule A do\nend"
+    end
+
+    test "removes a bare ``` fence" do
+      assert Parser.strip_outer_fences("```\nx\n```") == "x"
+    end
+
+    test "no-op when there is no fence" do
+      assert Parser.strip_outer_fences("defmodule A do\nend") == "defmodule A do\nend"
+    end
+
+    test "preserves a mid-content fence (only the FIRST/LAST are stripped)" do
+      s = "defmodule A do\n  @moduledoc \"x\\n```\\ny\"\nend"
+      assert Parser.strip_outer_fences(s) == s
+    end
+  end
+
   describe "fix_is_prefix/3" do
     test "renames is_foo to foo? in module and test when canonical is a predicate" do
       mod = "defmodule Solution do\n  def is_palindrome(s), do: s == String.reverse(s)\nend"

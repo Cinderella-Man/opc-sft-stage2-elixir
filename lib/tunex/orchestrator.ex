@@ -65,6 +65,8 @@ defmodule Tunex.Orchestrator do
       rowstat: rowstat,
       transient_retries: Map.get(budget, :transient_retries, 5),
       transient_backoff_ms: Map.get(budget, :transient_backoff_ms, 2_000),
+      transient_storm_limit: Config.transient_storm_limit(),
+      consecutive_transient: 0,
       started_mono: System.monotonic_time(:millisecond),
       done: 0
     }
@@ -83,11 +85,38 @@ defmodule Tunex.Orchestrator do
   end
 
   def handle_info(:next, %{pending: [idx | rest]} = state) do
-    run_row(idx, state)
+    outcome = run_row(idx, state)
+    state = apply_breaker(state, outcome, idx)
     state = %{state | pending: rest, done: state.done + 1}
     log_progress(state)
     send(self(), :next)
     {:noreply, state}
+  end
+
+  # Consecutive-:transient_abort circuit breaker (docs/10 Fix 1): a real Mimo
+  # outage halts cleanly instead of churning the pending list. A blacklisted row
+  # carries no Mimo signal (left unchanged); any real outcome resets the streak.
+  defp apply_breaker(state, outcome, idx) do
+    case breaker_step(state.consecutive_transient, state.transient_storm_limit, outcome) do
+      :halt ->
+        Tunex.shutdown({:transient_storm, idx})
+        state
+
+      {:cont, n} ->
+        if n > 0, do: Logger.warning("[Orchestrator] transient_abort streak #{n}/#{state.transient_storm_limit}")
+        %{state | consecutive_transient: n}
+    end
+  end
+
+  @doc false
+  # Pure breaker decision (exposed for tests): `:halt` at the limit, else the new
+  # consecutive count. Blacklist holds; any non-abort real outcome resets to 0.
+  def breaker_step(consecutive, limit, outcome) do
+    case outcome do
+      :transient_abort -> if consecutive + 1 >= limit, do: :halt, else: {:cont, consecutive + 1}
+      :blacklist -> {:cont, consecutive}
+      _ -> {:cont, 0}
+    end
   end
 
   # Live trajectory line after every row: throughput + projected daily burn.
@@ -105,6 +134,8 @@ defmodule Tunex.Orchestrator do
 
   # ── Per-row ─────────────────────────────────────────────────────────
 
+  # Returns the breaker-relevant outcome (`:transient_abort` / `:blacklist` /
+  # a real rule-gen outcome / `:exception`) for the consecutive-abort breaker.
   defp run_row(idx, state) do
     do_row(idx, state)
   rescue
@@ -115,6 +146,7 @@ defmodule Tunex.Orchestrator do
       append_error(state, %{index: idx, failure_reason: "exception: #{Exception.message(e)}"})
       write_row_stat(state, %{index: idx, ts: System.os_time(:second), outcome: :exception})
       Progress.mark_done(state.progress_path, idx)
+      :exception
   end
 
   defp do_row(idx, state) do
@@ -148,7 +180,14 @@ defmodule Tunex.Orchestrator do
     )
 
     Logger.info("[idx=#{idx}] finished in #{elapsed}s (est $#{cost_est})")
+    breaker_outcome(stat)
   end
+
+  # The breaker watches the rule-gen outcome; a blacklisted row never reached
+  # Mimo (own signal); anything else is a real outcome (resets the streak).
+  defp breaker_outcome(%{rulegen: o}), do: o
+  defp breaker_outcome(%{blacklist: _}), do: :blacklist
+  defp breaker_outcome(_), do: nil
 
   defp solve_and_finish(idx, row, payload, src, state) do
     # Distillation boundary (T2.1): the classifier drops everything ABOVE this
@@ -178,13 +217,20 @@ defmodule Tunex.Orchestrator do
     # commit) itself. The solve outcome forks the classifier lens (07 §3.3).
     rg = safe_rule_gen(idx, router_outcome(solve))
 
-    # SFT append is based on Solve (step 5), independent of rule-gen (step 6).
-    case record do
-      {:success, r} -> append_success(state, r)
-      {:error, r} -> append_error(state, r)
-    end
+    if rg_outcome(rg) == :transient_abort do
+      # Don't-consume (docs/10 Fix 1): a recoverable rule-gen timeout — skip BOTH
+      # the SFT append and mark_done so the row re-runs cleanly next pass (and
+      # appends exactly once then). The log already moved to transient/.
+      Logger.info("[idx=#{idx}] transient_abort — NOT consuming (re-runs next pass)")
+    else
+      # SFT append is based on Solve (step 5), independent of rule-gen (step 6).
+      case record do
+        {:success, r} -> append_success(state, r)
+        {:error, r} -> append_error(state, r)
+      end
 
-    Progress.mark_done(state.progress_path, idx)
+      Progress.mark_done(state.progress_path, idx)
+    end
 
     %{
       translate: src,

@@ -216,7 +216,15 @@ defmodule Tunex.Parser do
 
   # ── Internal ───────────────────────────────────────────────────────
 
-  defp strip_outer_fences(s) do
+  @doc """
+  Strip a single outer markdown code fence (first + last only) off `s`.
+
+  Non-multiline by design: only the leading ```` ```lang ```` and the trailing
+  ```` ``` ```` are removed, so a mid-content fence (e.g. inside a rule's
+  `@moduledoc`) is preserved. Used by the rule-gen output/spec parsers to undo
+  the model wrapping whole files in fences (docs/10 Fix 2).
+  """
+  def strip_outer_fences(s) do
     s
     |> String.replace(~r/^```\w*\n?/, "")
     |> String.replace(~r/\n?```$/, "")

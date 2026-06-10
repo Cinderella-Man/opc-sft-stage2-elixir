@@ -84,4 +84,52 @@ defmodule Tunex.Evolve.RouterTest do
 
     assert moved?("behaviour_diverged", 5)
   end
+
+  # ── docs/10 Fix 1: transient timeout don't-consume / too_slow / fatal ───────
+
+  test "a transient classify timeout (under the per-row limit) → :transient_abort, moves to transient/, no Ledger" do
+    write_log(10, "log\n")
+    classify = fn _l, _o, _opts -> {:error, {:classifier_errors, {:llm_error, {:network, :timeout}}, ""}} end
+
+    assert %{outcome: :transient_abort} =
+             Router.run(10, :solved, "/x", classify: classify, transient_attempts: fn _ -> 1 end)
+
+    assert moved?("transient", 10)
+    refute moved?("classifier_errors", 10)
+    # don't-consume must NOT poison the ledger with network spam
+    refute File.exists?(Tunex.Config.run_path("decisions.md"))
+  end
+
+  test "a transient classify timeout AT the per-row limit → :too_slow, moves to too_slow/ (consumed)" do
+    write_log(11, "log\n")
+    classify = fn _l, _o, _opts -> {:error, {:classifier_errors, {:llm_error, {:network, :timeout}}, ""}} end
+
+    limit = Tunex.Config.transient_row_limit()
+
+    assert %{outcome: :too_slow} =
+             Router.run(11, :solved, "/x", classify: classify, transient_attempts: fn _ -> limit end)
+
+    assert moved?("too_slow", 11)
+    refute moved?("transient", 11)
+  end
+
+  test "a fatal classify error (401) → injected shutdown, :fatal_abort" do
+    write_log(12, "log\n")
+    classify = fn _l, _o, _opts -> {:error, {:classifier_errors, {:llm_error, {:http, 401, "no"}}, ""}} end
+    me = self()
+    shutdown = fn reason -> send(me, {:shutdown, reason}) end
+
+    assert %{outcome: :fatal_abort} =
+             Router.run(12, :solved, "/x", classify: classify, shutdown: shutdown)
+
+    assert_received {:shutdown, {:fatal_api, {:llm_error, {:http, 401, "no"}}}}
+  end
+
+  test "a genuine malformed-spec classifier error still → classifier_errors/ (:other)" do
+    write_log(13, "log\n")
+    classify = fn _l, _o, _opts -> {:error, {:classifier_errors, :missing_after, "raw"}} end
+
+    assert %{outcome: :classifier_error} = Router.run(13, :solved, "/x", classify: classify)
+    assert moved?("classifier_errors", 13)
+  end
 end

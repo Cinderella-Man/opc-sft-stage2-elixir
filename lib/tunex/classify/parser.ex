@@ -6,7 +6,7 @@ defmodule Tunex.Classify.Parser do
   live in `Tunex.Classify` (T3.3).
   """
 
-  alias Tunex.{Markers, Classify.Spec}
+  alias Tunex.{Markers, Parser, Classify.Spec}
 
   @decisions %{
     "NO_ACTION" => :no_action,
@@ -19,7 +19,10 @@ defmodule Tunex.Classify.Parser do
 
   @spec parse(String.t()) :: {:ok, Spec.t()} | {:error, term()}
   def parse(text) when is_binary(text) do
-    m = Markers.to_map(text)
+    # Strip a stray outer code fence off every block (docs/10 Fix 2) — a fenced
+    # BEFORE/AFTER would fail the `parses?` gate → re-ask → classifier_error.
+    # Harmless on the short token fields (no fence → no-op).
+    m = Markers.to_map(text) |> Map.new(fn {k, v} -> {k, Parser.strip_outer_fences(v)} end)
 
     with {:ok, decision} <- decision(m) do
       {:ok,

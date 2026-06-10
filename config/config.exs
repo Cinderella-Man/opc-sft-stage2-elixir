@@ -171,7 +171,21 @@ config :tunex,
     # 429-streak → fatal; transient (5xx/network) retry/backoff before halt.
     max_consecutive_429: 5,
     transient_retries: 5,
-    transient_backoff_ms: 2_000
+    transient_backoff_ms: 2_000,
+    # ── Rule-gen resilience (docs/10_log_review_fixes.md) ───────────────
+    # llm_timeout_ms is the receive_timeout for EVERY LLM call. Raised from the
+    # old hardcoded 600_000 after the logs showed the 26/28 escalated + the
+    # classifier_error were slow `implement` generations cut off at the 10-min
+    # ceiling (NOT network blips: Mimo succeeded earlier in the same row 28/28).
+    # 1_800_000 (30 min) is the PROBE value — set production = the measured
+    # completion-time ceiling + ~30% after re-running the 28 timed-out rows.
+    llm_timeout_ms: 1_800_000,
+    # Consecutive rule-gen :transient_abort rows → graceful halt (a real Mimo
+    # outage halts cleanly instead of churning the whole pending list).
+    transient_storm_limit: 5,
+    # Per-row persisted :transient_abort count → give the row up to too_slow/
+    # (so a consistently-too-slow row can't re-run + time out forever).
+    transient_row_limit: 3
   }
 
 config :logger,

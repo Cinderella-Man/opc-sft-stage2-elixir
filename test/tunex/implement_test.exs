@@ -28,6 +28,30 @@ defmodule Tunex.ImplementTest do
       assert Map.has_key?(tests, "EQUIVALENCE_TEST")
     end
 
+    test "strips an outer ```elixir fence off blocks so the file compiles (docs/10 Fix 2)" do
+      emit = """
+      ===RULE===
+      ```elixir
+      defmodule Credence.Pattern.NoFoo do
+      end
+      ```
+      ===CHECK_TEST===
+      defmodule X do
+      end
+      ===FIX_TEST===
+      defmodule Y do
+      end
+      ===EQUIVALENCE_TEST===
+      defmodule Z do
+      end
+      ===END===
+      """
+
+      assert {:ok, %{rule: rule}} = Output.parse(emit, mode: :new, phase: :pattern, assumptions?: false)
+      refute rule =~ "```"
+      assert {:ok, _} = Code.string_to_quoted(rule)
+    end
+
     test "pattern missing EQUIVALENCE_TEST is rejected" do
       emit = "===RULE===\nx\n===CHECK_TEST===\nx\n===FIX_TEST===\nx\n===END==="
       assert {:error, :pattern_missing_equivalence_test} = Output.parse(emit, mode: :new, phase: :pattern, assumptions?: false)

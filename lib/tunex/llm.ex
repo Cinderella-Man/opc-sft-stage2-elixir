@@ -51,7 +51,10 @@ defmodule Tunex.LLM do
 
     url = Keyword.get(opts, :url, Map.fetch!(config, :url))
     headers = Keyword.get(opts, :headers, Map.get(config, :headers, %{}))
-    timeout = Keyword.get(opts, :timeout, 600_000)
+    # receive_timeout for the call. Raised from the old hardcoded 600_000 to a
+    # config knob (docs/10) — the 26/28 escalated were slow `implement`
+    # generations cut off at the 10-min ceiling, not network blips.
+    timeout = Keyword.get(opts, :timeout, Config.llm_timeout_ms())
 
     body_params =
       config

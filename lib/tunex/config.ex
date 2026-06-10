@@ -74,6 +74,15 @@ defmodule Tunex.Config do
 
   def budget, do: Application.get_env(:tunex, :budget, %{})
 
+  @doc "receive_timeout (ms) for every LLM call (docs/10). Probe default 30 min."
+  def llm_timeout_ms, do: Map.get(budget(), :llm_timeout_ms, 1_800_000)
+
+  @doc "Consecutive rule-gen :transient_abort rows before a graceful halt."
+  def transient_storm_limit, do: Map.get(budget(), :transient_storm_limit, 5)
+
+  @doc "Per-row persisted :transient_abort count before giving the row up to too_slow/."
+  def transient_row_limit, do: Map.get(budget(), :transient_row_limit, 3)
+
   # ── Internal ────────────────────────────────────────────────────────
 
   defp stages, do: Application.get_env(:tunex, :stages, %{})

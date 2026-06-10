@@ -24,7 +24,7 @@ defmodule Tunex.Evolve.Router do
 
   require Logger
 
-  alias Tunex.{AppliedRules, Config, Credence, Equiv, Novelty, RowLog, RulePaths, SwitchProposal}
+  alias Tunex.{AppliedRules, Budget, Config, Credence, Equiv, Novelty, RowLog, RulePaths, SwitchProposal, TransientAttempts}
   alias Tunex.Classify
   alias Tunex.Implement
   alias Tunex.Implement.Naming
@@ -70,9 +70,17 @@ defmodule Tunex.Evolve.Router do
         dispatch(index, spec, log, clone, opts)
 
       {:error, {:classifier_errors, reason, _raw}} ->
-        Logger.warning("[Router] classifier error: #{inspect(reason)}")
-        RowLog.classifier_errors(index)
-        outcome(:classifier_error, nil)
+        # A transient LLM timeout / fatal auth error is handled don't-consume /
+        # halt (Fix 1); a genuine malformed-spec falls through to :other.
+        case rulegen_abort(index, reason, clone, opts, false) do
+          :other ->
+            Logger.warning("[Router] classifier error: #{inspect(reason)}")
+            RowLog.classifier_errors(index)
+            outcome(:classifier_error, nil)
+
+          out ->
+            out
+        end
     end
   end
 
@@ -160,15 +168,67 @@ defmodule Tunex.Evolve.Router do
         gate(index, decision_text, clone)
 
       {:gave_up, reason} ->
-        Logger.info("[Router] implementer gave_up: #{inspect(reason)}")
-        # The generator wrote stubs BEFORE the loop (new mode), so discard the
-        # clone tree on every post-scaffold abort (07 §5.0 dirty-tree path).
-        Gate.discard(clone)
-        Ledger.gave_up(index, "implementer gave_up: #{inspect(reason)}")
-        RowLog.escalate(index)
-        outcome(:gave_up, nil)
+        # A transient LLM timeout / fatal auth error is handled don't-consume /
+        # halt (Fix 1) — both still discard the dirty clone. A genuine give-up
+        # (retries_exhausted, ceiling, scaffold) falls through to :other.
+        case rulegen_abort(index, reason, clone, opts, true) do
+          :other ->
+            Logger.info("[Router] implementer gave_up: #{inspect(reason)}")
+            # The generator wrote stubs BEFORE the loop (new mode), so discard the
+            # clone tree on every post-scaffold abort (07 §5.0 dirty-tree path).
+            Gate.discard(clone)
+            Ledger.gave_up(index, "implementer gave_up: #{inspect(reason)}")
+            RowLog.escalate(index)
+            outcome(:gave_up, nil)
+
+          out ->
+            out
+        end
     end
   end
+
+  # ── Rule-gen LLM-error handling (docs/10 Fix 1) ─────────────────────────
+
+  # Classify a (possibly exhausted) rule-gen error. For a transient timeout:
+  # don't-consume (`:transient_abort`) until the per-row limit, then give up to
+  # `too_slow/`. For a fatal auth error: graceful halt (symmetric with
+  # orchestrator `stage/2`). A non-LLM error returns `:other` — the caller keeps
+  # its existing escalate / classifier_errors path. `discard?` is true on the
+  # implement path (a dirty scaffold/bugfix tree must be reverted).
+  defp rulegen_abort(index, reason, clone, opts, discard?) do
+    case rulegen_error_class(reason) do
+      :other ->
+        :other
+
+      :fatal ->
+        if discard?, do: Gate.discard(clone)
+        shutdown = Keyword.get(opts, :shutdown, &Tunex.shutdown/1)
+        shutdown.({:fatal_api, reason})
+        outcome(:fatal_abort, nil)
+
+      :transient ->
+        if discard?, do: Gate.discard(clone)
+        bump = Keyword.get(opts, :transient_attempts, &TransientAttempts.bump/1)
+        n = bump.(index)
+
+        if n >= Config.transient_row_limit() do
+          Logger.warning("[Router] transient timeout — row #{index} hit limit (#{n}) → too_slow")
+          RowLog.too_slow(index)
+          outcome(:too_slow, nil)
+        else
+          Logger.info("[Router] transient timeout — row #{index} (attempt #{n}) → not consuming")
+          RowLog.transient(index)
+          outcome(:transient_abort, nil)
+        end
+    end
+  end
+
+  # The Router has already destructured `{:llm_error, inner}` out of both
+  # `{:classifier_errors, reason, _}` and `{:gave_up, reason}`, so one clause
+  # covers both stages. Anything else (validation re-ask, retries_exhausted,
+  # ceilings, scaffold) is `:other`.
+  defp rulegen_error_class({:llm_error, inner}), do: Budget.classify_error(inner)
+  defp rulegen_error_class(_), do: :other
 
   defp gate(index, decision_text, clone) do
     case Gate.check(clone) do

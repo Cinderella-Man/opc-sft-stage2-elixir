@@ -16,7 +16,7 @@ defmodule Tunex.Implement.Output do
     * bugfix: `%{rule: content, tests: %{path => content}}`
   """
 
-  alias Tunex.Markers
+  alias Tunex.{Markers, Parser}
 
   @doc """
   `opts`:
@@ -26,7 +26,11 @@ defmodule Tunex.Implement.Output do
     * `:test_glob` — `[path]` of allowed bugfix test files.
   """
   def parse(text, opts) do
-    sections = Markers.split(text)
+    # Strip a stray outer code fence off EVERY block — the model mirrors the
+    # seed's fenced examples and wraps whole files in ```` ```elixir … ``` ````,
+    # which won't compile (docs/10 Fix 2). strip_outer_fences only touches the
+    # first/last fence, so a mid-file fence in a rule's @moduledoc survives.
+    sections = Markers.split(text) |> Enum.map(fn {k, v} -> {k, Parser.strip_outer_fences(v)} end)
 
     case Keyword.fetch!(opts, :mode) do
       :new -> parse_new(to_map(sections), Keyword.fetch!(opts, :phase), Keyword.get(opts, :assumptions?, false))

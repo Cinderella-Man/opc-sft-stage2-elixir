@@ -82,6 +82,34 @@ defmodule Tunex.ClassifyTest do
     test "rejects an unknown decision" do
       assert {:error, {:bad_decision, "MAYBE"}} = Parser.parse("===DECISION===\nMAYBE\n===END===")
     end
+
+    test "strips an outer ```elixir fence off BEFORE so it still parses (docs/10 Fix 2)" do
+      text = """
+      ===DECISION===
+      POTENTIAL_NEW_RULE
+      ===PROPOSED_NAME===
+      no_foo
+      ===PHASE===
+      pattern
+      ===BEFORE===
+      ```elixir
+      defmodule Bad do
+        def f(x), do: x
+      end
+      ```
+      ===AFTER===
+      defmodule Good do
+        def f(x), do: x
+      end
+      ===RATIONALE===
+      x
+      ===END===
+      """
+
+      assert {:ok, %Spec{before: before}} = Parser.parse(text)
+      refute before =~ "```"
+      assert {:ok, _} = Code.string_to_quoted(before)
+    end
   end
 
   describe "Prompt" do
@@ -107,6 +135,13 @@ defmodule Tunex.ClassifyTest do
     test "option-shaping: empty closed set drops BUGFIX" do
       assert "BUGFIX_RULE" not in Prompt.offered_decisions([])
       assert "BUGFIX_RULE" in Prompt.offered_decisions([:"Elixir.Foo"])
+    end
+
+    test "phase taxonomy is injected verbatim (docs/10 Fix 3)" do
+      user = Prompt.build(distilled_log: "x", closed_set: [], ledger: "", assumptions: [], solve_outcome: :failed)
+      assert user =~ Prompt.phase_taxonomy()
+      assert user =~ "Choosing PHASE"
+      assert user =~ "NEVER pattern"
     end
 
     test "failed lens differs from solved lens" do

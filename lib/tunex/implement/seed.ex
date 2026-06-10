@@ -25,6 +25,11 @@ defmodule Tunex.Implement.Seed do
 
   def system, do: @system
 
+  # Each output block holds the RAW file body. A leading/trailing ``` fence makes
+  # the file fail to compile (docs/10 Fix 2) — the output strip is the safety net,
+  # this line cuts the cause (the model otherwise mirrors the seed's fenced examples).
+  @no_fence "Emit each block's RAW file content — do NOT wrap it in ``` code fences."
+
   @doc "Build the user prompt from a context map (see moduledoc / T5.1)."
   def build(ctx) do
     [
@@ -177,12 +182,12 @@ defmodule Tunex.Implement.Seed do
 
   defp output_contract(%{mode: :bugfix, bugfix: bf}) do
     paths = Map.keys(bf.test_files) |> Enum.map(&"===TEST:#{&1}===") |> Enum.join("\n")
-    "## Output contract (whole files)\n===RULE===\n<rule.ex>\n#{paths}\n<each test file>\n===END==="
+    "## Output contract (whole files)\n#{@no_fence}\n===RULE===\n<rule.ex>\n#{paths}\n<each test file>\n===END==="
   end
 
   defp contract(roles) do
     body = Enum.map_join(roles, "\n", &"===#{&1}===\n<whole file>")
-    "## Output contract (whole files — emit each block in full)\n#{body}\n===END==="
+    "## Output contract (whole files — emit each block in full)\n#{@no_fence}\n#{body}\n===END==="
   end
 
   defp fence(content), do: "```\n#{String.trim_trailing(content || "")}\n```"
