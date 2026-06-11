@@ -60,6 +60,7 @@ defmodule Tunex.Config do
   def pi_thinking, do: Map.get(pi(), :thinking, "low")
   def pi_tools, do: Map.get(pi(), :tools, "read,bash,edit,write")
   def pi_timeout_ms, do: Map.get(pi(), :timeout_ms, 1_800_000)
+  def pi_idle_ms, do: Map.get(pi(), :idle_ms, 360_000)
 
   @doc "Which implement driver: `:llm` (single-call, default) or `:pi` (agent)."
   def implement_driver, do: Application.get_env(:tunex, :implement_driver, :llm)

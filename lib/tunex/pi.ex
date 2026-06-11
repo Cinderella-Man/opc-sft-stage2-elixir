@@ -74,8 +74,8 @@ defmodule Tunex.Pi do
         env: [{~c"TUNEX_MIMO_KEY", String.to_charlist(Config.pi_mimo_key())}]
       ])
 
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
     t0 = System.monotonic_time(:millisecond)
+    deadline = t0 + timeout_ms
 
     acc = %{
       buffer: "",
@@ -85,10 +85,11 @@ defmodule Tunex.Pi do
       stop: nil,
       error: nil,
       row: row,
-      t0: t0
+      t0: t0,
+      last_ms: t0
     }
 
-    collect(port, acc, deadline)
+    collect(port, acc, deadline, Config.pi_idle_ms())
   end
 
   defp zero_usage,
@@ -99,26 +100,41 @@ defmodule Tunex.Pi do
       "cache_creation_input_tokens" => 0
     }
 
-  defp collect(port, acc, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  defp collect(port, acc, deadline, idle_ms) do
+    now = System.monotonic_time(:millisecond)
+    wall_left = deadline - now
+    idle_left = acc.last_ms + idle_ms - now
 
-    if remaining <= 0 do
-      timeout(port, acc)
-    else
-      receive do
-        {^port, {:data, chunk}} -> collect(port, handle_chunk(acc, chunk), deadline)
-        {^port, {:exit_status, code}} -> finalize(acc, code)
-      after
-        remaining -> timeout(port, acc)
-      end
+    cond do
+      wall_left <= 0 ->
+        timeout(port, acc, :wall)
+
+      idle_left <= 0 ->
+        timeout(port, acc, :idle)
+
+      true ->
+        receive do
+          {^port, {:data, chunk}} ->
+            acc = handle_chunk(%{acc | last_ms: System.monotonic_time(:millisecond)}, chunk)
+            collect(port, acc, deadline, idle_ms)
+
+          {^port, {:exit_status, code}} ->
+            finalize(acc, code)
+        after
+          # wake at whichever cutoff is sooner, then re-evaluate which expired.
+          min(wall_left, idle_left) -> collect(port, acc, deadline, idle_ms)
+        end
     end
   end
 
-  defp timeout(port, acc) do
+  # :wall = total budget exhausted; :idle = no event for idle_ms (a stalled Mimo
+  # stream — caught in minutes instead of burning the whole wall-clock budget).
+  defp timeout(port, acc, kind) do
     kill(port)
-    Logger.warning("[Pi] TIMEOUT — killing agent (treated as gave_up)")
-    record_diag(acc, nil, "timeout")
-    {:gave_up, "timeout"}
+    reason = if kind == :idle, do: "idle_timeout", else: "timeout"
+    Logger.warning("[Pi] #{String.upcase(reason)} — killing agent (treated as gave_up)")
+    record_diag(acc, nil, reason)
+    {:gave_up, reason}
   end
 
   # ── Event handling ──────────────────────────────────────────────────

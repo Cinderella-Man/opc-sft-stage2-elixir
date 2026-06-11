@@ -54,6 +54,8 @@ defmodule Tunex.Implement do
 
     case pi.(prompt, cwd: ctx.clone, row: ctx[:row]) do
       {:ok, _result} ->
+        canonicalize_fix_tests(ctx)
+
         case focused_test(ctx) do
           :pass -> {:ok, result(ctx)}
           {:fail, failures} -> {:gave_up, {:pi_tests_red, String.slice(failures, 0, 400)}}
@@ -62,6 +64,26 @@ defmodule Tunex.Implement do
       {:gave_up, reason} ->
         {:gave_up, {:pi, reason}}
     end
+  end
+
+  # Deterministic cleanup before the Gate (docs/10): the agent can't byte-predict
+  # the rule's exact output, so its `expected =` heredocs are often wrong → the
+  # fix test fails → the (often correct) rule is rejected. `mix credence.fix_tests`
+  # rewrites `expected` to the rule's REAL output (the project's own convention),
+  # for free, no agent turns. Best-effort: a rule that doesn't compile is skipped
+  # there and caught by focused_test/the Gate as before.
+  defp canonicalize_fix_tests(ctx) do
+    fix_tests = ctx |> test_paths() |> Enum.filter(&String.ends_with?(&1, "_fix_test.exs"))
+
+    if fix_tests != [] do
+      System.cmd("mix", ["credence.fix_tests" | fix_tests],
+        cd: ctx.clone,
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", "test"}]
+      )
+    end
+  rescue
+    _ -> :ok
   end
 
   defp loop(ctx, seed, user, attempt, out_total, emit) do

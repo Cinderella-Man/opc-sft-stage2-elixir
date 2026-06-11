@@ -119,7 +119,12 @@ config :tunex,
     # rules need some reasoning. Tune against speed/quality.
     thinking: "low",
     tools: "read,bash,edit,write",
-    timeout_ms: 1_800_000
+    timeout_ms: 1_800_000,
+    # Idle cutoff: kill if NO agent event arrives for this long (a stalled Mimo
+    # stream otherwise burns the full timeout_ms — docs/10). Streaming emits
+    # deltas every few seconds during a real turn, so this only trips on a true
+    # stall; keep it well above the slowest single Mimo turn (~4.5 min observed).
+    idle_ms: 360_000
   },
 
   # ── Claude Code (rule-gen) — Mimo via the Anthropic-compatible endpoint
