@@ -55,6 +55,7 @@ defmodule Tunex.Implement do
     case pi.(prompt, cwd: ctx.clone, row: ctx[:row]) do
       {:ok, _result} ->
         canonicalize_fix_tests(ctx)
+        normalize_test_heredocs(ctx)
 
         case focused_test(ctx) do
           :pass -> {:ok, result(ctx)}
@@ -77,6 +78,23 @@ defmodule Tunex.Implement do
 
     if fix_tests != [] do
       System.cmd("mix", ["credence.fix_tests" | fix_tests],
+        cd: ctx.clone,
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", "test"}]
+      )
+    end
+  rescue
+    _ -> :ok
+  end
+
+  # Strip gratuitous heredoc trailing `\` from the rule's test files before the
+  # Gate (docs/10). Verified-safe per file (it re-runs each test, reverts on red),
+  # so it can only tidy — never break a green suite.
+  defp normalize_test_heredocs(ctx) do
+    tests = ctx |> test_paths() |> Enum.filter(&String.ends_with?(&1, "_test.exs"))
+
+    if tests != [] do
+      System.cmd("mix", ["credence.normalize_tests" | tests],
         cd: ctx.clone,
         stderr_to_stdout: true,
         env: [{"MIX_ENV", "test"}]
