@@ -229,6 +229,10 @@ defmodule Tunex.Evolve.Router do
   # covers both stages. Anything else (validation re-ask, retries_exhausted,
   # ceilings, scaffold) is `:other`.
   defp rulegen_error_class({:llm_error, inner}), do: Budget.classify_error(inner)
+  # A pi/agent timeout (wall or idle) is infra/transient, NOT a dead-end idea —
+  # don't poison decisions.md with it; re-run next pass (bounded by the per-row
+  # too_slow limit) like any transient (docs/10).
+  defp rulegen_error_class({:pi, r}) when r in ["timeout", "idle_timeout"], do: :transient
   defp rulegen_error_class(_), do: :other
 
   defp gate(index, decision_text, clone) do

@@ -5,7 +5,7 @@ defmodule Tunex.Preflight do
 
   Order: static checks (clone/branch/CLI/secrets) → reconciliation → runtime
   checks (clean tree, implement-driver smoke, Mimo chat reachable, classify
-  reachable, local solve endpoint reachable, credence compiles). The
+  reachable, local solve endpoint reachable, credence HEAD suite green). The
   implement-driver smoke validates the agent end-to-end — for `:pi`, a one-shot
   `pi` session (CLI + Mimo provider extension + key + reachability) — so a broken
   rule-builder fails *boot*, not every row. The solve-endpoint check catches a
@@ -142,7 +142,7 @@ defmodule Tunex.Preflight do
     mimo_chat_reachable!()
     solve_endpoint_reachable!()
     classify_endpoint_reachable!()
-    credence_compiles!(clone)
+    credence_suite_green!(clone)
   end
 
   # The classifier (07 §3.1) carries the single hardest judgment and may be
@@ -245,12 +245,25 @@ defmodule Tunex.Preflight do
   defp local_url?(url),
     do: String.contains?(url, "localhost") or String.contains?(url, "127.0.0.1")
 
-  defp credence_compiles!(clone) do
+  # HEAD must be fully GREEN before the run — not just compile. A pre-existing
+  # red suite (e.g. a landed rule missing a test) otherwise makes the Gate's
+  # full-suite check reject EVERY new rule via :full_suite_red and poison
+  # decisions.md with valid proposals (docs/10). Failing boot here turns that
+  # silent stall into a loud, actionable halt, and guarantees a runtime
+  # :full_suite_red is genuinely the new rule's regression.
+  defp credence_suite_green!(clone) do
     {out, code} =
-      System.cmd("mix", ["compile"], cd: clone, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
+      System.cmd("mix", ["test"], cd: clone, stderr_to_stdout: true, env: [{"MIX_ENV", "test"}])
 
     unless code == 0 do
-      fail("Credence does not compile in #{clone}:\n#{out}")
+      tail = out |> String.split("\n") |> Enum.take(-40) |> Enum.join("\n")
+
+      fail("""
+      Credence HEAD suite is NOT green in #{clone} (mix test exit #{code}).
+      A red HEAD makes the Gate reject every rule (:full_suite_red). Fix the clone
+      (add the missing test / revert the offending rule), then re-run. Tail:
+      #{tail}
+      """)
     end
   end
 
