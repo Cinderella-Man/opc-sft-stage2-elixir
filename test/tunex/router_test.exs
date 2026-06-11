@@ -62,14 +62,20 @@ defmodule Tunex.Evolve.RouterTest do
     assert moved?("classifier_errors", 3)
   end
 
-  test "POTENTIAL_NEW_RULE that is COVERED moves to duplicate/" do
+  test "POTENTIAL_NEW_RULE that is COVERED no longer skips — builds anyway (docs/10 A)" do
     write_log(4, "log\n")
     spec = %Spec{decision: :potential_new_rule, phase: :pattern, proposed_name: "no_foo", before: "defmodule B do\nend", after: "defmodule A do\nend"}
     classify = fn _l, _o, _opts -> {:ok, spec} end
     novelty = fn _before, _clone -> :covered end
+    # :covered is now a non-blocking note — the row proceeds to equiv (here
+    # DIVERGES), it does NOT skip to duplicate/.
+    equiv = fn _spec -> {:diverges, "x"} end
 
-    assert %{outcome: :duplicate} = Router.run(4, :solved, "/x", classify: classify, novelty: novelty)
-    assert moved?("duplicate", 4)
+    assert %{outcome: :behaviour_diverged} =
+             Router.run(4, :solved, "/x", classify: classify, novelty: novelty, equiv: equiv)
+
+    refute moved?("duplicate", 4)
+    assert moved?("behaviour_diverged", 4)
   end
 
   test "POTENTIAL_NEW_RULE NOVEL but equiv DIVERGES moves to behaviour_diverged/" do

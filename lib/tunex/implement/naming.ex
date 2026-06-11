@@ -44,18 +44,31 @@ defmodule Tunex.Implement.Naming do
     end
   end
 
-  # First free snake name (`base`, then `base_2`, `base_3`, …) by checking the
+  # First free snake name (`base`, then `base2`, `base3`, …) by checking the
   # clone's `lib/<phase>/<snake>.ex` — independent of pattern novelty (§3.8).
+  #
+  # Names are CANONICALIZED to exactly what `gen.rule` writes: it derives the file
+  # from the camelized module, which drops the underscore before a trailing digit
+  # (`use_map_join_2` → `UseMapJoin2` → `use_map_join2.ex`). Without this,
+  # `free_snake` would check `use_map_join_2.ex` (never written) and keep
+  # re-proposing `_2` → gen.rule aborts on the real collision (`_3` unreachable),
+  # and the `test_paths` glob (`<snake>*_test.exs`) would miss the real files.
+  # Canonicalizing keeps `snake` == the on-disk basename so collisions progress.
   defp free_snake(base, phase, clone) do
+    base = canonical(base)
+
     if rule_exists?(base, phase, clone) do
       Enum.find_value(2..99, "#{base}_collision", fn n ->
-        cand = "#{base}_#{n}"
+        cand = canonical("#{base}_#{n}")
         if rule_exists?(cand, phase, clone), do: false, else: cand
       end)
     else
       base
     end
   end
+
+  # The basename gen.rule will actually produce for `snake`.
+  defp canonical(snake), do: Macro.underscore(Macro.camelize(snake))
 
   defp rule_exists?(snake, phase, clone),
     do: File.exists?(Path.join(clone, "lib/#{phase}/#{snake}.ex"))

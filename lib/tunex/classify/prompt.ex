@@ -161,6 +161,10 @@ defmodule Tunex.Classify.Prompt do
 
     ## Rules that already fired on this row (the BUGFIX closed set)
     #{closed_set_block(closed)}
+    These rules ALREADY engaged on this row — Credence handled what they target.
+    Do NOT propose a POTENTIAL_NEW_RULE for an idiom one of them already fixes;
+    that is already covered. (If such a rule MIS-fired or under-fired, that's a
+    BUGFIX_RULE, not a new rule.)
 
     ## Dead-ends already tried (do NOT re-propose)
     #{ledger_block(Keyword.get(opts, :ledger, ""))}

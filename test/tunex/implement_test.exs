@@ -181,6 +181,33 @@ defmodule Tunex.ImplementTest do
   describe "Naming.resolve_and_scaffold/3 (real clone — integration)" do
     @describetag :integration
 
+    test "name collisions progress _2/_3 with snake matching the on-disk file (docs/10)" do
+      clone = Tunex.Config.credence_clone()
+      base = "no_tunex_collision_probe"
+
+      on_exit(fn ->
+        for suffix <- ["", "2", "3"] do
+          File.rm(Path.join(clone, "lib/pattern/#{base}#{suffix}.ex"))
+          for k <- ~w(check fix equivalence),
+              do: File.rm(Path.join(clone, "test/pattern/#{base}#{suffix}_#{k}_test.exs"))
+        end
+      end)
+
+      {:ok, s1} = Naming.resolve_and_scaffold(base, :pattern, clone)
+      {:ok, s2} = Naming.resolve_and_scaffold(base, :pattern, clone)
+      {:ok, s3} = Naming.resolve_and_scaffold(base, :pattern, clone)
+
+      assert s1.snake == base
+      assert s2.snake == "#{base}2"
+      assert s3.snake == "#{base}3"
+
+      # snake must equal the actual lib file's basename (the canonicalization fix).
+      for s <- [s1, s2, s3] do
+        libfile = Enum.find(s.paths, &String.starts_with?(&1, "lib/"))
+        assert libfile == "lib/pattern/#{s.snake}.ex"
+      end
+    end
+
     test "generates honest-red stubs that fail their own focused test, then clean up" do
       clone = Tunex.Config.credence_clone()
       name = "no_tunex_scaffold_probe"

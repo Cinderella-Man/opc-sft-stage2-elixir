@@ -102,17 +102,18 @@ defmodule Tunex.Evolve.Router do
   end
 
   defp dispatch(index, %{decision: :potential_new_rule} = spec, log, clone, opts) do
+    # docs/10: the synthetic-`before` covers check is UNSOUND as a SKIP gate — it
+    # flags rules that never fired on the real code (a check re-run on a tidied-up
+    # snippet), which suppressed genuinely-novel rules. If the idiom survived this
+    # row's solve (which already ran Credence.fix), it was NOT handled in practice
+    # → build it. `covers` is kept only as a NON-BLOCKING overlap note.
     novelty = Keyword.get(opts, :novelty, &Novelty.check/2)
 
-    case novelty.(spec.before, clone) do
-      :covered ->
-        Logger.info("[Router] novelty: COVERED — duplicate")
-        RowLog.duplicate(index)
-        outcome(:duplicate, :potential_new_rule)
-
-      :novel ->
-        new_rule_after_equiv(index, spec, log, clone, opts)
+    if novelty.(spec.before, clone) == :covered do
+      Logger.info("[Router] note: an existing rule may overlap this idiom (non-blocking) — building anyway")
     end
+
+    new_rule_after_equiv(index, spec, log, clone, opts)
   end
 
   defp new_rule_after_equiv(index, spec, log, clone, opts) do
