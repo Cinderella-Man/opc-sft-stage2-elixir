@@ -116,6 +116,8 @@ defmodule Tunex.ImplementTest do
       assert user =~ "Type-change ban"
       assert user =~ "EQUIVALENCE_TEST"
       assert user =~ "AST dumps"
+      # the before/after are a fixable sketch, not gospel (docs/10)
+      assert user =~ "ONE-SHOT proposal"
     end
 
     test "pi driver: same context, but an AGENT task instead of the marker contract (docs/10)" do

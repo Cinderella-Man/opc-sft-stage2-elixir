@@ -88,5 +88,20 @@ defmodule Tunex.EquivTest do
 
       assert Equiv.check(spec) == :skipped
     end
+
+    test "skips (NOT diverges) when the after body calls a module-local helper (docs/10)" do
+      # The extracted `after` expression `do_count(n, 1, 1)` can't compile
+      # standalone (the helper lives elsewhere in the module). That's not a
+      # behaviour divergence — it's an inapplicable expression-level check — so
+      # it must defer to the Gate's full-module equivalence test, not reject.
+      spec = %Tunex.Classify.Spec{
+        decision: :potential_new_rule,
+        before: "defmodule B do\n  def run(n), do: n + 0\nend",
+        after: "defmodule A do\n  def run(n), do: do_count(n, 1, 1)\nend",
+        assumptions: []
+      }
+
+      assert Equiv.check(spec) == :skipped
+    end
   end
 end

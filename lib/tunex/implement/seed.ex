@@ -113,8 +113,15 @@ defmodule Tunex.Implement.Seed do
     BEFORE (the offending / non-idiomatic snippet):
     #{fence(s.before)}
 
-    AFTER (the idiomatic rewrite — fix/2 must produce this):
+    AFTER (the INTENDED idiomatic result — your fix should realize this):
     #{fence(s.after)}
+
+    NOTE: before/after are a ONE-SHOT proposal and may be incomplete or fail to
+    compile on their own (e.g. a helper they call isn't shown, a stray ``` fence,
+    a typo). They convey the INTENDED idiom — they are NOT gospel. Your rule,
+    tests, and fixtures must actually COMPILE and pass `mix test`: fix that kind of
+    MECHANICAL breakage yourself instead of faithfully reproducing a broken
+    snippet. Do NOT change WHAT the rule detects or the behaviour it must preserve.
     """
   end
 

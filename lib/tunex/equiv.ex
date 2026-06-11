@@ -94,7 +94,22 @@ defmodule Tunex.Equiv do
   end
 
   defp interpret("REPAIR" <> rest), do: {:repair, String.trim(rest)}
-  defp interpret("DIVERGES" <> rest), do: {:diverges, String.trim(rest)}
+
+  defp interpret("DIVERGES" <> rest) do
+    rest = String.trim(rest)
+
+    if String.contains?(rest, "does not compile") do
+      # Not a behaviour divergence — the expression-level extract couldn't be
+      # COMPILED standalone (e.g. the def body calls a private helper that isn't
+      # in the bare extracted expression). The equiv check is simply inapplicable
+      # here, so defer to the Gate's full-module `_equivalence_test` instead of
+      # rejecting a (likely valid) rule into behaviour_diverged/ (docs/10).
+      :skipped
+    else
+      {:diverges, rest}
+    end
+  end
+
   defp interpret(_), do: :skipped
 
   # " minimal_set=[single_codepoint_graphemes]" → [:single_codepoint_graphemes];
