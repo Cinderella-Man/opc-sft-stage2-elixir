@@ -171,11 +171,38 @@ defmodule Tunex.Preflight do
   end
 
   # Smoke the IMPLEMENT driver end-to-end so a broken agent fails *boot*, not
-  # every row mid-run. :pi runs a one-shot pi session in a temp dir (proves CLI +
-  # extension + Mimo key + Mimo reachable through pi); :llm is already covered by
-  # the chat-endpoint smokes below (implement uses the same provider as classify).
+  # every row mid-run. :pi / :cc run a one-shot agent session in a temp dir
+  # (proves CLI + creds + Mimo reachable through the harness); :llm is already
+  # covered by the chat-endpoint smokes below (implement uses the same provider
+  # as classify).
   defp rule_gen_smoke! do
-    if Config.implement_driver() == :pi, do: pi_smoke!()
+    case Config.implement_driver() do
+      :pi -> pi_smoke!()
+      :cc -> cc_smoke!()
+      _ -> :ok
+    end
+  end
+
+  defp cc_smoke! do
+    tmp = Path.join(System.tmp_dir!(), "tunex_cc_smoke_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp)
+
+    try do
+      case Tunex.ClaudeCode.run("Reply with exactly: OK", cwd: tmp, max_turns: 2, timeout_ms: 90_000) do
+        {:ok, %{is_error: false, result_text: text}} ->
+          Logger.info("[Preflight] cc smoke OK: #{String.slice(text, 0, 40)}")
+
+        other ->
+          fail("""
+          Claude Code agent smoke test failed: #{inspect(other)}
+          Check: `claude` on PATH, the claude_code_auth_token in config/secrets.exs,
+          claude_code.base_url/model in config.exs, and that Mimo is reachable.
+          Or set implement_driver: :llm to use the single-call driver.
+          """)
+      end
+    after
+      File.rm_rf!(tmp)
+    end
   end
 
   defp pi_smoke! do

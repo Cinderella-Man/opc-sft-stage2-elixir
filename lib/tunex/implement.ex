@@ -17,7 +17,7 @@ defmodule Tunex.Implement do
 
   require Logger
 
-  alias Tunex.{Config, LLM, Pi}
+  alias Tunex.{ClaudeCode, Config, LLM, Pi}
   alias Tunex.Implement.{Output, Seed}
 
   @doc """
@@ -33,10 +33,14 @@ defmodule Tunex.Implement do
   """
   def run(ctx, opts \\ []) do
     case Keyword.get(opts, :driver, Config.implement_driver()) do
-      :pi -> run_pi(ctx, opts)
+      :pi -> run_agent(ctx, opts, agent_fun(opts, &Pi.run/2), :pi)
+      :cc -> run_agent(ctx, opts, agent_fun(opts, &cc_run/2), :cc)
       _ -> run_llm(ctx, opts)
     end
   end
+
+  # The agent fn is injectable (tests pass `:pi`); otherwise the driver default.
+  defp agent_fun(opts, default), do: Keyword.get(opts, :pi, default)
 
   defp run_llm(ctx, opts) do
     emit = Keyword.get(opts, :emit, &default_emit/2)
@@ -44,26 +48,45 @@ defmodule Tunex.Implement do
     loop(ctx, seed, seed, 1, 0, emit)
   end
 
-  # Agentic driver: the router already wrote the scaffold stubs into the clone
-  # (new mode) or the rule+tests are already there (bugfix), so pi edits them in
-  # place. After it finishes we re-run the focused tests ourselves — a green
-  # claim from the agent is not trusted.
-  defp run_pi(ctx, opts) do
-    pi = Keyword.get(opts, :pi, &Pi.run/2)
+  # Agentic driver (`:pi` or `:cc`): the router already wrote the scaffold stubs
+  # into the clone (new mode) or the rule+tests are already there (bugfix), so the
+  # agent edits them in place. After it finishes we re-run the focused tests
+  # ourselves — a green claim from the agent is not trusted. The prompt and
+  # verification are harness-agnostic; `tag` (`:pi`/`:cc`) only labels the
+  # give-up reason so the router classifies a `{tag, "timeout"}` as transient.
+  defp run_agent(ctx, _opts, agent, tag) do
     prompt = Seed.build(ctx, driver: :pi)
 
-    case pi.(prompt, cwd: ctx.clone, row: ctx[:row]) do
+    case agent.(prompt, cwd: ctx.clone, row: ctx[:row]) do
       {:ok, _result} ->
         canonicalize_fix_tests(ctx)
         normalize_test_heredocs(ctx)
 
         case focused_test(ctx) do
           :pass -> {:ok, result(ctx)}
-          {:fail, failures} -> {:gave_up, {:pi_tests_red, String.slice(failures, 0, 400)}}
+          {:fail, failures} -> {:gave_up, {tests_red_tag(tag), String.slice(failures, 0, 400)}}
         end
 
       {:gave_up, reason} ->
-        {:gave_up, {:pi, reason}}
+        {:gave_up, {tag, reason}}
+    end
+  end
+
+  defp tests_red_tag(:pi), do: :pi_tests_red
+  defp tests_red_tag(:cc), do: :cc_tests_red
+
+  # Adapter: map the ClaudeCode contract onto the agent contract `run_agent`
+  # expects (`{:ok, result}` | `{:gave_up, reason}`). CC reports a hung/over-long
+  # session inside the result `subtype` (NOT a top-level `:gave_up`), and its
+  # `:decision` is generator-flow-specific (it parses a `DECISION` line the
+  # implement agent never emits), so we key off `subtype` and otherwise hand the
+  # result to `focused_test`, which is the real judge.
+  defp cc_run(prompt, opts) do
+    case ClaudeCode.run(prompt, opts) do
+      {:ok, %{subtype: "error_timeout"}} -> {:gave_up, "timeout"}
+      {:ok, %{subtype: "error_max_turns"}} -> {:gave_up, "max turns reached"}
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:gave_up, "cc_error: #{inspect(reason)}"}
     end
   end
 

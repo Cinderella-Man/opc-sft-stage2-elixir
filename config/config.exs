@@ -106,11 +106,12 @@ config :tunex,
   rule_gen_output_ceiling: 480_000,
 
   # ── Implement driver (docs/10) ──────────────────────────────────────
-  # :pi (default) = hand the same rich context to the `pi` coding agent, which
-  # fills the on-disk stubs, runs `mix test`, and loops itself (fixes the
-  # single-call timeout via many small fast turns). :llm = the old single-shot
-  # emit→write→test loop. Set TUNEX-style config to :llm to fall back.
-  implement_driver: :pi,
+  # :cc = hand the rich context to the Claude Code agent (Mimo via the
+  # Anthropic-compatible endpoint); it fills the on-disk stubs, runs `mix test`,
+  # and loops itself (config under `claude_code:` below). :pi = the same agentic
+  # loop driven by the `pi` CLI instead. :llm = the old single-shot
+  # emit→write→test loop. All three re-verify with our own focused `mix test`.
+  implement_driver: :cc,
   pi: %{
     extension: "pi/mimo_provider.ts",
     provider: "mimo",

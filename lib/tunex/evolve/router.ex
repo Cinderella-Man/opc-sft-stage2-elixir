@@ -233,6 +233,7 @@ defmodule Tunex.Evolve.Router do
   # don't poison decisions.md with it; re-run next pass (bounded by the per-row
   # too_slow limit) like any transient (docs/10).
   defp rulegen_error_class({:pi, r}) when r in ["timeout", "idle_timeout"], do: :transient
+  defp rulegen_error_class({:cc, r}) when r in ["timeout", "idle_timeout"], do: :transient
   defp rulegen_error_class(_), do: :other
 
   defp gate(index, decision_text, clone) do

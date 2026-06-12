@@ -144,6 +144,30 @@ defmodule Tunex.ImplementTest do
       refute user =~ "===RULE==="
     end
 
+    test "cc driver: an agent give-up is tagged {:cc, reason} so the router routes it transient" do
+      ctx = %{
+        mode: :new,
+        phase: :pattern,
+        spec: %{before: "defmodule B do\nend", after: "defmodule A do\nend", rationale: "x", assumptions: []},
+        scaffold: %{phase: :pattern, snake: "no_foo"},
+        scaffold_files: %{"lib/pattern/no_foo.ex" => "defmodule Credence.Pattern.NoFoo do\nend"},
+        ast_before: "a",
+        ast_after: "b",
+        minimal_set: [],
+        repair?: false,
+        clone: "/nonexistent",
+        row: 7
+      }
+
+      # The :cc driver accepts the same injectable agent fn as :pi; a give-up
+      # must be wrapped under the :cc tag (NOT :pi) so `rulegen_error_class/1`
+      # classifies a "timeout" as transient rather than a dead-end.
+      agent = fn _prompt, _opts -> {:gave_up, "timeout"} end
+
+      assert {:gave_up, {:cc, "timeout"}} =
+               Tunex.Implement.run(ctx, driver: :cc, pi: agent)
+    end
+
     test "semantic seed carries the real diagnostic, not an AST dump" do
       ctx = %{
         mode: :new,
