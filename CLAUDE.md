@@ -63,6 +63,10 @@ TUNEX_RUN=1 mix run --no-halt
   already proven and a paid smoke call is avoided).
 - `pipeline/{translate,round_trip,solve}.ex` — the three model stages. RoundTrip writes the single `Cache.put`.
 - `evolve/{credence_rule_generator,gate,git,ledger}.ex` — drive the agent, the 5-part Gate, commit→push, ledger.
+- `evolve/corpus.ex` — deterministic (0-token) reader for Credence's real-world over-firing corpus snapshot
+  (`../credence/docs/09`). On a Gate full-suite reject it classifies the failure: `:over_fire` (NEW corpus
+  findings → a bad rule to DROP) vs `:narrowing` (GONE findings → a legit fix to ACCEPT+re-pin) vs non-corpus
+  (an ordinary broken-rule reject). `persist_reject/2` writes `escalated/<index>.patch` + `<index>.corpus.md`.
 - `claude_code.ex` — Claude Code subprocess: **stream-json over a Port** (live `step N` logs + wall-clock
   timeout). NOTE: logged `step N` = streamed assistant messages, NOT `--max-turns` (Mimo emits many/turn).
 - `cache.ex` / `budget.ex` / `row_log.ex` / `config.ex` / `llm.ex` / `validator.ex` / `workspace.ex`.
@@ -71,9 +75,15 @@ TUNEX_RUN=1 mix run --no-halt
 
 ## Storage (var/, gitignored)
 - `var/cache/translations.jsonl` — translations + blacklist verdicts (survives `tunex.reset`).
-- `var/run/` — regenerable: `progress`, `seed`, `decisions.md` (dead-end ledger), SFT output, `escalated/`
-  (gave_up/reject/phantom logs), `committed/` (landed-rule logs + CC JSON transcript), `workspace/`, `logs/`,
-  + **observability ledgers**: `usage.jsonl` (per paid call: exact tokens + provider + row + est cost),
+- `var/run/` — regenerable: `progress`, `seed`, `decisions.md` (dead-end ledger), SFT output, `workspace/`,
+  and **`logs/`** — the SINGLE source for per-row logs: the one currently-running row is `logs/<index>.log`,
+  and every recognised outcome is a categorised subfolder the finished log MOVES into (`logs/escalated/`,
+  `logs/committed/`, `logs/no_action/`, `logs/duplicate/`, `logs/behaviour_diverged/`, `logs/switch_proposals/`,
+  `logs/classifier_errors/`, `logs/transient/`, `logs/too_slow/`). `logs/committed/` also holds the CC JSON
+  transcript; a corpus reject drops `logs/escalated/<index>.patch` (the agent's preserved diff) +
+  `<index>.corpus.md` (NEW/GONE findings + drop-or-accept commands). Dir names + nesting live in `RowLog`
+  (`outcome_dirs/0`, `outcome_path/1`).
+  + **observability ledgers** (flat in `var/run/`): `usage.jsonl` (per paid call: exact tokens + provider + row + est cost),
   `rows.jsonl` (per row: outcome + timing + `cost_est`), `heartbeat.jsonl` (5-min spend time-series),
   `diag.jsonl` (verbatim per-interaction capture: full chat usage + response headers, CC usage/modelUsage/
   timings, for EVERY outcome — the raw reconciliation feedstock).
@@ -85,6 +95,15 @@ TUNEX_RUN=1 mix run --no-halt
   `[progress]`/`[Budget] HEARTBEAT`/`[ClaudeCode] USAGE RECON` log lines; `Tunex.Budget.stats/0`.
 
 ## Non-obvious facts / gotchas (don't re-litigate)
+- **Corpus over-fire policy = BLOCK-AT-GATE, not auto-fix (decided 2026-06-13; see `docs/11`).** Credence's
+  over-firing corpus is a snapshot ratchet in its default `mix test` (`../credence/docs/09`). The Gate's
+  full-suite check runs that suite for FREE (harness `System.cmd`, 0 tokens) → a new rule that over-fires on
+  real code is rejected automatically; a corpus reject is **escalated** (patch preserved) for the maintainer
+  to DROP or ACCEPT+re-pin (`mix credence.corpus --update-snapshot`). Deliberately NOT excluded from the Gate
+  and NOT an auto-fix loop. **Lever 1 (token saving):** the rule-gen agent must run ONLY focused tests, NEVER
+  the full `mix test` — the token-free Gate is the single full-suite enforcer; the agent re-running it dumps
+  the (corpus-laden) output into context, re-sent every turn (the ~92% re-send). Enforced in
+  `implement/seed.ex` (live path) + the dormant generator prompt.
 - **Logs are intentionally FULL/untruncated** (the point is to see exactly what happened); only short-SHA +
   commit-subject are clipped.
 - **Git push needs a noreply email** — a real email → `GH007 "would publish a private email"` → silent

@@ -103,7 +103,7 @@ row that reached solve  (success OR failed — §3.3; failed rows feed new-synta
    │   input:  distilled log + APPLIED_RULES + decisions.md ledger
    │   output: marker-fenced thick spec  (see §4)
    │
-   ├── NO_ACTION ─────────────► log → var/run/no_action/<idx>.log         (no model work)
+   ├── NO_ACTION ─────────────► log → var/run/logs/no_action/<idx>.log     (no model work)
    │
    ├── BUGFIX_RULE ───────────► [IMPLEMENTER: bugfix mode]
    │      (rule_name ∈ APPLIED_RULES)        edit existing rule + its tests in place
@@ -885,7 +885,7 @@ is a clean rare-text class) there is no `===AFTER===`/build; instead a `===PROPO
 
 ### 4.3 Deterministic validation gates
 
-Parse + validate; on failure → **one re-ask**; if still invalid → log to `var/run/classifier_errors/<idx>`.
+Parse + validate; on failure → **one re-ask**; if still invalid → log to `var/run/logs/classifier_errors/<idx>`.
 
 - `decision` ∈ the **offered** set (respects option-shaping §3.3).
 - `BUGFIX_RULE` ⇒ `rule_name` ∈ `APPLIED_RULES` **and** resolves to an existing `lib/<phase>/<name>.ex`.

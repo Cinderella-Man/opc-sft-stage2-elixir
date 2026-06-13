@@ -23,7 +23,7 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
   require Logger
 
   alias Tunex.{ClaudeCode, Config, RowLog}
-  alias Tunex.Evolve.{Gate, Git, Ledger}
+  alias Tunex.Evolve.{Corpus, Gate, Git, Ledger}
 
   @task ~S"""
   You improve Credence — an Elixir AST linter — by writing/extending/fixing
@@ -108,7 +108,10 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
      idiomatic correct code): implement the rule under lib/<phase>/, add a
      regression test under test/<phase>/ that FAILS without the rule (ideally also
      a must-NOT-fire-on-good-code case), run `mix test test/<phase>/<rule>_test.exs`
-     until green, then run the full `mix test` ONCE. You cannot run git.
+     until green. Do NOT run the full `mix test` — a separate deterministic gate
+     runs the whole suite (including the real-world over-firing corpus) for you;
+     spending turns on it only burns budget re-sending its output. You cannot run
+     git.
 
      CHECK-ONLY rules are first-class — use them when a clean auto-fix is too
      complex (e.g. the fix needs many coordinated edits or an algorithm rewrite).
@@ -200,7 +203,10 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
         %{outcome: :committed, usage: result.usage, decision: result.decision}
 
       {:reject, reason} ->
-        # Gate already discarded the tree.
+        # Gate already discarded the tree. For a corpus-only reject we persist
+        # the agent's patch + a readable finding report to escalated/ so it is a
+        # drop-or-accept decision, not a re-derive-from-scratch one.
+        reason = Corpus.persist_reject(index, reason)
         Ledger.gate_reject(index, reason, decision_text(result.decision))
         RowLog.escalate(index)
         %{outcome: {:rejected, reason}, usage: result.usage, decision: result.decision}
@@ -238,7 +244,7 @@ defmodule Tunex.Evolve.CredenceRuleGenerator do
   defp decision_text({:rule_proposal, line}), do: String.slice(line, 0, 80)
 
   defp save_transcript(index, result) do
-    path = Path.join(Config.run_path("committed"), "#{index}.json")
+    path = Path.join(RowLog.outcome_path("committed"), "#{index}.json")
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, Jason.encode!(result.raw))
   end

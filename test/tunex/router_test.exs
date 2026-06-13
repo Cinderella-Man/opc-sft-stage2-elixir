@@ -26,7 +26,7 @@ defmodule Tunex.Evolve.RouterTest do
     path
   end
 
-  defp moved?(dir, idx), do: File.exists?(Path.join(Tunex.Config.run_path(dir), "#{idx}.log"))
+  defp moved?(dir, idx), do: File.exists?(Path.join(Tunex.RowLog.outcome_path(dir), "#{idx}.log"))
 
   test "NO_ACTION moves the log to no_action/", %{tmp: _tmp} do
     write_log(1, "no rules fired\n")
@@ -51,7 +51,7 @@ defmodule Tunex.Evolve.RouterTest do
     assert %{outcome: :switch_proposal} = Router.run(2, :failed, "/x", classify: classify)
     assert moved?("switch_proposals", 2)
     # the proposal record file exists too
-    assert File.exists?(Path.join(Tunex.Config.run_path("switch_proposals"), "2.json"))
+    assert File.exists?(Path.join(Tunex.RowLog.outcome_path("switch_proposals"), "2.json"))
   end
 
   test "classifier error moves to classifier_errors/" do

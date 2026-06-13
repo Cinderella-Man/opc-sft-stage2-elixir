@@ -28,7 +28,7 @@ defmodule Tunex.Evolve.Router do
   alias Tunex.Classify
   alias Tunex.Implement
   alias Tunex.Implement.Naming
-  alias Tunex.Evolve.{Gate, Git, Ledger}
+  alias Tunex.Evolve.{Corpus, Gate, Git, Ledger}
 
   def run(index, solve_outcome, clone \\ Config.credence_clone(), opts \\ []) do
     RowLog.filesync()
@@ -245,7 +245,10 @@ defmodule Tunex.Evolve.Router do
         outcome(:committed, decision_text)
 
       {:reject, reason} ->
-        # Gate already discarded the working tree.
+        # Gate already discarded the working tree. A corpus over-fire/narrowing
+        # reject preserves the agent's patch + a drop-or-accept report under
+        # escalated/ (deterministic; no model call).
+        reason = Corpus.persist_reject(index, reason)
         Ledger.gate_reject(index, reason, decision_text)
         RowLog.escalate(index)
         outcome({:rejected, reason}, decision_text)

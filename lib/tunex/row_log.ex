@@ -12,12 +12,17 @@ defmodule Tunex.RowLog do
   add) rather than an in-place path swap. Rows take minutes, so the per-row
   add/remove cost is negligible.
 
+  Layout — EVERYTHING lives under `var/run/logs/`: the single currently-running
+  row is `var/run/logs/<index>.log`, and each recognised outcome is a categorised
+  subfolder (`var/run/logs/escalated/`, `…/committed/`, …) the finished log MOVES
+  into. So `logs/` is "one live file + one folder per event type".
+
   Lifecycle per row (plan #15 routing table):
     * `open(index)`  — fresh handler → `var/run/logs/<index>.log`
     * `path/1`       — current log path (rule-gen reads after `filesync/0`)
     * `close/1`      — delete the log (ordinary success / no_opportunity)
-    * `escalate/1`   — move to `escalated/<index>.log` (dead-end / phantom / reject)
-    * `commit/1`     — move to `committed/<index>.log` (rule landed)
+    * `escalate/1`   — move to `logs/escalated/<index>.log` (dead-end / phantom / reject)
+    * `commit/1`     — move to `logs/committed/<index>.log` (rule landed)
   """
 
   require Logger
@@ -26,19 +31,22 @@ defmodule Tunex.RowLog do
 
   @handler :row_file
 
-  # Classifier-split outcome dirs (07 §8). Nothing is deleted — every outcome
-  # MOVES the log to its dir (08 T6.2/T6.5).
+  # Classifier-split outcome dirs (07 §8), all nested UNDER logs/. Nothing is
+  # deleted — every outcome MOVES the log to its dir (08 T6.2/T6.5).
   @outcome_dirs ~w(escalated committed no_action duplicate behaviour_diverged switch_proposals classifier_errors transient too_slow)
 
-  @doc "Create the run-scoped log dirs. Safe to call at boot."
+  @doc "Create the run-scoped log dirs (logs/ + every outcome subfolder). Safe at boot."
   def ensure_ready do
     File.mkdir_p!(logs_dir())
-    Enum.each(@outcome_dirs, fn d -> File.mkdir_p!(Config.run_path(d)) end)
+    Enum.each(@outcome_dirs, fn d -> File.mkdir_p!(outcome_path(d)) end)
     :ok
   end
 
   @doc "All classifier-split outcome dir names (for `mix tunex.reset`)."
   def outcome_dirs, do: @outcome_dirs
+
+  @doc "Full path to an outcome category dir, nested under `var/run/logs/`."
+  def outcome_path(name), do: Path.join(logs_dir(), name)
 
   # ── Per-row lifecycle ───────────────────────────────────────────────
 
@@ -68,32 +76,32 @@ defmodule Tunex.RowLog do
     :ok
   end
 
-  @doc "Move the row log to `escalated/` (dead-end / phantom / Gate reject)."
-  def escalate(index), do: move(index, Config.run_path("escalated"))
+  @doc "Move the row log to `logs/escalated/` (dead-end / phantom / Gate reject)."
+  def escalate(index), do: move(index, outcome_path("escalated"))
 
-  @doc "Move the row log to `committed/` (a rule landed)."
-  def commit(index), do: move(index, Config.run_path("committed"))
+  @doc "Move the row log to `logs/committed/` (a rule landed)."
+  def commit(index), do: move(index, outcome_path("committed"))
 
-  @doc "Move to `no_action/` (the classifier said NO_ACTION — 07 §8; nothing deleted)."
-  def no_action(index), do: move(index, Config.run_path("no_action"))
+  @doc "Move to `logs/no_action/` (the classifier said NO_ACTION — 07 §8; nothing deleted)."
+  def no_action(index), do: move(index, outcome_path("no_action"))
 
-  @doc "Move to `duplicate/` (novelty pre-check = COVERED)."
-  def duplicate(index), do: move(index, Config.run_path("duplicate"))
+  @doc "Move to `logs/duplicate/` (novelty pre-check = COVERED)."
+  def duplicate(index), do: move(index, outcome_path("duplicate"))
 
-  @doc "Move to `behaviour_diverged/` (classify-time equiv = DIVERGES)."
-  def behaviour_diverged(index), do: move(index, Config.run_path("behaviour_diverged"))
+  @doc "Move to `logs/behaviour_diverged/` (classify-time equiv = DIVERGES)."
+  def behaviour_diverged(index), do: move(index, outcome_path("behaviour_diverged"))
 
-  @doc "Move to `switch_proposals/` (a would-be rule pending a new switch)."
-  def switch_proposal(index), do: move(index, Config.run_path("switch_proposals"))
+  @doc "Move to `logs/switch_proposals/` (a would-be rule pending a new switch)."
+  def switch_proposal(index), do: move(index, outcome_path("switch_proposals"))
 
-  @doc "Move to `classifier_errors/` (malformed spec after one re-ask)."
-  def classifier_errors(index), do: move(index, Config.run_path("classifier_errors"))
+  @doc "Move to `logs/classifier_errors/` (malformed spec after one re-ask)."
+  def classifier_errors(index), do: move(index, outcome_path("classifier_errors"))
 
-  @doc "Move to `transient/` (a recoverable LLM timeout — row NOT consumed, re-runs)."
-  def transient(index), do: move(index, Config.run_path("transient"))
+  @doc "Move to `logs/transient/` (a recoverable LLM timeout — row NOT consumed, re-runs)."
+  def transient(index), do: move(index, outcome_path("transient"))
 
-  @doc "Move to `too_slow/` (gave up after `transient_row_limit` timeouts — row consumed)."
-  def too_slow(index), do: move(index, Config.run_path("too_slow"))
+  @doc "Move to `logs/too_slow/` (gave up after `transient_row_limit` timeouts — row consumed)."
+  def too_slow(index), do: move(index, outcome_path("too_slow"))
 
   # ── Internal ────────────────────────────────────────────────────────
 

@@ -8,10 +8,10 @@ defmodule Tunex.SwitchProposal do
   `lib/assumptions.ex`; a human reads the demand ranking and authors the switch.
   """
 
-  alias Tunex.Config
+  alias Tunex.RowLog
 
   @spec record(non_neg_integer(), map(), String.t()) :: String.t()
-  def record(idx, spec, dir \\ Config.run_path("switch_proposals")) do
+  def record(idx, spec, dir \\ RowLog.outcome_path("switch_proposals")) do
     File.mkdir_p!(dir)
     path = Path.join(dir, "#{idx}.json")
 

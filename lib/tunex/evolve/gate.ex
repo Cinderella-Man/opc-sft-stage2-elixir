@@ -11,7 +11,16 @@ defmodule Tunex.Evolve.Gate do
     (d) mutation                 — revert `lib/` to HEAD, run the changed test
                                    file(s), assert RED (incl. compile-error =
                                    RED), then restore
-    (a) full `mix test` green    — last; the slow one
+    (a) full `mix test` green    — last; the slow one. Includes Credence's
+                                   real-world over-firing corpus (a snapshot
+                                   ratchet, `../credence/docs/09`), so a rule
+                                   that over-fires on idiomatic real code is
+                                   rejected here for free. On a full-suite
+                                   reject, `Tunex.Evolve.Corpus.classify_failure/1`
+                                   tags it `{:corpus, :over_fire|:narrowing, …}`
+                                   (corpus-only drift) vs plain `:full_suite_red`
+                                   (an ordinary broken test); the caller
+                                   preserves the patch + a drop-or-accept report.
 
   Renames / supersession-with-replacement (delete+add) pass: the *add* side
   touches `lib/` + `test/` and the mutation check runs on the new test.
@@ -25,6 +34,7 @@ defmodule Tunex.Evolve.Gate do
   require Logger
 
   alias Tunex.Config
+  alias Tunex.Evolve.Corpus
 
   @doc "Run the contract against the (already-dirty) clone. `clone` defaults to config."
   def check(clone \\ Config.credence_clone()) do
@@ -41,11 +51,18 @@ defmodule Tunex.Evolve.Gate do
       {:ok, summarize(entries)}
     else
       {:reject, reason} ->
-        Logger.warning("[Gate] REJECT: #{inspect(reason)} — discarding")
+        Logger.warning("[Gate] REJECT: #{reject_label(reason)} — discarding")
         discard(clone)
         {:reject, reason}
     end
   end
+
+  # A corpus reject carries a (possibly large) patch + finding lists — keep the
+  # log line compact; the full detail is written to `escalated/` by the caller.
+  defp reject_label({:corpus, kind, %{new: new, gone: gone}}),
+    do: "corpus #{kind} (#{length(new)} new, #{length(gone)} gone)"
+
+  defp reject_label(reason), do: inspect(reason)
 
   @doc "Discard all working-tree + staged changes in the clone."
   def discard(clone \\ Config.credence_clone()) do
@@ -143,8 +160,21 @@ defmodule Tunex.Evolve.Gate do
       Logger.info("[Gate] full suite GREEN")
       :ok
     else
-      {:reject, :full_suite_red}
+      # Capture the agent's diff BEFORE classification touches the snapshot, so a
+      # corpus-only reject (an over-fire to drop, or a narrowing to accept) can be
+      # preserved + re-applied by the maintainer instead of silently discarded.
+      patch = staged_patch(clone)
+
+      case Corpus.classify_failure(clone) do
+        nil -> {:reject, :full_suite_red}
+        detail -> {:reject, {:corpus, detail.kind, Map.put(detail, :patch, patch)}}
+      end
     end
+  end
+
+  defp staged_patch(clone) do
+    {out, _code} = git(clone, ["diff", "--cached"])
+    out
   end
 
   # ── Git / test helpers ──────────────────────────────────────────────

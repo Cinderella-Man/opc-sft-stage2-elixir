@@ -1,12 +1,12 @@
 defmodule Mix.Tasks.Tunex.SwitchProposals do
   @shortdoc "Rank proposed assumption switches by demand (07 §3.12 Tier 2)"
   @moduledoc """
-  Aggregate `var/run/switch_proposals/` and rank proposed promises by **demand**
-  — the count of distinct rule proposals each would unblock (code-pattern
-  frequency, the one evidence the harness actually has; NOT runtime-data
-  frequency, which it can't see).
+  Aggregate `var/run/logs/switch_proposals/` and rank proposed promises by
+  **demand** — the count of distinct rule proposals each would unblock
+  (code-pattern frequency, the one evidence the harness actually has; NOT
+  runtime-data frequency, which it can't see).
 
-      mix tunex.switch_proposals            # uses var/run/switch_proposals
+      mix tunex.switch_proposals            # uses var/run/logs/switch_proposals
       mix tunex.switch_proposals path/to    # custom dir
 
   A human reads this ranking and decides whether to author the switch (+ its
@@ -16,7 +16,7 @@ defmodule Mix.Tasks.Tunex.SwitchProposals do
 
   @impl true
   def run(args) do
-    dir = List.first(args) || Path.join(Tunex.Config.run_dir(), "switch_proposals")
+    dir = List.first(args) || Tunex.RowLog.outcome_path("switch_proposals")
 
     records =
       Path.wildcard(Path.join(dir, "*.json"))

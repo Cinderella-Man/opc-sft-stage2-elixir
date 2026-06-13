@@ -64,10 +64,10 @@ defmodule Tunex.Implement.Seed do
   # ── Sections ─────────────────────────────────────────────────────────────
 
   defp header(%{mode: :new, phase: phase}, :pi),
-    do: "## Task: implement a NEW #{phase} Credence rule — agentic. Fill the generated stub files IN PLACE, run `mix test`, and loop until green."
+    do: "## Task: implement a NEW #{phase} Credence rule — agentic. Fill the generated stub files IN PLACE, run the focused tests, and loop until green."
 
   defp header(%{mode: :bugfix, bugfix: %{sub_shape: shape}}, :pi),
-    do: "## Task: FIX an existing Credence rule (#{shape}) — agentic. Edit it + its tests in place, run `mix test`, and loop until green."
+    do: "## Task: FIX an existing Credence rule (#{shape}) — agentic. Edit it + its tests in place, run the focused tests, and loop until green."
 
   defp header(%{mode: :new, phase: phase}, _llm),
     do: "## Task: implement a NEW #{phase} rule by filling the generated stubs."
@@ -101,6 +101,9 @@ defmodule Tunex.Implement.Seed do
     Rules:
     - Do NOT weaken, skip, or delete assertions to make them pass. Fix the rule, not the test.
     - Do NOT create new files beyond the generated stubs (bugfix: modify in place only).
+    - Run ONLY the focused tests above — do NOT run the full `mix test`. A separate
+      deterministic Gate runs the whole suite (including the real-world over-firing
+      corpus) for you; running it yourself only burns budget re-sending its output.
     - Do NOT run git.
     """
   end
