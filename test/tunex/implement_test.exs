@@ -202,6 +202,40 @@ defmodule Tunex.ImplementTest do
       assert user =~ "mark_equivalence_repair"
       assert user =~ "FunctionClauseError 9/9"
     end
+
+    test "syntax seed carries parser-driven fix guidance + the confirm_fix convention" do
+      ctx = %{
+        mode: :new,
+        phase: :syntax,
+        spec: %{before: "x", after: "y", rationale: "r", assumptions: []},
+        scaffold_files: %{},
+        minimal_set: [],
+        repair?: false
+      }
+
+      user = Seed.build(ctx)
+      # parser-driven fault location, not line/text heuristics (docs/12 §B)
+      assert user =~ "Syntax-fix guidance"
+      assert user =~ "Code.string_to_quoted"
+      # the fix-test convention is the newline-insensitive helper, for every phase
+      assert user =~ "confirm_fix"
+      refute user =~ "compare the WHOLE output with `==`"
+    end
+
+    test "pattern seed omits the syntax-only fix guidance" do
+      ctx = %{
+        mode: :new,
+        phase: :pattern,
+        spec: %{before: "x", after: "y", rationale: "r", assumptions: []},
+        scaffold_files: %{},
+        ast_before: "a",
+        ast_after: "b",
+        minimal_set: [],
+        repair?: false
+      }
+
+      refute Seed.build(ctx) =~ "Syntax-fix guidance"
+    end
   end
 
   describe "Naming.resolve_and_scaffold/3 (real clone — integration)" do

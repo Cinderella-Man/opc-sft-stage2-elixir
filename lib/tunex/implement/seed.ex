@@ -52,6 +52,7 @@ defmodule Tunex.Implement.Seed do
       diagnostic_block(ctx),
       bugfix_block(ctx),
       invariants_block(),
+      syntax_fix_block(ctx),
       conventions_block(),
       assumptions_block(ctx),
       repair_block(ctx),
@@ -191,13 +192,31 @@ defmodule Tunex.Implement.Seed do
     """
   end
 
+  # Syntax rules fix NON-PARSING code, so locate the fault from the parser's error
+  # structure — not from line/substring scanning, which misfires on shifted lines.
+  defp syntax_fix_block(%{phase: :syntax}) do
+    """
+    ## Syntax-fix guidance (parser-driven, not line/text heuristics)
+    The before is broken / non-parsing code. LOCATE the fault from the PARSER's error
+    structure — `Code.string_to_quoted/2` returns `{:error, {meta, message, token}}` with the
+    line/column, and Sourceror's fault-tolerant parse yields a partial tree — and key the fix on
+    that. Do NOT scan with `String.split("\\n")` + line/substring heuristics; they misfire on
+    shifted lines and lookalike text.
+    """
+  end
+
+  defp syntax_fix_block(_), do: nil
+
   defp conventions_block do
     """
     ## Test conventions (§5.6 — emit reviewer-ready)
-    - Fix tests compare the WHOLE output with `==` (BAN =~, String.contains?,
-      match?/Regex.match?, starts_with?/ends_with?, split+Enum.at — even for negatives).
+    - Fix tests use `confirm_fix(fix(R, input), expected)` (newline-insensitive — it trims a
+      trailing \\n on both sides), NOT `assert fix(...) == expected`. Still BAN =~, String.contains?,
+      match?/Regex.match?, starts_with?/ends_with?, split+Enum.at — even for negatives.
     - `expected` is the rule's REAL output (run it, copy the string), never hand-written.
-    - Heredocs only for code/expected (no \\n escapes).
+    - Fixture form — exactly one canonical shape per value: single-line value, no `"` → plain `"foo"`;
+      single-line value containing `"` → `~S'foo "x"'`; multi-line value → `"""…"""` heredoc. NEVER a
+      single-content-line heredoc, NEVER \\n escapes.
     - `_check` includes the deliberately-dropped unsafe cases asserted as "no issue".
     - check and fix must agree.
     - Pattern: the `_equivalence_test` calls assert_equivalent(before, rule: Rule,
